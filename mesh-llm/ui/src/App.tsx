@@ -102,6 +102,8 @@ type StatusPayload = {
   peers: Peer[];
   mesh_models: MeshModel[];
   inflight_requests: number;
+  launch_pi?: string | null;
+  launch_goose?: string | null;
 };
 
 type ChatMessage = {
@@ -968,6 +970,8 @@ export function App() {
           inviteClientCommand={inviteClientCommand}
           inviteToken={inviteToken}
           apiDirectUrl={apiDirectUrl}
+          launchPi={status?.launch_pi ?? null}
+          launchGoose={status?.launch_goose ?? null}
         />
 
         <main className="flex min-h-0 flex-1 flex-col overflow-hidden">
@@ -1069,6 +1073,8 @@ function AppHeader({
   inviteClientCommand,
   inviteToken,
   apiDirectUrl,
+  launchPi,
+  launchGoose,
 }: {
   sections: Array<{ key: TopSection; label: string }>;
   section: TopSection;
@@ -1081,11 +1087,15 @@ function AppHeader({
   inviteClientCommand: string;
   inviteToken: string;
   apiDirectUrl: string;
+  launchPi: string | null;
+  launchGoose: string | null;
 }) {
   const [inviteWithModelCopied, setInviteWithModelCopied] = useState(false);
   const [inviteClientCopied, setInviteClientCopied] = useState(false);
   const [tokenCopied, setTokenCopied] = useState(false);
   const [apiDirectCopied, setApiDirectCopied] = useState(false);
+  const [launchPiCopied, setLaunchPiCopied] = useState(false);
+  const [launchGooseCopied, setLaunchGooseCopied] = useState(false);
   const [isThemePopoverOpen, setIsThemePopoverOpen] = useState(false);
 
   async function copyInviteWithModelCommand() {
@@ -1129,6 +1139,28 @@ function AppHeader({
       window.setTimeout(() => setApiDirectCopied(false), 1500);
     } catch {
       setApiDirectCopied(false);
+    }
+  }
+
+  async function copyLaunchPi() {
+    if (!launchPi) return;
+    try {
+      await navigator.clipboard.writeText(launchPi);
+      setLaunchPiCopied(true);
+      window.setTimeout(() => setLaunchPiCopied(false), 1500);
+    } catch {
+      setLaunchPiCopied(false);
+    }
+  }
+
+  async function copyLaunchGoose() {
+    if (!launchGoose) return;
+    try {
+      await navigator.clipboard.writeText(launchGoose);
+      setLaunchGooseCopied(true);
+      window.setTimeout(() => setLaunchGooseCopied(false), 1500);
+    } catch {
+      setLaunchGooseCopied(false);
     }
   }
 
@@ -1219,6 +1251,51 @@ function AppHeader({
                   <div className="text-xs text-muted-foreground">Direct endpoint unavailable until status is loaded.</div>
                 )}
               </div>
+              {(launchPi || launchGoose) && (
+              <div className="space-y-2">
+                <div className="text-xs font-medium text-muted-foreground">Agent Commands</div>
+                {launchPi && (
+                  <div className="space-y-1">
+                    <div className="text-xs text-muted-foreground">pi</div>
+                    <div className="flex items-center gap-2 rounded-md border bg-muted/40 px-2 py-1.5">
+                      <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap text-xs">
+                        {launchPi}
+                      </code>
+                      <Button
+                        type="button"
+                        size="icon"
+                        variant="ghost"
+                        className="h-7 w-7 shrink-0"
+                        aria-label="Copy pi command"
+                        onClick={() => void copyLaunchPi()}
+                      >
+                        {launchPiCopied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+                      </Button>
+                    </div>
+                  </div>
+                )}
+                {launchGoose && (
+                  <div className="space-y-1">
+                    <div className="text-xs text-muted-foreground">Goose</div>
+                    <div className="flex items-center gap-2 rounded-md border bg-muted/40 px-2 py-1.5">
+                      <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap text-xs">
+                        {launchGoose}
+                      </code>
+                      <Button
+                        type="button"
+                        size="icon"
+                        variant="ghost"
+                        className="h-7 w-7 shrink-0"
+                        aria-label="Copy Goose command"
+                        onClick={() => void copyLaunchGoose()}
+                      >
+                        {launchGooseCopied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+                      </Button>
+                    </div>
+                  </div>
+                )}
+              </div>
+              )}
 
               </PopoverContent>
             </Popover>

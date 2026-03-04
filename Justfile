@@ -136,6 +136,10 @@ ui-dev api="http://127.0.0.1:3131" port="5173":
 mesh-client join="" port="9337":
     {{mesh_bin}} --client --port {{port}} --join {{join}}
 
+# Build and auto-join a mesh (discover via Nostr)
+auto: build
+    {{mesh_bin}} --auto --bin-dir {{build_dir}}/bin
+
 # ── Utilities ──────────────────────────────────────────────────
 
 # Stop all running servers
