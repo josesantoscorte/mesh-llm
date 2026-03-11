@@ -572,7 +572,8 @@ async fn download_with_resume(dest: &Path, url: &str) -> Result<()> {
         .connect_timeout(std::time::Duration::from_secs(30))
         .build()?;
 
-    for attempt in 1..=5 {
+    let max_retries = 100;
+    for attempt in 1..=max_retries {
         // Check how much we already have (for resume)
         let existing_bytes = if tmp.exists() {
             tokio::fs::metadata(&tmp).await?.len()
@@ -581,7 +582,7 @@ async fn download_with_resume(dest: &Path, url: &str) -> Result<()> {
         };
 
         eprintln!(
-            "  attempt {attempt}/5{}...",
+            "  attempt {attempt}/{max_retries}{}...",
             if existing_bytes > 0 {
                 format!(" (resuming from {:.1}MB)", existing_bytes as f64 / 1e6)
             } else {
@@ -598,7 +599,7 @@ async fn download_with_resume(dest: &Path, url: &str) -> Result<()> {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("  connection failed: {e}");
-                if attempt < 5 {
+                if attempt < max_retries {
                     eprintln!("  retrying in 3s...");
                     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                 }
@@ -666,7 +667,7 @@ async fn download_with_resume(dest: &Path, url: &str) -> Result<()> {
                         "  download interrupted at {:.1}MB: {e}",
                         downloaded as f64 / 1e6
                     );
-                    if attempt < 5 {
+                    if attempt < max_retries {
                         eprintln!("  retrying in 3s (will resume)...");
                         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                     }
@@ -688,7 +689,7 @@ async fn download_with_resume(dest: &Path, url: &str) -> Result<()> {
     }
 
     // Keep partial file for resume on next run
-    anyhow::bail!("Download failed after 5 attempts (partial file kept for resume)");
+    anyhow::bail!("Download failed after {max_retries} attempts (partial file kept for resume)");
 }
 
 fn print_progress(downloaded: u64, total: Option<u64>) {
