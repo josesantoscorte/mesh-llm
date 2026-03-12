@@ -2065,7 +2065,7 @@ function DashboardPage({
         />
         <StatCard
           title="Active Models"
-          value={`${warmModels.length}`}
+          value={`${(status?.mesh_models ?? []).filter((m) => m.status === 'warm').length}`}
           icon={<Sparkles className="h-4 w-4" />}
           tooltip="Models currently loaded and serving across the mesh."
         />
@@ -2546,6 +2546,7 @@ function MeshTopologyFlow({
           statusLabel: 'n/a',
           latencyMs: null,
           loadedModel: 'idle',
+          loadedModels: [],
           vramGb: 0,
           vramSharePct: 0,
         },
