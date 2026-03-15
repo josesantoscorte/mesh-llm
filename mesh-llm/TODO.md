@@ -11,13 +11,21 @@ Mini↔Fly nodes are rock solid (0 failures across all heartbeats). Local↔Fly 
 
 Dedicated iroh relay (`usw1-2.relay.michaelneale.mesh-llm.iroh.link`) works great for everyone except Studio. Switched from old Fly relay in v0.35.2.
 
+**Root cause identified:** Studio is a corporate-managed Mac with:
+- **CrowdStrike Falcon** — endpoint security that inspects all network traffic, notorious for interfering with QUIC/UDP
+- **Code42** — backup/DLP agent with network hooks
+- **Santa** — binary authorization endpoint security
+- **Firewall stealth mode ON** — silently drops all unsolicited inbound UDP (breaks STUN)
+- **sleep=1** — machine tries to sleep after 1 minute (currently prevented by daemons)
+
+Mini has: firewall OFF, zero system extensions, sleep=0. That's why Mini is stable.
+
 Next steps:
-- [ ] Check Studio's macOS firewall settings — is it interfering with iroh's UDP/QUIC?
-- [ ] Check Studio's sleep/power settings — is the network interface sleeping?
-- [ ] Test Studio with a fresh identity (delete `~/.mesh-llm/key`)
-- [ ] Run `iroh doctor` or similar diagnostics on Studio vs Mini
-- [ ] Check if Studio has any network extensions, VPN, or Little Snitch
-- [ ] Profile iroh endpoint on Studio — is it the QUIC layer or the relay websocket?
+- [ ] `sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setstealthmode off` (might fix STUN + inbound UDP)
+- [ ] `sudo /usr/libexec/ApplicationFirewall/socketfilterfw --add ~/mesh-bundle/mesh-llm` (allow through firewall)
+- [ ] `sudo pmset -a sleep 0` or run with `caffeinate -s` (prevent sleep)
+- [ ] Check if CrowdStrike can exclude mesh-llm binary or UDP port range
+- [ ] Test after each change to isolate which one matters most
 
 ## Mac Native App
 
