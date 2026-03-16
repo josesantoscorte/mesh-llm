@@ -1,22 +1,5 @@
 # mesh-llm TODO
 
-## Connection Stability — Studio-specific
-
-**Studio is the problem, not the relay.** 5-minute drop count comparison on dedicated iroh relay:
-- Local: **1 drop** (and that 1 was to Studio)
-- Mini: **15 drops** (all to Studio)
-- Studio: **100 drops**
-
-Mini↔Fly nodes are rock solid (0 failures across all heartbeats). Local↔Fly and Local↔Mini also 100% stable. Only connections involving Studio flap. Even Local→Studio on the same LAN (10ms direct path) times out periodically.
-
-Dedicated iroh relay (`usw1-2.relay.michaelneale.mesh-llm.iroh.link`) works great for everyone except Studio. Switched from old Fly relay in v0.35.2.
-
-**Root cause: macOS sleep.** Studio had `sleep=1` (sleeps after 1 minute) + `networkoversleep=0` (kills network on sleep). 450 sleep/wake cycles in 4 days. Every sleep killed all QUIC connections, causing the flapping.
-
-**Fixed by:** `pmset -a sleep 0`, `pmset -a networkoversleep 1`, macOS upgrade to 26.3.1, IPv6 disabled. Result: **0 drops in 5 minutes** (was 100 drops/5min before). All heartbeat gossip 100% successful.
-
-Note: CrowdStrike/Code42/Santa/firewall stealth mode are on both Studio AND Local — they're not the cause (Local was stable the whole time).
-
 ## Mac Native App
 
 Simple native macOS app (SwiftUI) that starts or joins a mesh.
