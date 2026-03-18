@@ -475,7 +475,7 @@ pub async fn publish_watchdog(
                         .any(|m| served.iter().any(|s| m.listing.serving.contains(s)))
                 };
 
-                if !mesh_listed && !our_peers.is_empty() {
+                if !mesh_listed && (!our_peers.is_empty() || !served.is_empty()) {
                     // Brief backoff with jitter to avoid stampede (3-10s)
                     let backoff = (rand::random::<u64>() % 7) + 3;
                     eprintln!("📡 Mesh listing missing from Nostr — waiting {backoff}s before taking over...");
