@@ -137,24 +137,33 @@ GOOSE_PROVIDER=openai OPENAI_API_KEY=dummy OPENAI_HOST=http://localhost:9337 GOO
 
 ### pi
 
-Add a `mesh` provider to `~/.pi/agent/models.json`:
+1. Start a mesh client:
+```bash
+mesh-llm --client --auto --port 9337
+```
+
+2. Check what models are available:
+```bash
+curl -s http://localhost:9337/v1/models | jq '.data[].id'
+```
+
+3. Add a `mesh` provider to `~/.pi/agent/models.json` (adjust model IDs to match your mesh):
 
 ```json
 {
   "providers": {
     "mesh": {
       "api": "openai-completions",
-      "apiKey": "dummy",
+      "apiKey": "mesh",
       "baseUrl": "http://localhost:9337/v1",
       "models": [
         {
-          "id": "GLM-4.7-Flash-Q4_K_M",
-          "name": "GLM 4.7 Flash (mesh)",
-          "contextWindow": 32768,
+          "id": "MiniMax-M2.5-Q4_K_M",
+          "name": "MiniMax M2.5 (Mesh)",
+          "contextWindow": 65536,
           "maxTokens": 8192,
-          "reasoning": false,
+          "reasoning": true,
           "input": ["text"],
-          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
           "compat": {
             "maxTokensField": "max_tokens",
             "supportsDeveloperRole": false,
@@ -167,7 +176,12 @@ Add a `mesh` provider to `~/.pi/agent/models.json`:
 }
 ```
 
-Then: `pi --provider mesh --model GLM-4.7-Flash-Q4_K_M`
+4. Run pi:
+```bash
+pi --model mesh/MiniMax-M2.5-Q4_K_M
+```
+
+Or switch models interactively with Ctrl+M inside pi.
 
 ### opencode
 
