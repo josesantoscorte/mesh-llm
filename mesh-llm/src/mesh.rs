@@ -848,18 +848,11 @@ impl Node {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(60)).await;
 
-                let is_client = matches!(*node.role.lock().await, NodeRole::Client);
                 let mut peers_and_conns: Vec<(EndpointId, Option<Connection>)> = {
                     let state = node.state.lock().await;
-                    state.peers.iter().filter_map(|(id, p)| {
+                    state.peers.keys().map(|id| {
                         let conn = state.connections.get(id).cloned();
-                        // Clients skip heartbeat to other clients with no connection —
-                        // no point establishing client-to-client QUIC connections.
-                        // If we already have a connection (e.g. they connected to us), keep it.
-                        if is_client && conn.is_none() && matches!(p.role, NodeRole::Client) {
-                            return None;
-                        }
-                        Some((*id, conn))
+                        (*id, conn)
                     }).collect()
                 };
                 tracing::debug!("Heartbeat tick: {} peers to check", peers_and_conns.len());
@@ -1563,10 +1556,7 @@ impl Node {
 
         {
             let state = self.state.lock().await;
-            // Skip if we already have a connection to this peer.
-            // Note: check connections, not just peers — transitive peers appear in
-            // the peer table without a connection and still need a direct connect.
-            if state.connections.contains_key(&peer_id) { return Ok(()); }
+            if state.peers.contains_key(&peer_id) { return Ok(()); }
             if state.dead_peers.contains(&peer_id) {
                 tracing::debug!("Skipping connection to dead peer {}", peer_id.fmt_short());
                 return Ok(());
@@ -1656,16 +1646,10 @@ impl Node {
             }
         }
 
-        // Try to establish direct connections to new peers (only on initial join).
-        // Clients skip other clients — they only need connections to hosts/workers
-        // for tunneling inference requests. This avoids O(clients²) connections.
+        // Try to establish direct connections to new peers (only on initial join)
         if discover_peers {
-            let is_client = matches!(*self.role.lock().await, NodeRole::Client);
             for ann in &their_announcements {
                 if ann.addr.id != self.endpoint.id() {
-                    if is_client && matches!(ann.role, NodeRole::Client) {
-                        continue;
-                    }
                     let has_conn = self.state.lock().await.connections.contains_key(&ann.addr.id);
                     if !has_conn {
                         if let Err(e) = Box::pin(self.connect_to_peer(ann.addr.clone())).await {
