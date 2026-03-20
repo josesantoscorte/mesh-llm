@@ -49,6 +49,45 @@ Fetch model files directly from mesh peers instead of HuggingFace. Peers already
 - Rate limiting to avoid saturating the link during active inference
 - Multi-peer parallel download (fetch chunks from different peers)?
 
+## Vision / Multimodal
+
+llama.cpp already supports vision models via `--mmproj` (multimodal projector). The server handles OpenAI-compatible `image_url` content parts in `/v1/chat/completions`. Our proxy forwards request bodies as-is, so the vision message format should just work end-to-end.
+
+**What's needed:**
+- **Launch**: Pass `--mmproj <file>` when starting llama-server for vision models
+- **Catalog**: Add vision models with their mmproj files (two downloads per model)
+- **Router**: Detect vision requests (content array with `image_url` type), route only to vision-capable hosts
+
+**Models (all Qwen3.5 are vision-native):**
+- Qwen3.5-0.8B (~0.5GB + 0.3GB mmproj) — tiny, runs anywhere, good for OCR/screenshots
+- Qwen3.5-27B (~16GB + mmproj) — Studio already has the text model on disk, just needs mmproj
+- Qwen2.5-VL-7B, Qwen2.5-VL-32B, Qwen2.5-VL-72B — dedicated vision variants
+- Gemma-3-12b, Pixtral-12B — alternative architectures
+
+**Blocker: one model per host.** Currently each host runs a single llama-server. Vision as a second model needs multi-model-per-host support (see below). Without that, a host must choose between its text model and a vision model.
+
+No image generation — llama.cpp is transformers only. Vision = understanding (describe, OCR, visual QA).
+
+## Multi-Model Per Host
+
+Currently each host runs one llama-server serving one model. Hosts with spare VRAM could serve multiple models simultaneously.
+
+**Options:**
+1. **Multiple llama-server processes** — each on a different port, proxy routes by model. Simple but duplicates KV cache overhead.
+2. **llama-server native multi-model** — newer versions support `--model` multiple times. Single process, shared infrastructure. Need to verify this works with `--mmproj` for mixed text+vision serving.
+
+**Why it matters:**
+- Studio (206GB) could serve MiniMax (130GB) + Qwen3.5-27B-VL (20GB) + spare
+- Mini (16GB) could serve Qwen3-8B (5GB) + Qwen3.5-0.8B-VL (1GB)
+- Vision doesn't have to replace the text model
+- Draft/speculative models could coexist with the main model
+
+**Implications:**
+- Election needs to account for multiple models per host
+- Gossip announcements need to advertise multiple serving models
+- Proxy routing needs model→host:port mapping (not just host)
+- VRAM budget tracking per host
+
 ## Smart Router
 - [ ] **Static speed estimates**: Add `tok_s: f64` to ModelProfile. Feed into scoring so Quick tasks prefer fast models.
 - [ ] **Response quality checks**: Detect empty/repetitive/truncated responses, trigger retry with different model.
