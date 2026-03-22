@@ -68,34 +68,45 @@ Ensemble is 3-10x slower than the best solo model per task. Each round requires 
 
 4. **Model diversity matters more than model count**. MiniMax (MoE, strong tools) + Qwen3-30B (MoE, fast) complement each other. Adding a third weak model (Qwen3-8B) didn't help — it never won.
 
-## Claude vs Qwen3-8B Comparison
+## Claude vs Qwen3-8B: Agentic Comparison
 
-Direct head-to-head on a code review task (find bugs in a statistics module, fix them, add error handling, suggest tests).
+### Real agentic task (pi harness, multi-turn with tools)
+
+Task: Add a `display_name()` method to a Rust User struct. Agent must read files, edit the right one, produce compiling code.
+
+Ran via `pi -p` (print mode) with `PI_CODING_AGENT_DIR` isolation — same approach as Open Model Gym.
 
 | | Claude Sonnet 4 | Qwen3-8B (local) |
 |--|---|----|
-| Time | 34.0s | 28.7s |
-| Output | 8,987 chars | 7,460 chars |
+| Time | **12s** | 84s |
+| Score | **5/5** | 3/5 |
+| Edited file? | ✅ Yes, correct | ❌ No |
+| Compiles? | ✅ | ✅ (unchanged) |
+| Hallucinated? | No | **Yes** — claimed method already existed |
+
+**Claude** read `user.rs`, added the method in the right place with `format!("{} {}", self.first_name, self.last_name)`, preserved all existing methods. 12 seconds, clean.
+
+**Qwen3-8B** hallucinated that the method was already present and produced no edit. The file was untouched. 84 seconds wasted on nothing.
+
+### Single-turn comparison (raw API, no tools)
+
+Same code review task (find bugs in a Python statistics module):
+
+| | Claude Sonnet 4 | Qwen3-8B (local) |
+|--|---|----|
+| Time | 34s | 29s |
 | Bugs found | 10 | 7 |
 | Quality | Excellent | Good |
 
-### Quality Analysis
+Claude found more subtle edge cases (NaN, infinity, booleans-as-ints, string-as-iterable). Qwen3-8B caught the main bugs but missed nuance.
 
-**Claude advantages:**
-- Found more edge cases (NaN, infinity, boolean-as-number, string input, iterator input)
-- Produced complete working fixed code with a shared `_validate_input()` helper
-- Test cases are specific pytest assertions with `pytest.raises`
-- Identified the subtle issue of booleans being treated as int (True=1, False=0)
+### Verdict
 
-**Qwen3-8B:**
-- Found the main bugs (empty list, mode ties, percentile range, non-numeric)
-- Chose `return None` pattern instead of raising exceptions — debatable design choice but less Pythonic
-- Test cases are more repetitive (same `describe([])` test repeated)
-- Missed: NaN handling, infinity, boolean-as-number, string-as-iterable, iterator support
+**The gap is massive for agentic work.** Single-turn, the models are in the same ballpark — Qwen3-8B finds 70% of what Claude finds. But when you need the model to actually use tools (read files, edit code, verify), Qwen3-8B falls apart. It hallucinates rather than doing the work.
 
-**Verdict:** Claude is meaningfully better — finds more edge cases, produces more idiomatic Python, better test coverage. But Qwen3-8B catches the most important bugs. For a code review, Claude at ~$0.05 beats Qwen3-8B (free), but the gap isn't enormous.
+This is the real challenge for mesh-llm as an agent backend. The models can reason but they can't reliably execute multi-step tool-use workflows. MoM doesn't help here — you can't vote on "which model correctly edited a file" if none of them did.
 
-**MoM implication:** An ensemble of Qwen3-8B + Qwen3-30B + MiniMax might close the gap with Claude by combining diverse perspectives. The MoM tool-use result already showed the ensemble picking the best model's answer.
+**Next:** Test with MiniMax-253B (much stronger) and Qwen2.5-72B via the mesh to see if model scale closes the gap.
 
 ## Next Steps
 
