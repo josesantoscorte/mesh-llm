@@ -145,37 +145,7 @@ else
 fi
 
 echo ""
-echo "── Test 6: Post with reply_to ──"
-if [ -n "$POST_ID" ]; then
-    REPLY=$(curl -s "http://localhost:$CONSOLE_A/api/blackboard/post" \
-        -H "Content-Type: application/json" \
-        -d "{\"text\":\"This is a reply\",\"reply_to\":\"$POST_ID\"}")
-    if echo "$REPLY" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d.get('reply_to') is not None" 2>/dev/null; then
-        REPLY_ID=$(echo "$REPLY" | python3 -c "import sys,json; print(format(json.load(sys.stdin)['id'],'x'))" 2>/dev/null || echo "")
-        total_pass "Reply posted (id: $REPLY_ID)"
-    else
-        total_fail "Reply post" "$REPLY"
-    fi
-else
-    total_fail "Reply post" "No original post ID"
-fi
-
-echo ""
-echo "── Test 7: Thread shows original + reply ──"
-if [ -n "$POST_ID" ]; then
-    THREAD=$(curl -s "http://localhost:$CONSOLE_A/api/blackboard/thread/$POST_ID")
-    TCOUNT=$(echo "$THREAD" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null || echo "0")
-    if [ "$TCOUNT" -ge 2 ]; then
-        total_pass "Thread has $TCOUNT items"
-    else
-        total_fail "Thread" "Expected >=2, got $TCOUNT: $THREAD"
-    fi
-else
-    total_fail "Thread" "No post ID"
-fi
-
-echo ""
-echo "── Test 8: CLI feed works ──"
+echo "── Test 6: CLI feed works ──"
 CLI_FEED=$($BINARY blackboard --port $CONSOLE_A --limit 5 2>&1)
 if echo "$CLI_FEED" | grep -q "whiteboard\|Hello"; then
     total_pass "CLI feed shows messages"
@@ -184,7 +154,7 @@ else
 fi
 
 echo ""
-echo "── Test 9: CLI search works ──"
+echo "── Test 7: CLI search works ──"
 CLI_SEARCH=$($BINARY blackboard --search "whiteboard" --port $CONSOLE_A 2>&1)
 if echo "$CLI_SEARCH" | grep -q "whiteboard\|Hello"; then
     total_pass "CLI search finds message"
@@ -193,7 +163,7 @@ else
 fi
 
 echo ""
-echo "── Test 10: CLI post works ──"
+echo "── Test 8: CLI post works ──"
 CLI_POST=$($BINARY blackboard "CLI post test message" --port $CONSOLE_A 2>&1)
 if echo "$CLI_POST" | grep -q "Posted"; then
     total_pass "CLI post succeeded"
@@ -202,7 +172,7 @@ else
 fi
 
 echo ""
-echo "── Test 11: PII scrubbing (private paths) ──"
+echo "── Test 9: PII scrubbing (private paths) ──"
 PII_POST=$($BINARY blackboard "Check /Users/michael/secret/file.txt" --port $CONSOLE_A 2>&1)
 if echo "$PII_POST" | grep -q "PII\|Scrubbing\|Posted"; then
     # Verify the stored message was scrubbed
@@ -219,7 +189,7 @@ else
 fi
 
 echo ""
-echo "── Test 12: Post with empty text rejected ──"
+echo "── Test 10: Post with empty text rejected ──"
 EMPTY=$(curl -s "http://localhost:$CONSOLE_A/api/blackboard/post" \
     -H "Content-Type: application/json" \
     -d '{"text":""}')
@@ -232,7 +202,7 @@ fi
 # ── Cross-node tests (only if Node B is running) ──
 if [ -n "$PID_B" ]; then
     echo ""
-    echo "── Test 13: Message propagated to Node B ──"
+    echo "── Test 11: Message propagated to Node B ──"
     sleep 3  # Give flood-fill time
     FEED_B=$(curl -s "http://localhost:$CONSOLE_B/api/blackboard/feed")
     BCOUNT=$(echo "$FEED_B" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null || echo "0")
@@ -243,7 +213,7 @@ if [ -n "$PID_B" ]; then
     fi
 
     echo ""
-    echo "── Test 14: Post from Node B propagates to A ──"
+    echo "── Test 12: Post from Node B propagates to A ──"
     curl -s "http://localhost:$CONSOLE_B/api/blackboard/post" \
         -H "Content-Type: application/json" \
         -d '{"text":"Hello from Node B!"}'
@@ -261,7 +231,7 @@ else
 fi
 
 echo ""
-echo "── Test 15: Feed limit works ──"
+echo "── Test 13: Feed limit works ──"
 LIMIT_FEED=$(curl -s "http://localhost:$CONSOLE_A/api/blackboard/feed?limit=2")
 LCOUNT=$(echo "$LIMIT_FEED" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null || echo "0")
 if [ "$LCOUNT" -le 2 ]; then

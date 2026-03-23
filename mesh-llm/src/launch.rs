@@ -194,6 +194,12 @@ pub async fn start_llama_server(
         // Goose/OpenAI clients parse this correctly. "none" leaks raw <think>
         // tags into content which is worse.
         "--reasoning-format".to_string(), "deepseek".to_string(),
+        // Disable thinking by default. Thinking models (Qwen3, MiniMax) burn
+        // 15-80s on hidden reasoning for no quality gain on most tasks, and
+        // Qwen3.5-9B is completely broken (reasoning consumes all max_tokens).
+        // API users can opt-in per-request with:
+        //   "chat_template_kwargs": {"enable_thinking": true}
+        "--reasoning-budget".to_string(), "0".to_string(),
     ]);
     // KV cache quantization based on model size:
     //   < 5GB: leave default (FP16) — small models, KV cache is negligible
