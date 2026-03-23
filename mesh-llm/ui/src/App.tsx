@@ -688,27 +688,38 @@ export function App() {
     currentAbortRef.current = controller;
 
     try {
-      const response = await fetch('/api/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        signal: controller.signal,
-        body: JSON.stringify({
-          model,
-          messages: historyForRequest.map((m) => ({
-            role: m.role,
-            content: m.image
-              ? [
-                  { type: 'text' as const, text: m.content },
-                  { type: 'image_url' as const, image_url: { url: m.image } },
-                ]
-              : m.content,
-          })),
-          stream: true,
-          stream_options: { include_usage: true },
-        }),
-      });
+      const MAX_RETRIES = 3;
+      const RETRY_DELAYS = [1000, 2000, 4000];
+      const RETRYABLE = new Set([500, 502, 503]);
+      let response: Response | null = null;
 
-      if (!response.ok || !response.body) throw new Error(`HTTP ${response.status}`);
+      for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+        response = await fetch('/api/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          signal: controller.signal,
+          body: JSON.stringify({
+            model,
+            messages: historyForRequest.map((m) => ({
+              role: m.role,
+              content: m.image
+                ? [
+                    { type: 'text' as const, text: m.content },
+                    { type: 'image_url' as const, image_url: { url: m.image } },
+                  ]
+                : m.content,
+            })),
+            stream: true,
+            stream_options: { include_usage: true },
+            chat_template_kwargs: { enable_thinking: false },
+          }),
+        });
+        if (response.ok && response.body) break;
+        if (!RETRYABLE.has(response.status) || attempt === MAX_RETRIES - 1) break;
+        await new Promise((r) => setTimeout(r, RETRY_DELAYS[attempt]));
+      }
+
+      if (!response?.ok || !response?.body) throw new Error(`HTTP ${response?.status ?? 'unknown'}`);
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
