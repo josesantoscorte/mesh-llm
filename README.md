@@ -24,7 +24,7 @@ cd mesh-llm
 just build
 ```
 
-Requires: `just`, `cmake`, `nvcc`, Rust toolchain, Node.js + npm. See [CONTRIBUTING.md](CONTRIBUTING.md) for details.
+Requires: `just`, `cmake`, Rust toolchain, Node.js + npm. NVIDIA GPU builds need `nvcc` (CUDA toolkit). CPU-only and Jetson/Tegra also work. See [CONTRIBUTING.md](CONTRIBUTING.md) for details.
 
 ## Run
 Once installed, you can run:
