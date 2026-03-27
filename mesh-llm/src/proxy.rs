@@ -107,7 +107,8 @@ pub async fn handle_mesh_request(node: mesh::Node, tcp_stream: TcpStream, track_
             let served = node.models_being_served().await;
             let available: Vec<(&str, f64)> =
                 served.iter().map(|name| (name.as_str(), 0.0)).collect();
-            let picked = router::pick_model_classified(&cl, &available);
+            let load = node.model_load().await;
+            let picked = router::pick_model_load_aware(&cl, &available, &load);
             if let Some(name) = picked {
                 tracing::info!(
                     "router: {:?}/{:?} tools={} → {name}",
@@ -125,6 +126,7 @@ pub async fn handle_mesh_request(node: mesh::Node, tcp_stream: TcpStream, track_
     } else {
         None
     };
+    let is_auto = routed_model.is_some() || model_name.is_none();
     let effective_model = routed_model.or(model_name);
 
     // Demand tracking for rebalancing
@@ -134,59 +136,193 @@ pub async fn handle_mesh_request(node: mesh::Node, tcp_stream: TcpStream, track_
         }
     }
 
-    // Resolve target hosts by model name, fall back to any host
-    let target_hosts = if let Some(ref name) = effective_model {
-        node.hosts_for_model(name).await
-    } else {
-        vec![]
-    };
-    let target_hosts = if target_hosts.is_empty() {
-        match node.any_host().await {
-            Some(p) => vec![p.id],
-            None => {
-                let _ = send_503(tcp_stream).await;
-                return;
-            }
-        }
-    } else {
-        target_hosts
-    };
+    // Resolve hosts and handle fallback.
+    //
+    // Auto mode (routed_model set, or no model specified): work through ranked
+    //   model list by quality + load, trying each model's hosts in order.
+    // Named model: try all hosts for that model. Only fall back to ranked
+    //   alternatives if NO hosts for the named model are reachable.
 
-    // Try each host in order — if tunnel fails, retry with next.
-    // On first failure, trigger background gossip refresh so future requests
-    // have a fresh routing table (doesn't block the retry loop).
-    let mut last_err = None;
-    let mut refreshed = false;
-    for target_host in &target_hosts {
-        match node.open_http_tunnel(*target_host).await {
-            Ok((quic_send, quic_recv)) => {
-                if let Err(e) = tunnel::relay_tcp_via_quic(tcp_stream, quic_send, quic_recv).await {
-                    tracing::debug!("HTTP tunnel relay ended: {e}");
+    if is_auto {
+        // Auto: build ranked model list, try each model's hosts in order
+        let served = node.models_being_served().await;
+        let load = node.model_load().await;
+        let available: Vec<(&str, f64)> =
+            served.iter().map(|name| (name.as_str(), 0.0)).collect();
+
+        let ranked_models: Vec<String> =
+            if let Some(body_json) = extract_body_json(&buf[..n]) {
+                let cl = router::classify(&body_json);
+                router::rank_models_load_aware(&cl, &available, &load)
+                    .into_iter()
+                    .map(|s| s.to_string())
+                    .collect()
+            } else {
+                served.clone()
+            };
+
+        let mut last_err = None;
+        let mut refreshed = false;
+        let mut tried_any = false;
+        for model in &ranked_models {
+            for target_host in node.hosts_for_model(model).await {
+                tried_any = true;
+                if Some(model.as_str()) != effective_model.as_deref() && last_err.is_none() {
+                    tracing::info!(
+                        "load spillover: {} → {model}",
+                        effective_model.as_deref().unwrap_or("auto")
+                    );
                 }
-                return;
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to tunnel to host {}: {e}, trying next",
-                    target_host.fmt_short()
-                );
-                last_err = Some(e);
-                // Background refresh on first failure — non-blocking
-                if !refreshed {
-                    let refresh_node = node.clone();
-                    tokio::spawn(async move {
-                        refresh_node.gossip_one_peer().await;
-                    });
-                    refreshed = true;
+                match node.open_http_tunnel(target_host).await {
+                    Ok((quic_send, quic_recv)) => {
+                        if let Err(e) =
+                            tunnel::relay_tcp_via_quic(tcp_stream, quic_send, quic_recv).await
+                        {
+                            tracing::debug!("HTTP tunnel relay ended: {e}");
+                        }
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to tunnel to host {} (model {model}): {e}, trying next",
+                            target_host.fmt_short()
+                        );
+                        last_err = Some(e);
+                        if !refreshed {
+                            let n = node.clone();
+                            tokio::spawn(async move { n.gossip_one_peer().await });
+                            refreshed = true;
+                        }
+                    }
                 }
             }
         }
+        // Absolute fallback: try any host
+        if !tried_any {
+            if let Some(p) = node.any_host().await {
+                match node.open_http_tunnel(p.id).await {
+                    Ok((quic_send, quic_recv)) => {
+                        let _ =
+                            tunnel::relay_tcp_via_quic(tcp_stream, quic_send, quic_recv).await;
+                        return;
+                    }
+                    Err(e) => last_err = Some(e),
+                }
+            }
+        }
+        if let Some(e) = last_err {
+            tracing::warn!("All hosts failed across {} models: {e}", ranked_models.len());
+        }
+        let _ = send_503(tcp_stream).await;
+    } else {
+        // Named model: try all hosts for the requested model first.
+        let name = effective_model.as_deref().unwrap();
+        let target_hosts = node.hosts_for_model(name).await;
+
+        if !target_hosts.is_empty() {
+            let mut last_err = None;
+            let mut refreshed = false;
+            for target_host in &target_hosts {
+                match node.open_http_tunnel(*target_host).await {
+                    Ok((quic_send, quic_recv)) => {
+                        if let Err(e) =
+                            tunnel::relay_tcp_via_quic(tcp_stream, quic_send, quic_recv).await
+                        {
+                            tracing::debug!("HTTP tunnel relay ended: {e}");
+                        }
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to tunnel to host {} (model {name}): {e}, trying next",
+                            target_host.fmt_short()
+                        );
+                        last_err = Some(e);
+                        if !refreshed {
+                            let n = node.clone();
+                            tokio::spawn(async move { n.gossip_one_peer().await });
+                            refreshed = true;
+                        }
+                    }
+                }
+            }
+            // All hosts for the named model failed — fall back through ranked alternatives
+            tracing::info!("all hosts for {name} failed, trying alternatives");
+            let served = node.models_being_served().await;
+            let load = node.model_load().await;
+            let alternatives: Vec<(&str, f64)> = served
+                .iter()
+                .filter(|m| m.as_str() != name)
+                .map(|m| (m.as_str(), 0.0))
+                .collect();
+            if let Some(body_json) = extract_body_json(&buf[..n]) {
+                let cl = router::classify(&body_json);
+                for alt in router::rank_models_load_aware(&cl, &alternatives, &load) {
+                    for host in node.hosts_for_model(alt).await {
+                        match node.open_http_tunnel(host).await {
+                            Ok((quic_send, quic_recv)) => {
+                                tracing::info!("fallback: {name} → {alt}");
+                                let _ = tunnel::relay_tcp_via_quic(
+                                    tcp_stream, quic_send, quic_recv,
+                                )
+                                .await;
+                                return;
+                            }
+                            Err(e) => {
+                                last_err = Some(e);
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(e) = last_err {
+                tracing::warn!("All hosts failed for {name} and alternatives: {e}");
+            }
+            let _ = send_503(tcp_stream).await;
+        } else {
+            // No hosts serve this model at all — ranked fallback
+            let served = node.models_being_served().await;
+            let load = node.model_load().await;
+            let alternatives: Vec<(&str, f64)> = served
+                .iter()
+                .filter(|m| m.as_str() != name)
+                .map(|m| (m.as_str(), 0.0))
+                .collect();
+            if let Some(body_json) = extract_body_json(&buf[..n]) {
+                let cl = router::classify(&body_json);
+                for alt in router::rank_models_load_aware(&cl, &alternatives, &load) {
+                    for host in node.hosts_for_model(alt).await {
+                        match node.open_http_tunnel(host).await {
+                            Ok((quic_send, quic_recv)) => {
+                                tracing::info!("fallback: {name} unavailable → {alt}");
+                                let _ = tunnel::relay_tcp_via_quic(
+                                    tcp_stream, quic_send, quic_recv,
+                                )
+                                .await;
+                                return;
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                }
+            }
+            // Absolute fallback: any host
+            match node.any_host().await {
+                Some(p) => {
+                    match node.open_http_tunnel(p.id).await {
+                        Ok((quic_send, quic_recv)) => {
+                            let _ =
+                                tunnel::relay_tcp_via_quic(tcp_stream, quic_send, quic_recv).await;
+                            return;
+                        }
+                        Err(_) => {}
+                    }
+                }
+                None => {}
+            }
+            let _ = send_503(tcp_stream).await;
+        }
     }
-    // All hosts failed
-    if let Some(e) = last_err {
-        tracing::warn!("All hosts failed for model {:?}: {e}", effective_model);
-    }
-    let _ = send_503(tcp_stream).await;
 }
 
 /// Route a request to a known inference target (local llama-server or remote host).

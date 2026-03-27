@@ -175,6 +175,11 @@ struct PeerAnnouncement {
     is_soc: Option<bool>,
     #[serde(default)]
     gpu_vram: Option<String>,
+    /// Current number of inflight inference requests on this node.
+    /// Used by proxy nodes to make load-aware routing decisions.
+    /// Stale by up to 60s (gossip interval) but useful for sustained load.
+    #[serde(default)]
+    inflight: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -206,6 +211,8 @@ pub struct PeerInfo {
     pub hostname: Option<String>,
     pub is_soc: Option<bool>,
     pub gpu_vram: Option<String>,
+    /// Last-known inflight request count from gossip. Stale by up to 60s.
+    pub inflight: u64,
 }
 
 /// Peers not directly verified within this window are considered stale
@@ -1907,32 +1914,68 @@ impl Node {
         result
     }
 
+    /// Get per-model load: returns (model_name, min_inflight_across_hosts) for every served model.
+    /// min_inflight is used because if ANY host for that model is idle, the model is available.
+    /// Includes our own inflight count for locally-served models.
+    /// Values are from last gossip (up to 60s stale) — good for sustained load, not spikes.
+    pub async fn model_load(&self) -> HashMap<String, u64> {
+        let state = self.state.lock().await;
+        let my_serving_models = self.serving_models.lock().await.clone();
+        let my_inflight = self.inflight_requests();
+
+        let mut model_min_inflight: HashMap<String, u64> = HashMap::new();
+
+        // Our own models
+        for m in &my_serving_models {
+            let entry = model_min_inflight.entry(m.clone()).or_insert(u64::MAX);
+            *entry = (*entry).min(my_inflight);
+        }
+
+        // Peer models
+        for p in state.peers.values() {
+            if !matches!(p.role, NodeRole::Host { .. }) {
+                continue;
+            }
+            let peer_models: Vec<&String> = if !p.serving_models.is_empty() {
+                p.serving_models.iter().collect()
+            } else if let Some(ref s) = p.serving {
+                vec![s]
+            } else {
+                vec![]
+            };
+            for m in peer_models {
+                let entry = model_min_inflight.entry(m.clone()).or_insert(u64::MAX);
+                *entry = (*entry).min(p.inflight);
+            }
+        }
+
+        // Replace MAX with 0 for models where we had no load info
+        for v in model_min_inflight.values_mut() {
+            if *v == u64::MAX {
+                *v = 0;
+            }
+        }
+
+        model_min_inflight
+    }
+
     /// Find a host for a specific model, using hash-based selection for load distribution.
     /// When multiple hosts serve the same model, picks one based on our node ID hash.
     /// All host IDs serving a model, with hash-preferred host first.
     /// Used for retry: if the first host fails, try the next.
     pub async fn hosts_for_model(&self, model: &str) -> Vec<EndpointId> {
         let state = self.state.lock().await;
-        let mut hosts: Vec<EndpointId> = state
+        let mut hosts: Vec<(EndpointId, u64)> = state
             .peers
             .values()
             .filter(|p| {
                 matches!(p.role, NodeRole::Host { .. }) && p.serving.as_deref() == Some(model)
             })
-            .map(|p| p.id)
+            .map(|p| (p.id, p.inflight))
             .collect();
-        hosts.sort();
-        // Put the hash-preferred host first so normal path tries it first
-        if !hosts.is_empty() {
-            let my_id = self.endpoint.id();
-            let id_bytes = my_id.as_bytes();
-            let hash = id_bytes
-                .iter()
-                .fold(0u64, |acc, &b| acc.wrapping_mul(31).wrapping_add(b as u64));
-            let idx = (hash as usize) % hosts.len();
-            hosts.rotate_left(idx);
-        }
-        hosts
+        // Sort by load (least-loaded first), then by ID for determinism
+        hosts.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        hosts.into_iter().map(|(id, _)| id).collect()
     }
 
     /// Find ANY host in the mesh (fallback when no model match).
@@ -2792,6 +2835,7 @@ impl Node {
             existing.hostname = ann.hostname.clone();
             existing.is_soc = ann.is_soc;
             existing.gpu_vram = ann.gpu_vram.clone();
+            existing.inflight = ann.inflight;
             let updated_peer = existing.clone();
             let changed = peer_meaningfully_changed(&old_peer, &updated_peer);
             if role_changed || serving_changed {
@@ -2847,6 +2891,7 @@ impl Node {
             hostname: ann.hostname.clone(),
             is_soc: ann.is_soc,
             gpu_vram: ann.gpu_vram.clone(),
+            inflight: ann.inflight, // 0 if old node didn't send it (serde default)
         };
         state.peers.insert(id, peer.clone());
         let count = state.peers.len();
@@ -2905,6 +2950,7 @@ impl Node {
             if ann.gpu_vram.is_some() {
                 existing.gpu_vram = ann.gpu_vram.clone();
             }
+            existing.inflight = ann.inflight;
             let updated_peer = existing.clone();
             let changed = peer_meaningfully_changed(&old_peer, &updated_peer);
             if serving_changed {
@@ -2952,6 +2998,7 @@ impl Node {
                 hostname: ann.hostname.clone(),
                 is_soc: ann.is_soc,
                 gpu_vram: ann.gpu_vram.clone(),
+                inflight: ann.inflight,
             };
             state.peers.insert(id, peer.clone());
             drop(state);
@@ -3000,6 +3047,7 @@ impl Node {
                     hostname: p.hostname.clone(),
                     is_soc: p.is_soc,
                     gpu_vram: p.gpu_vram.clone(),
+                    inflight: p.inflight, // relay last-known load from this peer
                 })
                 .collect()
         };
@@ -3033,6 +3081,7 @@ impl Node {
             } else {
                 None
             },
+            inflight: self.inflight_requests(), // live count, not stale
         });
         announcements
     }

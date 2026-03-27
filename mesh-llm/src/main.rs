@@ -1950,7 +1950,9 @@ async fn api_proxy(
                                     .keys()
                                     .map(|name| (name.as_str(), 0.0))
                                     .collect();
-                                let picked = router::pick_model_classified(&cl, &available);
+                                let load = node.model_load().await;
+                                let picked =
+                                    router::pick_model_load_aware(&cl, &available, &load);
                                 if let Some(name) = picked {
                                     tracing::info!(
                                         "router: {:?}/{:?} tools={} → {name}",
@@ -2040,8 +2042,30 @@ async fn api_proxy(
                     } else if let Some(ref name) = effective_model {
                         let t = targets.get(name);
                         if matches!(t, election::InferenceTarget::None) {
-                            tracing::debug!("Model '{}' not found, trying first available", name);
-                            first_available_target(&targets)
+                            // Named model not available — try load-aware fallback
+                            let load = node.model_load().await;
+                            let available: Vec<(&str, f64)> = targets
+                                .targets
+                                .keys()
+                                .filter(|m| m.as_str() != name.as_str())
+                                .map(|m| (m.as_str(), 0.0))
+                                .collect();
+                            if let Some(body_json) = proxy::extract_body_json(&buf[..n]) {
+                                let cl = router::classify(&body_json);
+                                if let Some(alt) =
+                                    router::pick_model_load_aware(&cl, &available, &load)
+                                {
+                                    tracing::info!(
+                                        "load fallback: {} unavailable → {alt}",
+                                        name
+                                    );
+                                    targets.get(alt)
+                                } else {
+                                    first_available_target(&targets)
+                                }
+                            } else {
+                                first_available_target(&targets)
+                            }
                         } else {
                             t
                         }

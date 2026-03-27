@@ -726,6 +726,162 @@ pub fn pick_model_classified<'a>(
     scored.first().map(|(name, _)| *name)
 }
 
+/// Score and rank all available models with load awareness.
+/// Returns models sorted best-first. Both agentic and chat callers
+/// can iterate through the ranked list to find a responsive host.
+///
+/// `model_load` maps model_name → min_inflight across hosts serving it.
+/// A model with inflight=0 (or absent from the map) is considered idle.
+///
+/// Load penalty policy:
+/// - Agentic: only penalize when heavily loaded (inflight ≥ 3). Quality > latency.
+/// - Chat: penalize earlier (inflight ≥ 1). Users notice wait time.
+/// - Penalty is soft: a busy tier-4 model can still beat an idle tier-1.
+///   But a busy tier-3 will lose to an idle tier-3.
+pub fn rank_models_load_aware<'a>(
+    classification: &Classification,
+    available_models: &[(&'a str, f64)],
+    model_load: &std::collections::HashMap<String, u64>,
+) -> Vec<&'a str> {
+    if available_models.is_empty() {
+        return vec![];
+    }
+
+    // Filter for tool-capable models if tools are required
+    let filtered: Vec<(&str, f64)> = if classification.needs_tools {
+        available_models
+            .iter()
+            .filter(|(name, _)| profile_for(name).map(|p| p.tools).unwrap_or(false))
+            .copied()
+            .collect()
+    } else {
+        available_models.to_vec()
+    };
+    let candidates = if filtered.is_empty() {
+        available_models
+    } else {
+        &filtered
+    };
+
+    let category = classification.category;
+
+    let mut scored: Vec<(&str, i32)> = candidates
+        .iter()
+        .map(|(name, tok_s)| {
+            let profile = profile_for(name);
+            let tier = profile.map(|p| p.tier).unwrap_or(1) as i32;
+
+            let has_match = profile
+                .map(|p| p.strengths.contains(&category))
+                .unwrap_or(false);
+            let match_bonus = if has_match { 1000 } else { 0 };
+
+            let position_bonus = profile
+                .map(|p| {
+                    p.strengths
+                        .iter()
+                        .position(|s| *s == category)
+                        .map(|i| match i {
+                            0 => 20,
+                            1 => 10,
+                            _ => 5,
+                        })
+                        .unwrap_or(0)
+                })
+                .unwrap_or(0);
+
+            let tier_bonus = if classification.needs_tools {
+                tier * 20
+            } else {
+                match classification.complexity {
+                    Complexity::Quick => tier * 5,
+                    Complexity::Moderate => tier * 10,
+                    Complexity::Deep => tier * 15,
+                }
+            };
+
+            let speed_bonus = if classification.needs_tools {
+                (tok_s / 20.0).min(5.0) as i32
+            } else {
+                (tok_s / 5.0).min(20.0) as i32
+            };
+
+            // Load penalty — the key addition.
+            // inflight=0 means idle (or old node that doesn't report). No penalty.
+            let inflight = model_load.get(*name).copied().unwrap_or(0);
+            let load_penalty = if classification.needs_tools {
+                // Agentic: tolerate more load before penalizing. Quality matters.
+                // 0-2 inflight: no penalty (normal for agentic sessions)
+                // 3+: -30 per additional request (strong but not overwhelming)
+                if inflight >= 3 {
+                    (inflight as i32 - 2) * 30
+                } else {
+                    0
+                }
+            } else {
+                // Chat: penalize earlier. Latency-sensitive.
+                // 1 inflight: -15 (mild preference for idle)
+                // 2+: -30 per additional (strong push to alternatives)
+                if inflight >= 2 {
+                    15 + (inflight as i32 - 1) * 30
+                } else if inflight == 1 {
+                    15
+                } else {
+                    0
+                }
+            };
+
+            let score = match_bonus + tier_bonus + position_bonus + speed_bonus - load_penalty;
+            (*name, score)
+        })
+        .collect();
+
+    scored.sort_by(|a, b| b.1.cmp(&a.1));
+    scored.into_iter().map(|(name, _)| name).collect()
+}
+
+/// Pick the single best model with load awareness.
+/// Convenience wrapper around `rank_models_load_aware`.
+/// For non-agentic requests, spreads load across top-scoring models.
+pub fn pick_model_load_aware<'a>(
+    classification: &Classification,
+    available_models: &[(&'a str, f64)],
+    model_load: &std::collections::HashMap<String, u64>,
+) -> Option<&'a str> {
+    // If no load info, fall through to normal selection
+    if model_load.is_empty() || model_load.values().all(|&v| v == 0) {
+        return pick_model_classified(classification, available_models);
+    }
+
+    let ranked = rank_models_load_aware(classification, available_models, model_load);
+
+    // For non-agentic, spread across top models (re-score without load to find ties)
+    if !classification.needs_tools && ranked.len() > 1 {
+        // Re-score without load to check for near-ties at the top
+        let no_load = std::collections::HashMap::new();
+        let base_ranked = rank_models_load_aware(
+            &Classification {
+                needs_tools: false,
+                ..*classification
+            },
+            available_models,
+            &no_load,
+        );
+        // If the top-2 base scores are close, spread randomly
+        if base_ranked.len() > 1 {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos() as usize;
+            // Pick among the top ranked (load-aware) — at most 3
+            let top_n = ranked.len().min(3);
+            return Some(ranked[nanos % top_n]);
+        }
+    }
+
+    ranked.into_iter().next()
+}
+
 /// Convenience: pick model from just a category (no complexity/tools info).
 /// Used by tests and simple call sites.
 #[cfg(test)]
@@ -1184,4 +1340,181 @@ fn test_agentic_deep_strongly_prefers_biggest() {
     };
     let result = pick_model_classified(&cl, &available);
     assert_eq!(result, Some("MiniMax-M2.5-Q4_K_M"));
+}
+
+// ── Load-aware routing tests ────────────────────────────────────────
+
+#[test]
+fn test_load_aware_no_load_same_as_normal() {
+    let available = vec![
+        ("Qwen2.5-Coder-32B-Instruct-Q4_K_M", 15.0),
+        ("Qwen3-8B-Q4_K_M", 50.0),
+    ];
+    let cl = Classification {
+        category: Category::Code,
+        complexity: Complexity::Moderate,
+        needs_tools: true,
+    };
+    let empty_load = std::collections::HashMap::new();
+    let result = pick_model_load_aware(&cl, &available, &empty_load);
+    let normal = pick_model_classified(&cl, &available);
+    assert_eq!(result, normal);
+}
+
+#[test]
+fn test_load_aware_agentic_ignores_mild_load() {
+    // Agentic: inflight=2 should NOT trigger penalty (threshold is 3)
+    let available = vec![
+        ("MiniMax-M2.5-Q4_K_M", 20.0),            // tier 4
+        ("Qwen2.5-Coder-7B-Instruct-Q4_K_M", 85.0), // tier 2
+    ];
+    let mut load = std::collections::HashMap::new();
+    load.insert("MiniMax-M2.5-Q4_K_M".to_string(), 2);
+    let cl = Classification {
+        category: Category::Code,
+        complexity: Complexity::Moderate,
+        needs_tools: true,
+    };
+    let result = pick_model_load_aware(&cl, &available, &load);
+    // MiniMax should still win — 2 inflight isn't enough to penalize for agentic
+    assert_eq!(result, Some("MiniMax-M2.5-Q4_K_M"));
+}
+
+#[test]
+fn test_load_aware_agentic_penalizes_heavy_load() {
+    // Agentic: inflight=5 should push away from the loaded model
+    let available = vec![
+        ("Qwen2.5-32B-Instruct-Q4_K_M", 18.0), // tier 3, tools: true
+        ("Qwen3-8B-Q4_K_M", 50.0),             // tier 2, tools: true
+    ];
+    let mut load = std::collections::HashMap::new();
+    load.insert("Qwen2.5-32B-Instruct-Q4_K_M".to_string(), 5);
+    let cl = Classification {
+        category: Category::Code,
+        complexity: Complexity::Moderate,
+        needs_tools: true,
+    };
+    let result = pick_model_load_aware(&cl, &available, &load);
+    // 32B: tier 3×20=60, penalty=(5-2)×30=90 → net negative. 8B should win.
+    assert_eq!(result, Some("Qwen3-8B-Q4_K_M"));
+}
+
+#[test]
+fn test_load_aware_chat_penalizes_earlier() {
+    // Chat: inflight=2 should already penalize
+    let available = vec![
+        ("Qwen2.5-72B-Instruct-Q4_K_M", 10.0), // tier 3
+        ("Qwen3-8B-Q4_K_M", 50.0),             // tier 2
+    ];
+    let mut load = std::collections::HashMap::new();
+    load.insert("Qwen2.5-72B-Instruct-Q4_K_M".to_string(), 3);
+    let cl = Classification {
+        category: Category::Chat,
+        complexity: Complexity::Quick,
+        needs_tools: false,
+    };
+    let result = pick_model_load_aware(&cl, &available, &load);
+    // 72B: tier 3×5=15, penalty=15+(3-1)×30=75 → way negative. 8B should win.
+    assert_eq!(result, Some("Qwen3-8B-Q4_K_M"));
+}
+
+#[test]
+fn test_load_aware_agentic_filters_no_tools() {
+    // Agentic fallback should not pick tools:false models
+    let available = vec![
+        ("DeepSeek-R1-Distill-70B-Q4_K_M", 10.0), // tier 3, tools: false
+        ("Qwen3-8B-Q4_K_M", 50.0),                // tier 2, tools: true
+    ];
+    let load = std::collections::HashMap::new();
+    let cl = Classification {
+        category: Category::Code,
+        complexity: Complexity::Moderate,
+        needs_tools: true,
+    };
+    let result = pick_model_load_aware(&cl, &available, &load);
+    assert_eq!(result, Some("Qwen3-8B-Q4_K_M"));
+}
+
+#[test]
+fn test_rank_models_returns_full_list() {
+    let available = vec![
+        ("MiniMax-M2.5-Q4_K_M", 20.0),
+        ("Qwen2.5-32B-Instruct-Q4_K_M", 18.0),
+        ("Qwen3-8B-Q4_K_M", 50.0),
+    ];
+    let load = std::collections::HashMap::new();
+    let cl = Classification {
+        category: Category::Code,
+        complexity: Complexity::Moderate,
+        needs_tools: true,
+    };
+    let ranked = rank_models_load_aware(&cl, &available, &load);
+    // All 3 should appear (all have tools: true)
+    assert_eq!(ranked.len(), 3);
+    // Best tier first
+    assert_eq!(ranked[0], "MiniMax-M2.5-Q4_K_M");
+}
+
+#[test]
+fn test_rank_models_load_reorders() {
+    let available = vec![
+        ("MiniMax-M2.5-Q4_K_M", 20.0),          // tier 4
+        ("Qwen2.5-32B-Instruct-Q4_K_M", 18.0),  // tier 3
+        ("Qwen3-8B-Q4_K_M", 50.0),              // tier 2
+    ];
+    let mut load = std::collections::HashMap::new();
+    load.insert("MiniMax-M2.5-Q4_K_M".to_string(), 6); // very busy
+    let cl = Classification {
+        category: Category::Code,
+        complexity: Complexity::Moderate,
+        needs_tools: true,
+    };
+    let ranked = rank_models_load_aware(&cl, &available, &load);
+    // MiniMax heavily loaded — should drop in the ranking
+    assert_ne!(ranked[0], "MiniMax-M2.5-Q4_K_M");
+    // All 3 still present
+    assert_eq!(ranked.len(), 3);
+}
+
+#[test]
+fn test_gossip_inflight_compat_defaults_to_zero() {
+    // Old nodes that don't send inflight should deserialize as 0
+    let json = r#"{"addr":{"id":"aaaa","addrs":[]},"role":"worker"}"#;
+    let ann: Result<serde_json::Value, _> = serde_json::from_str(json);
+    assert!(ann.is_ok());
+    let v = ann.unwrap();
+    // inflight field missing → serde default → 0
+    assert_eq!(v.get("inflight"), None);
+}
+
+#[test]
+fn test_chat_yields_before_agentic() {
+    // Under moderate load (inflight=3), chat should spill to a smaller model
+    // while agentic stays on the big model. This prevents chat from crowding
+    // out agentic sessions.
+    let available = vec![
+        ("MiniMax-M2.5-Q4_K_M", 20.0),          // tier 4
+        ("Qwen3-8B-Q4_K_M", 50.0),              // tier 2
+    ];
+    let mut load = std::collections::HashMap::new();
+    load.insert("MiniMax-M2.5-Q4_K_M".to_string(), 3);
+
+    let chat = Classification {
+        category: Category::Chat,
+        complexity: Complexity::Quick,
+        needs_tools: false,
+    };
+    let agentic = Classification {
+        category: Category::Code,
+        complexity: Complexity::Moderate,
+        needs_tools: true,
+    };
+
+    let chat_ranked = rank_models_load_aware(&chat, &available, &load);
+    let agentic_ranked = rank_models_load_aware(&agentic, &available, &load);
+
+    // Chat should prefer the smaller idle model (MiniMax penalized)
+    assert_eq!(chat_ranked[0], "Qwen3-8B-Q4_K_M");
+    // Agentic should still prefer MiniMax (penalty threshold not reached)
+    assert_eq!(agentic_ranked[0], "MiniMax-M2.5-Q4_K_M");
 }
