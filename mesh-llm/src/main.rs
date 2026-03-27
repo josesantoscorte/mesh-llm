@@ -545,17 +545,7 @@ async fn resolve_model(input: &std::path::Path) -> Result<PathBuf> {
     if s.starts_with("https://huggingface.co/") || s.starts_with("http://huggingface.co/") {
         let filename = s.rsplit('/').next()
             .ok_or_else(|| anyhow::anyhow!("Can't extract filename from URL: {}", s))?;
-        let dest = download::models_dir().join(filename);
-        if dest.exists() {
-            let size = tokio::fs::metadata(&dest).await?.len();
-            if size > 1_000_000 {
-                eprintln!("✅ {} already exists ({:.1}GB)", filename, size as f64 / 1e9);
-                return Ok(dest);
-            }
-        }
-        eprintln!("📥 Downloading {}...", filename);
-        download::download_url(&s, &dest).await?;
-        return Ok(dest);
+        return download::download_hf_split_gguf(&s, filename).await;
     }
 
     // HF shorthand: org/repo/file.gguf
@@ -571,17 +561,7 @@ async fn resolve_model(input: &std::path::Path) -> Result<PathBuf> {
             }
         };
         let filename = s.rsplit('/').next().unwrap();
-        let dest = download::models_dir().join(filename);
-        if dest.exists() {
-            let size = tokio::fs::metadata(&dest).await?.len();
-            if size > 1_000_000 {
-                eprintln!("✅ {} already exists ({:.1}GB)", filename, size as f64 / 1e9);
-                return Ok(dest);
-            }
-        }
-        eprintln!("📥 Downloading {}...", filename);
-        download::download_url(&url, &dest).await?;
-        return Ok(dest);
+        return download::download_hf_split_gguf(&url, filename).await;
     }
 
     anyhow::bail!("Model not found: {}", s);

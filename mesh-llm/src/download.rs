@@ -22,6 +22,10 @@ pub struct CatalogModel {
     /// Multimodal projector for vision models (filename, url).
     /// When set, llama-server is launched with `--mmproj <file>`.
     pub mmproj: Option<(&'static str, &'static str)>,
+    /// Agentic/tool-calling quality rank. 0 = no tool support, higher = better. Max 10.
+    pub tool_rank: u8,
+    /// General chat/reasoning quality rank. Higher = better. Max 10.
+    pub chat_rank: u8,
 }
 
 /// Pre-computed MoE expert sharding configuration for a model.
@@ -68,6 +72,8 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         moe: None,
         extra_files: &[],
         mmproj: None,
+        tool_rank: 1,
+        chat_rank: 2,
     },
     CatalogModel {
         name: "Qwen2.5-3B-Instruct-Q4_K_M",
@@ -79,6 +85,8 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         moe: None,
         extra_files: &[],
         mmproj: None,
+        tool_rank: 1,
+        chat_rank: 1,
     },
     CatalogModel {
         name: "Llama-3.2-3B-Instruct-Q4_K_M",
@@ -90,6 +98,8 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         moe: None,
         extra_files: &[],
         mmproj: None,
+        tool_rank: 3,
+        chat_rank: 1,
     },
     // ── Small (6-8GB VRAM) ──────────────────────────────────────────
     CatalogModel {
@@ -102,6 +112,8 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         moe: None,
         extra_files: &[],
         mmproj: None,
+        tool_rank: 2,
+        chat_rank: 4,
     },
     CatalogModel {
         name: "Qwen2.5-Coder-7B-Instruct-Q4_K_M",
@@ -113,6 +125,8 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         moe: None,
         extra_files: &[],
         mmproj: None,
+        tool_rank: 5,
+        chat_rank: 3,
     },
     CatalogModel {
         name: "Gemma-3-12B-it-Q4_K_M",
@@ -124,6 +138,8 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         moe: None,
         extra_files: &[],
         mmproj: None,
+        tool_rank: 2,
+        chat_rank: 4,
     },
     CatalogModel {
         name: "Hermes-2-Pro-Mistral-7B-Q4_K_M",
@@ -135,6 +151,8 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         moe: None,
         extra_files: &[],
         mmproj: None,
+        tool_rank: 5,
+        chat_rank: 3,
     },
     // ── Medium (11-17GB VRAM) ───────────────────────────────────────
     CatalogModel {
@@ -147,6 +165,8 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         moe: None,
         extra_files: &[],
         mmproj: None,
+        tool_rank: 3,
+        chat_rank: 5,
     },
     CatalogModel {
         name: "Qwen2.5-14B-Instruct-Q4_K_M",
@@ -158,6 +178,8 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         moe: None,
         extra_files: &[],
         mmproj: None,
+        tool_rank: 3,
+        chat_rank: 5,
     },
     CatalogModel {
         name: "Qwen2.5-Coder-14B-Instruct-Q4_K_M",
@@ -169,6 +191,8 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         moe: None,
         extra_files: &[],
         mmproj: None,
+        tool_rank: 6,
+        chat_rank: 4,
     },
     CatalogModel {
         name: "DeepSeek-R1-Distill-Qwen-14B-Q4_K_M",
@@ -180,6 +204,8 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         moe: None,
         extra_files: &[],
         mmproj: None,
+        tool_rank: 1,
+        chat_rank: 6,
     },
     CatalogModel {
         name: "Devstral-Small-2505-Q4_K_M",
@@ -191,6 +217,8 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         moe: None,
         extra_files: &[],
         mmproj: None,
+        tool_rank: 7,
+        chat_rank: 5,
     },
     CatalogModel {
         name: "Mistral-Small-3.1-24B-Instruct-Q4_K_M",
@@ -202,6 +230,8 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         moe: None,
         extra_files: &[],
         mmproj: None,
+        tool_rank: 5,
+        chat_rank: 5,
     },
     // ── Large (20-24GB VRAM) ────────────────────────────────────────
     CatalogModel {
@@ -219,6 +249,8 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         }),
         extra_files: &[],
         mmproj: None,
+        tool_rank: 4,
+        chat_rank: 5,
     },
     CatalogModel {
         name: "Qwen3-30B-A3B-Q4_K_M",
@@ -235,6 +267,8 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         }),
         extra_files: &[],
         mmproj: None,
+        tool_rank: 4,
+        chat_rank: 6,
     },
     CatalogModel {
         name: "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M",
@@ -251,6 +285,8 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         }),
         extra_files: &[],
         mmproj: None,
+        tool_rank: 7,
+        chat_rank: 5,
     },
     CatalogModel {
         name: "GLM-4-32B-0414-Q4_K_M",
@@ -262,6 +298,8 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         moe: None,
         extra_files: &[],
         mmproj: None,
+        tool_rank: 5,
+        chat_rank: 6,
     },
     CatalogModel {
         name: "Qwen3-32B-Q4_K_M",
@@ -273,6 +311,8 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         moe: None,
         extra_files: &[],
         mmproj: None,
+        tool_rank: 4,
+        chat_rank: 7,
     },
     CatalogModel {
         name: "DeepSeek-R1-Distill-Qwen-32B-Q4_K_M",
@@ -284,6 +324,8 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         moe: None,
         extra_files: &[],
         mmproj: None,
+        tool_rank: 1,
+        chat_rank: 7,
     },
     CatalogModel {
         name: "Qwen2.5-32B-Instruct-Q4_K_M",
@@ -295,6 +337,8 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         moe: None,
         extra_files: &[],
         mmproj: None,
+        tool_rank: 4,
+        chat_rank: 6,
     },
     CatalogModel {
         name: "Qwen2.5-Coder-32B-Instruct-Q4_K_M",
@@ -306,6 +350,8 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         moe: None,
         extra_files: &[],
         mmproj: None,
+        tool_rank: 8,
+        chat_rank: 5,
     },
     CatalogModel {
         name: "Llama-4-Scout-Q4_K_M",
@@ -322,6 +368,8 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         }),
         extra_files: &[],
         mmproj: None,
+        tool_rank: 5,
+        chat_rank: 5,
     },
     CatalogModel {
         name: "Gemma-3-27B-it-Q4_K_M",
@@ -333,6 +381,8 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         moe: None,
         extra_files: &[],
         mmproj: None,
+        tool_rank: 3,
+        chat_rank: 6,
     },
     CatalogModel {
         name: "Qwen3.5-27B-Q4_K_M",
@@ -344,6 +394,8 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         moe: None,
         extra_files: &[],
         mmproj: Some(("Qwen3.5-27B-mmproj-BF16.gguf", "https://huggingface.co/unsloth/Qwen3.5-27B-GGUF/resolve/main/mmproj-BF16.gguf")),
+        tool_rank: 5,
+        chat_rank: 7,
     },
     // ── Large (40GB+ VRAM) ────────────────────────────────────────
     CatalogModel {
@@ -360,6 +412,8 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
             ("Qwen3-Coder-Next-Q4_K_M-00004-of-00004.gguf", "https://huggingface.co/Qwen/Qwen3-Coder-Next-GGUF/resolve/main/Qwen3-Coder-Next-Q4_K_M/Qwen3-Coder-Next-Q4_K_M-00004-of-00004.gguf"),
         ],
         mmproj: None,
+        tool_rank: 9,
+        chat_rank: 7,
     },
     CatalogModel {
         name: "Llama-3.3-70B-Instruct-Q4_K_M",
@@ -371,6 +425,8 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         moe: None,
         extra_files: &[],
         mmproj: None,
+        tool_rank: 6,
+        chat_rank: 8,
     },
     CatalogModel {
         name: "Qwen2.5-72B-Instruct-Q4_K_M",
@@ -382,6 +438,8 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         moe: None,
         extra_files: &[],
         mmproj: None,
+        tool_rank: 5,
+        chat_rank: 8,
     },
     CatalogModel {
         name: "DeepSeek-R1-Distill-70B-Q4_K_M",
@@ -393,6 +451,8 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         moe: None,
         extra_files: &[],
         mmproj: None,
+        tool_rank: 1,
+        chat_rank: 8,
     },
     CatalogModel {
         name: "Mixtral-8x22B-Instruct-Q4_K_M",
@@ -409,6 +469,8 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         }),
         extra_files: &[],
         mmproj: None,
+        tool_rank: 3,
+        chat_rank: 6,
     },
     // ── XXL (100GB+ VRAM) ─────────────────────────────────────────
     CatalogModel {
@@ -426,6 +488,8 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         }),
         extra_files: &[],
         mmproj: None,
+        tool_rank: 5,
+        chat_rank: 9,
     },
     CatalogModel {
         name: "Llama-3.1-405B-Instruct-Q2_K",
@@ -437,6 +501,8 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         moe: None,
         extra_files: &[],
         mmproj: None,
+        tool_rank: 4,
+        chat_rank: 7,
     },
     // ── XXL (100GB+ VRAM, split GGUF) ─────────────────────────────
     CatalogModel {
@@ -458,6 +524,31 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
             ("MiniMax-M2.5-Q4_K_M-00004-of-00004.gguf", "https://huggingface.co/unsloth/MiniMax-M2.5-GGUF/resolve/main/Q4_K_M/MiniMax-M2.5-Q4_K_M-00004-of-00004.gguf"),
         ],
         mmproj: None,
+        tool_rank: 6,
+        chat_rank: 9,
+    },
+    CatalogModel {
+        name: "Qwen3.5-122B-A10B-UD-Q8_K_XL",
+        file: "Qwen3.5-122B-A10B-UD-Q8_K_XL-00001-of-00005.gguf",
+        url: "https://huggingface.co/unsloth/Qwen3.5-122B-A10B-GGUF/resolve/main/UD-Q8_K_XL/Qwen3.5-122B-A10B-UD-Q8_K_XL-00001-of-00005.gguf",
+        size: "159GB",
+        description: "Qwen3.5 122B MoE A10B active, vision + text, UD-Q8_K_XL near-lossless",
+        draft: Some("Qwen3-0.6B-Q4_K_M"),
+        moe: Some(MoeConfig {
+            n_expert: 128,
+            n_expert_used: 8,
+            min_experts_per_node: 46,
+            ranking: &[],
+        }),
+        extra_files: &[
+            ("Qwen3.5-122B-A10B-UD-Q8_K_XL-00002-of-00005.gguf", "https://huggingface.co/unsloth/Qwen3.5-122B-A10B-GGUF/resolve/main/UD-Q8_K_XL/Qwen3.5-122B-A10B-UD-Q8_K_XL-00002-of-00005.gguf"),
+            ("Qwen3.5-122B-A10B-UD-Q8_K_XL-00003-of-00005.gguf", "https://huggingface.co/unsloth/Qwen3.5-122B-A10B-GGUF/resolve/main/UD-Q8_K_XL/Qwen3.5-122B-A10B-UD-Q8_K_XL-00003-of-00005.gguf"),
+            ("Qwen3.5-122B-A10B-UD-Q8_K_XL-00004-of-00005.gguf", "https://huggingface.co/unsloth/Qwen3.5-122B-A10B-GGUF/resolve/main/UD-Q8_K_XL/Qwen3.5-122B-A10B-UD-Q8_K_XL-00004-of-00005.gguf"),
+            ("Qwen3.5-122B-A10B-UD-Q8_K_XL-00005-of-00005.gguf", "https://huggingface.co/unsloth/Qwen3.5-122B-A10B-GGUF/resolve/main/UD-Q8_K_XL/Qwen3.5-122B-A10B-UD-Q8_K_XL-00005-of-00005.gguf"),
+        ],
+        mmproj: Some(("Qwen3.5-122B-A10B-mmproj-BF16.gguf", "https://huggingface.co/unsloth/Qwen3.5-122B-A10B-GGUF/resolve/main/mmproj-BF16.gguf")),
+        tool_rank: 6,
+        chat_rank: 9,
     },
     // ── Vision models ───────────────────────────────────────────────
     CatalogModel {
@@ -470,6 +561,8 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         moe: None,
         extra_files: &[],
         mmproj: Some(("Qwen3.5-0.8B-mmproj-BF16.gguf", "https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/mmproj-BF16.gguf")),
+        tool_rank: 0,
+        chat_rank: 2,
     },
     CatalogModel {
         name: "Qwen3.5-4B-Vision-Q4_K_M",
@@ -481,6 +574,8 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         moe: None,
         extra_files: &[],
         mmproj: Some(("Qwen3.5-4B-mmproj-BF16.gguf", "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/mmproj-BF16.gguf")),
+        tool_rank: 0,
+        chat_rank: 3,
     },
     CatalogModel {
         name: "Qwen3.5-9B-Vision-Q4_K_M",
@@ -492,6 +587,8 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         moe: None,
         extra_files: &[],
         mmproj: Some(("Qwen3.5-9B-mmproj-BF16.gguf", "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/mmproj-BF16.gguf")),
+        tool_rank: 0,
+        chat_rank: 4,
     },
     // ── Draft models ────────────────────────────────────────────────
     CatalogModel {
@@ -504,6 +601,8 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         moe: None,
         extra_files: &[],
         mmproj: None,
+        tool_rank: 0,
+        chat_rank: 0,
     },
     CatalogModel {
         name: "Qwen3-0.6B-Q4_K_M",
@@ -515,6 +614,8 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         moe: None,
         extra_files: &[],
         mmproj: None,
+        tool_rank: 0,
+        chat_rank: 0,
     },
     CatalogModel {
         name: "Llama-3.2-1B-Instruct-Q4_K_M",
@@ -526,6 +627,8 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         moe: None,
         extra_files: &[],
         mmproj: None,
+        tool_rank: 0,
+        chat_rank: 0,
     },
     CatalogModel {
         name: "Gemma-3-1B-it-Q4_K_M",
@@ -537,6 +640,8 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         moe: None,
         extra_files: &[],
         mmproj: None,
+        tool_rank: 0,
+        chat_rank: 0,
     },
 ];
 
@@ -660,6 +765,84 @@ pub async fn download_model(model: &CatalogModel) -> Result<PathBuf> {
 /// Download any URL to a destination path with resume support.
 pub async fn download_url(url: &str, dest: &Path) -> Result<()> {
     download_with_resume(dest, url).await
+}
+
+/// Download a HuggingFace GGUF URL, auto-detecting split files (-00001-of-NNNNN.gguf).
+/// If the filename matches the split pattern, downloads all parts in parallel.
+/// Returns the path to the first part (or the single file).
+pub async fn download_hf_split_gguf(url: &str, filename: &str) -> Result<PathBuf> {
+    let dir = models_dir();
+    tokio::fs::create_dir_all(&dir).await?;
+
+    let re = regex_lite::Regex::new(r"-00001-of-(\d{5})\.gguf$").unwrap();
+    if let Some(caps) = re.captures(filename) {
+        let n: u32 = caps[1].parse()?;
+        eprintln!("📥 Detected split GGUF: {} parts", n);
+
+        // Build list of (part_filename, part_url) for all parts
+        let mut files: Vec<(String, String)> = Vec::new();
+        for i in 1..=n {
+            let part_filename = filename.replace(
+                "-00001-of-",
+                &format!("-{:05}-of-", i),
+            );
+            let part_url = url.replace(
+                "-00001-of-",
+                &format!("-{:05}-of-", i),
+            );
+            files.push((part_filename, part_url));
+        }
+
+        // Filter to parts that still need downloading
+        let mut needed: Vec<(String, String)> = Vec::new();
+        for (f, u) in &files {
+            let path = dir.join(f);
+            if path.exists() {
+                let size = tokio::fs::metadata(&path).await.map(|m| m.len()).unwrap_or(0);
+                if size > 1_000_000 {
+                    eprintln!("  ✅ {} already exists ({:.1}GB)", f, size as f64 / 1e9);
+                    continue;
+                }
+            }
+            needed.push((f.clone(), u.clone()));
+        }
+
+        if !needed.is_empty() {
+            eprintln!("  ⚡ Downloading {} files in parallel...", needed.len());
+            let total = needed.len();
+            let completed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut handles = Vec::new();
+            for (file, url) in needed {
+                let path = dir.join(&file);
+                let completed = completed.clone();
+                handles.push(tokio::spawn(async move {
+                    download_with_resume(&path, &url).await?;
+                    let done = completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    eprintln!("  ✅ {} [{}/{}]", file, done, total);
+                    Ok::<(), anyhow::Error>(())
+                }));
+            }
+            for handle in handles {
+                handle.await??;
+            }
+        }
+
+        let dest = dir.join(filename);
+        return Ok(dest);
+    }
+
+    // Not a split file — single download
+    let dest = dir.join(filename);
+    if dest.exists() {
+        let size = tokio::fs::metadata(&dest).await?.len();
+        if size > 1_000_000 {
+            eprintln!("✅ {} already exists ({:.1}GB)", filename, size as f64 / 1e9);
+            return Ok(dest);
+        }
+    }
+    eprintln!("📥 Downloading {}...", filename);
+    download_with_resume(&dest, url).await?;
+    Ok(dest)
 }
 
 /// Download with resume support and retries using reqwest.

@@ -23,6 +23,12 @@ Currently each host runs one llama-server serving one model. Hosts with spare VR
 - Mini (16GB) could serve Qwen3.5-9B (5.5GB) + draft model
 - Enables MoM routing across models on the same host
 
+## Auto-Detect Split GGUFs from HF URLs
+
+When `--model` is given a HuggingFace URL ending in `-00001-of-NNNNN.gguf`, auto-discover and download the remaining N-1 split files from the same HF directory. Currently split-file awareness only exists in the catalog via `extra_files` — ad-hoc HF URLs require the user to spell out every split manually.
+
+**Example:** `--model https://huggingface.co/.../Qwen3.5-122B-A10B-UD-Q8_K_XL-00001-of-00005.gguf` should detect the `-00001-of-00005` pattern, construct URLs for parts 2-5, and download them all (parallel, with resume) to `~/.models/`.
+
 ## Peer-to-Peer Model Transfer
 
 Fetch model files directly from mesh peers instead of HuggingFace. Peers already have QUIC connections — add a new stream type where the requester sends a filename and offset, the responder streams the file back.

@@ -797,107 +797,90 @@ pub fn smart_auto(
 }
 
 /// Model tiers by VRAM requirement (approximate loaded size × 1.1 headroom).
-/// Model tiers for auto-selection, ordered largest-first.
-/// min_vram = file_size * 1.1 rounded up. Prefer Qwen3 over 2.5 at same tier.
-/// Parse a size string like "2.5GB" to GB as f64.
-fn parse_size_gb(s: &str) -> f64 {
-    s.trim_end_matches("GB").parse::<f64>().unwrap_or(0.0)
-}
-
-/// Build model tiers from the catalog, sorted largest first.
-/// Each entry is (model_name, min_vram_gb) where min_vram = file_size * 1.1.
-/// Excludes draft models (< 1GB).
-fn model_tiers() -> Vec<(&'static str, f64)> {
-    let mut tiers: Vec<_> = crate::download::MODEL_CATALOG
-        .iter()
-        .filter(|m| parse_size_gb(m.size) >= 1.0) // skip drafts
-        .map(|m| (m.name, parse_size_gb(m.size) * 1.1))
-        .collect();
-    tiers.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    tiers
-}
-
 /// Pick models to SERVE for `--auto` based on VRAM and what's on disk.
 /// Returns models this node should actually load into llama-servers.
 ///
-/// Strategy: one strong generalist + one code specialist when VRAM allows.
-/// MoE models preferred (faster tok/s per VRAM GB). Prefers on-disk models
-/// to avoid download wait. Leaves ~15% VRAM headroom for KV cache.
-///
-/// Packs by VRAM tier:
-///   <13GB:   Qwen3-8B (5G)
-///   13-22GB: Qwen3-8B (5G) + Coder-7B (4.4G)
-///   22-28GB: GLM-4.7-Flash (18G) — MoE, fast, good all-rounder
-///   28-52GB: Qwen3-30B-A3B (17G) + Coder-7B (4.4G)
-///   55-58GB: Qwen2.5-32B (20G) + Qwen3-30B-A3B (17G) + Coder-7B (4.4G)
-///   58-85GB: Qwen2.5-72B (47G)
-///   85-165GB: Qwen2.5-72B (47G) + Coder-32B (20G)
-///   165GB+:  MiniMax-M2.5 (138G)
+/// Strategy: rank-based selection from the catalog.
+/// 1. Pick the highest chat_rank model that fits (best general quality)
+/// 2. If room remains, add the highest tool_rank model (best for agents/coding)
+/// 3. If still more room, keep adding by chat_rank
+/// Prefers models already on disk when ranks are tied. Leaves 15% VRAM for KV cache.
 pub fn auto_model_pack(vram_gb: f64) -> Vec<String> {
+    use crate::download::{MODEL_CATALOG, parse_size_gb};
+
     let local_models = crate::mesh::scan_local_models();
-    let tiers = model_tiers();
-
-    // Helper: check if a model is on disk
     let on_disk = |name: &str| local_models.contains(&name.to_string());
-    // Helper: model size from tiers
-    let size_of = |name: &str| -> f64 {
-        tiers.iter().find(|(n, _)| *n == name).map(|(_, s)| *s).unwrap_or(f64::MAX)
-    };
-    let fits = |name: &str, budget: f64| -> bool { size_of(name) <= budget };
 
-    let usable = vram_gb * 0.85; // 15% headroom for KV cache
+    // Collect non-draft, non-vision models with their sizes (×1.1 headroom)
+    let mut candidates: Vec<(&str, f64, u8, u8)> = MODEL_CATALOG
+        .iter()
+        .filter(|m| m.chat_rank > 0 && m.tool_rank > 0) // skip drafts and vision-only
+        .map(|m| (m.name, parse_size_gb(m.size) * 1.1, m.chat_rank, m.tool_rank))
+        .collect();
 
-    // Opinionated packs — each is (generalist, optional specialist(s))
-    // The order within a tier prefers: on-disk first, then opinionated default.
-    struct Pack {
-        min_vram: f64,
-        models: &'static [&'static str],
-    }
-    let packs: &[Pack] = &[
-        // Sizes: MiniMax=138G, 72B=47G, Coder-32B=20G, 32B=20G, 30B-A3B=17.3G,
-        //        GLM-Flash=18G, 14B=9G, Qwen3-8B=5G, Coder-7B=4.4G
-        // With 1.1× tier multiplier and 0.85× usable VRAM.
-        Pack { min_vram: 165.0, models: &["MiniMax-M2.5-Q4_K_M"] },
-        Pack { min_vram: 85.0,  models: &["Qwen2.5-72B-Instruct-Q4_K_M", "Qwen2.5-Coder-32B-Instruct-Q4_K_M"] },
-        Pack { min_vram: 58.0,  models: &["Qwen2.5-72B-Instruct-Q4_K_M"] },
-        Pack { min_vram: 55.0,  models: &["Qwen2.5-32B-Instruct-Q4_K_M", "Qwen3-30B-A3B-Q4_K_M", "Qwen2.5-Coder-7B-Instruct-Q4_K_M"] },
-        Pack { min_vram: 28.0,  models: &["Qwen3-30B-A3B-Q4_K_M", "Qwen2.5-Coder-7B-Instruct-Q4_K_M"] },
-        Pack { min_vram: 22.0,  models: &["GLM-4.7-Flash-Q4_K_M"] },
-        Pack { min_vram: 13.0,  models: &["Qwen3-8B-Q4_K_M", "Qwen2.5-Coder-7B-Instruct-Q4_K_M"] },
-        Pack { min_vram: 0.0,   models: &["Qwen3-8B-Q4_K_M"] },
-    ];
+    let usable = vram_gb * 0.85;
 
-    // Find the best pack that fits
-    for pack in packs {
-        if vram_gb < pack.min_vram {
-            continue;
-        }
-        // Check all models in the pack actually fit within usable VRAM
-        let total: f64 = pack.models.iter().map(|m| size_of(m)).sum();
-        if total <= usable {
-            return pack.models.iter().map(|m| m.to_string()).collect();
-        }
+    // Sort by chat_rank desc, then prefer on-disk, then smaller size (fits more)
+    candidates.sort_by(|a, b| {
+        b.2.cmp(&a.2) // chat_rank desc
+            .then_with(|| {
+                let a_disk = on_disk(a.0);
+                let b_disk = on_disk(b.0);
+                b_disk.cmp(&a_disk) // on-disk first
+            })
+            .then_with(|| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)) // smaller first
+    });
+
+    let mut selected: Vec<String> = Vec::new();
+    let mut remaining = usable;
+
+    // 1. Pick best chat_rank model that fits
+    if let Some(primary) = candidates.iter().find(|(_, size, _, _)| *size <= remaining) {
+        selected.push(primary.0.to_string());
+        remaining -= primary.1;
     }
 
-    // Fallback: find the largest single model that fits, prefer on-disk
-    let on_disk_fit = tiers.iter()
-        .find(|(name, min_vram)| *min_vram <= usable && on_disk(name));
-    let any_fit = tiers.iter().find(|(_, min_vram)| *min_vram <= usable);
+    // 2. Try to add highest tool_rank model that fits and isn't already selected
+    let mut tool_candidates: Vec<_> = candidates.iter()
+        .filter(|(name, size, _, _)| !selected.contains(&name.to_string()) && *size <= remaining)
+        .collect();
+    tool_candidates.sort_by(|a, b| {
+        b.3.cmp(&a.3) // tool_rank desc
+            .then_with(|| {
+                let a_disk = on_disk(a.0);
+                let b_disk = on_disk(b.0);
+                b_disk.cmp(&a_disk)
+            })
+            .then_with(|| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    if let Some(tool_model) = tool_candidates.first() {
+        selected.push(tool_model.0.to_string());
+        remaining -= tool_model.1;
+    }
 
-    let primary = on_disk_fit.or(any_fit)
-        .map(|(name, _)| name.to_string())
-        .unwrap_or_else(|| "Qwen2.5-3B-Instruct-Q4_K_M".into());
-
-    // Try to add a code specialist if there's room
-    let remaining = usable - size_of(&primary);
-    let coders = ["Qwen2.5-Coder-32B-Instruct-Q4_K_M", "Qwen2.5-Coder-14B-Instruct-Q4_K_M", "Qwen2.5-Coder-7B-Instruct-Q4_K_M"];
-    for coder in coders {
-        if coder != primary && fits(coder, remaining) {
-            return vec![primary, coder.to_string()];
+    // 3. Optionally add one more model if significant VRAM remains (>20GB)
+    //    This avoids filling up with tiny filler models that aren't useful.
+    if remaining > 20.0 {
+        for (name, size, _, _) in &candidates {
+            if selected.contains(&name.to_string()) { continue; }
+            if *size <= remaining {
+                selected.push(name.to_string());
+                break;
+            }
         }
     }
 
-    vec![primary]
+    // Fallback: if nothing fit, pick smallest available
+    if selected.is_empty() {
+        let smallest = MODEL_CATALOG.iter()
+            .filter(|m| m.chat_rank > 0)
+            .min_by(|a, b| parse_size_gb(a.size).partial_cmp(&parse_size_gb(b.size)).unwrap());
+        if let Some(m) = smallest {
+            selected.push(m.name.to_string());
+        }
+    }
+
+    selected
 }
 
 /// Models to advertise as "wanted" for demand seeding.
@@ -933,70 +916,87 @@ mod auto_pack_tests {
     fn pack_8gb_single_model() {
         let pack = auto_model_pack(8.0);
         assert_eq!(pack.len(), 1);
+        // Best chat_rank that fits in ~6.8GB usable
         assert_eq!(pack[0], "Qwen3-8B-Q4_K_M");
     }
 
     #[test]
-    fn pack_16gb_dual_model() {
+    fn pack_16gb_generalist_plus_tool() {
         let pack = auto_model_pack(16.0);
         assert_eq!(pack.len(), 2);
-        assert_eq!(pack[0], "Qwen3-8B-Q4_K_M");
-        assert_eq!(pack[1], "Qwen2.5-Coder-7B-Instruct-Q4_K_M");
+        // Best chat_rank fitting ~13.6GB = DeepSeek-R1-Distill-14B (chat_rank=6, 9GB)
+        assert_eq!(pack[0], "DeepSeek-R1-Distill-Qwen-14B-Q4_K_M");
+        // Best tool_rank fitting remaining ~4.6GB
+        assert_eq!(pack[1], "Llama-3.2-3B-Instruct-Q4_K_M");
     }
 
     #[test]
-    fn pack_24gb_glm_flash() {
+    fn pack_24gb_qwen35_27b() {
         let pack = auto_model_pack(24.0);
+        // Qwen3.5-27B: chat_rank=7, 17GB fits in ~20.4GB usable
         assert_eq!(pack.len(), 1);
-        assert_eq!(pack[0], "GLM-4.7-Flash-Q4_K_M");
+        assert_eq!(pack[0], "Qwen3.5-27B-Q4_K_M");
     }
 
     #[test]
     fn pack_32gb_generalist_plus_coder() {
         let pack = auto_model_pack(32.0);
         assert_eq!(pack.len(), 2);
-        assert_eq!(pack[0], "Qwen3-30B-A3B-Q4_K_M");
+        // Qwen3.5-27B (chat_rank=7) + best tool model in remaining ~10GB
+        assert_eq!(pack[0], "Qwen3.5-27B-Q4_K_M");
         assert_eq!(pack[1], "Qwen2.5-Coder-7B-Instruct-Q4_K_M");
     }
 
     #[test]
-    fn pack_52gb_generalist_plus_coder() {
-        // 52GB isn't enough for triple pack (needs 55+), gets dual instead
+    fn pack_52gb_generalist_plus_big_coder() {
         let pack = auto_model_pack(52.0);
         assert_eq!(pack.len(), 2);
-        assert_eq!(pack[0], "Qwen3-30B-A3B-Q4_K_M");
-        assert_eq!(pack[1], "Qwen2.5-Coder-7B-Instruct-Q4_K_M");
-    }
-
-    #[test]
-    fn pack_55gb_triple() {
-        let pack = auto_model_pack(55.0);
-        assert_eq!(pack.len(), 3);
-        assert!(pack.contains(&"Qwen2.5-32B-Instruct-Q4_K_M".to_string()));
-        assert!(pack.contains(&"Qwen3-30B-A3B-Q4_K_M".to_string()));
-        assert!(pack.contains(&"Qwen2.5-Coder-7B-Instruct-Q4_K_M".to_string()));
+        // Qwen3.5-27B + Coder-32B (tool_rank=8) fits in ~44GB usable
+        assert_eq!(pack[0], "Qwen3.5-27B-Q4_K_M");
+        assert_eq!(pack[1], "Qwen2.5-Coder-32B-Instruct-Q4_K_M");
     }
 
     #[test]
     fn pack_72gb_frontier() {
         let pack = auto_model_pack(72.0);
-        assert_eq!(pack.len(), 1);
-        assert_eq!(pack[0], "Qwen2.5-72B-Instruct-Q4_K_M");
+        assert_eq!(pack.len(), 2);
+        // Llama-3.3-70B (chat_rank=8, 43GB) + Coder-14B (tool_rank=6)
+        assert_eq!(pack[0], "Llama-3.3-70B-Instruct-Q4_K_M");
+        assert_eq!(pack[1], "Qwen2.5-Coder-14B-Instruct-Q4_K_M");
     }
 
     #[test]
     fn pack_96gb_frontier_plus_coder() {
         let pack = auto_model_pack(96.0);
         assert_eq!(pack.len(), 2);
-        assert_eq!(pack[0], "Qwen2.5-72B-Instruct-Q4_K_M");
+        // Llama-3.3-70B (chat_rank=8) + Coder-32B (tool_rank=8)
+        assert_eq!(pack[0], "Llama-3.3-70B-Instruct-Q4_K_M");
         assert_eq!(pack[1], "Qwen2.5-Coder-32B-Instruct-Q4_K_M");
     }
 
     #[test]
-    fn pack_206gb_minimax() {
+    fn pack_206gb_minimax_plus_coder() {
         let pack = auto_model_pack(206.0);
-        assert_eq!(pack.len(), 1);
+        assert_eq!(pack.len(), 2);
+        // MiniMax (chat_rank=9, 138GB) + Coder-32B (tool_rank=8)
         assert_eq!(pack[0], "MiniMax-M2.5-Q4_K_M");
+        assert_eq!(pack[1], "Qwen2.5-Coder-32B-Instruct-Q4_K_M");
+    }
+
+    #[test]
+    fn pack_256gb_minimax_plus_frontier_coder() {
+        let pack = auto_model_pack(256.0);
+        assert_eq!(pack.len(), 2);
+        // MiniMax (chat_rank=9) + Coder-Next (tool_rank=9, 48GB)
+        assert_eq!(pack[0], "MiniMax-M2.5-Q4_K_M");
+        assert_eq!(pack[1], "Qwen3-Coder-Next-Q4_K_M");
+    }
+
+    #[test]
+    fn pack_always_returns_something() {
+        // Even tiny VRAM should return at least one model
+        let pack = auto_model_pack(2.0);
+        assert!(!pack.is_empty());
     }
 
     #[test]
