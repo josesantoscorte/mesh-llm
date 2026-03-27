@@ -1,8 +1,6 @@
 mod api;
 mod download;
 mod election;
-mod blackboard;
-mod blackboard_mcp;
 mod hardware;
 mod launch;
 mod mesh;
@@ -13,8 +11,12 @@ mod rewrite;
 mod pipeline;
 mod plugin;
 mod plugin_mcp;
+mod plugins;
 mod router;
 mod tunnel;
+
+pub use plugins::blackboard;
+pub use plugins::blackboard::mcp as blackboard_mcp;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};

@@ -3,6 +3,8 @@
 //! Every node holds the same in-memory list (eventually consistent via flood-fill).
 //! Items expire after 48 hours and the list is capped at 500 items.
 
+pub mod mcp;
+
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex;
