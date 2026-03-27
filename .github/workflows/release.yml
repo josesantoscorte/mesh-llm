@@ -108,7 +108,7 @@ jobs:
     name: Build Linux AMD ROCm
     runs-on: ubuntu-latest
     container:
-      image: rocm/dev-ubuntu-22.04:7.1.1-complete
+      image: rocm/dev-ubuntu-22.04:7.1.1
 
     steps:
       - name: Install base packages
@@ -122,7 +122,10 @@ jobs:
             cmake \
             ninja-build \
             pkg-config \
-            python3
+            python3 \
+            hipblas-dev \
+            rocblas-dev
+          rm -rf /var/lib/apt/lists/*
 
       - uses: actions/checkout@v4
 
