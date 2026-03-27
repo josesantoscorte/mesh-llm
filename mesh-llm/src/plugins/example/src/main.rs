@@ -2,11 +2,11 @@ use anyhow::Result;
 use mesh_llm_plugin::{
     accept_bulk_transfer_message, async_trait, bulk_transfer_sequence, cancel_task_result,
     complete_result, empty_object_schema, get_prompt_result, get_task_payload_result,
-    get_task_result, json_reply_channel_message, json_schema_tool, json_string, list_prompts,
-    list_resource_templates, list_resources, list_tasks, parse_optional_json,
-    plugin_server_info_full, prompt, prompt_argument, proto, read_resource_result, task,
-    tool_with_schema, Plugin, PluginContext, PluginResult, PluginRuntime, SubscriptionSet,
-    TaskStore, ToolCallRequest, ToolRouter,
+    get_task_result, json_reply_channel_message, json_schema_tool, json_string, list_tasks,
+    parse_optional_json, plugin_server_info_full, prompt, prompt_argument, proto,
+    read_resource_result, task, tool_with_schema, Plugin, PluginContext, PluginResult,
+    PluginRuntime, PromptRouter, ResourceRouter, SubscriptionSet, TaskStore, ToolCallRequest,
+    ToolRouter,
 };
 use rmcp::model::{
     AnnotateAble, CallToolResult, CancelTaskParams, CancelTaskResult, CompleteRequestParams,
@@ -450,15 +450,21 @@ impl Plugin for ExamplePlugin {
         _request: Option<PaginatedRequestParams>,
         _context: &mut PluginContext<'_>,
     ) -> PluginResult<Option<ListPromptsResult>> {
-        Ok(Some(list_prompts_result()))
+        Ok(Some(
+            prompt_router(self.state.clone()).list_prompts_result(),
+        ))
     }
 
     async fn get_prompt(
         &mut self,
         request: GetPromptRequestParams,
-        _context: &mut PluginContext<'_>,
+        context: &mut PluginContext<'_>,
     ) -> PluginResult<Option<GetPromptResult>> {
-        Ok(Some(get_example_prompt(&self.state, request).await?))
+        Ok(Some(
+            prompt_router(self.state.clone())
+                .get(request, context)
+                .await?,
+        ))
     }
 
     async fn list_resources(
@@ -466,15 +472,21 @@ impl Plugin for ExamplePlugin {
         _request: Option<PaginatedRequestParams>,
         _context: &mut PluginContext<'_>,
     ) -> PluginResult<Option<ListResourcesResult>> {
-        Ok(Some(list_resources_result()))
+        Ok(Some(
+            resource_router(self.state.clone()).list_resources_result(),
+        ))
     }
 
     async fn read_resource(
         &mut self,
         request: ReadResourceRequestParams,
-        _context: &mut PluginContext<'_>,
+        context: &mut PluginContext<'_>,
     ) -> PluginResult<Option<ReadResourceResult>> {
-        Ok(Some(read_example_resource(&self.state, request).await?))
+        Ok(Some(
+            resource_router(self.state.clone())
+                .read(request, context)
+                .await?,
+        ))
     }
 
     async fn list_resource_templates(
@@ -482,7 +494,9 @@ impl Plugin for ExamplePlugin {
         _request: Option<PaginatedRequestParams>,
         _context: &mut PluginContext<'_>,
     ) -> PluginResult<Option<ListResourceTemplatesResult>> {
-        Ok(Some(list_resource_templates_result()))
+        Ok(Some(
+            resource_router(self.state.clone()).list_resource_templates_result(),
+        ))
     }
 
     async fn subscribe_resource(
@@ -777,8 +791,11 @@ fn server_info() -> ServerInfo {
     )
 }
 
-fn list_prompts_result() -> ListPromptsResult {
-    list_prompts(vec![
+fn prompt_router(state: Arc<Mutex<ExampleState>>) -> PromptRouter {
+    let mut router = PromptRouter::new();
+
+    let status_state = state.clone();
+    router.add(
         prompt(
             "status_brief",
             "Create a short status brief summarizing the current example plugin state.",
@@ -787,6 +804,32 @@ fn list_prompts_result() -> ListPromptsResult {
                 prompt_argument("audience", "Target audience for the brief.", false),
             ]),
         ),
+        move |request, _context| {
+            let state = status_state.clone();
+            Box::pin(async move {
+                let args = request.arguments.unwrap_or_default();
+                let state = state.lock().await;
+                let topic = args
+                    .get("topic")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("mesh health");
+                let audience = args
+                    .get("audience")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("operators");
+                Ok(get_prompt_result(vec![
+                    PromptMessage::new_text(
+                        PromptMessageRole::User,
+                        format!("Write a concise status brief for {audience}. Focus on {topic}."),
+                    ),
+                    PromptMessage::new_text(PromptMessageRole::User, state.snapshot(5).to_string()),
+                ]))
+            })
+        },
+    );
+
+    let peer_state = state.clone();
+    router.add(
         prompt(
             "peer_focus",
             "Summarize a specific peer from the current example state.",
@@ -796,120 +839,105 @@ fn list_prompts_result() -> ListPromptsResult {
                 true,
             )]),
         ),
-    ])
+        move |request, _context| {
+            let state = peer_state.clone();
+            Box::pin(async move {
+                let args = request.arguments.unwrap_or_default();
+                let peer_id = args
+                    .get("peer_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let state = state.lock().await;
+                let peer = state
+                    .known_peers
+                    .get(peer_id)
+                    .map(|peer| serde_json::to_string(peer).unwrap_or_else(|_| "{}".into()))
+                    .unwrap_or_else(|| "{\"missing\":true}".into());
+                Ok(get_prompt_result(vec![
+                    PromptMessage::new_text(
+                        PromptMessageRole::User,
+                        format!("Summarize peer {peer_id} and its current role in the mesh."),
+                    ),
+                    PromptMessage::new_text(PromptMessageRole::User, peer),
+                ]))
+            })
+        },
+    );
+
+    router
 }
 
-async fn get_example_prompt(
-    state: &Arc<Mutex<ExampleState>>,
-    request: GetPromptRequestParams,
-) -> PluginResult<GetPromptResult> {
-    let args = request.arguments.unwrap_or_default();
-    let state = state.lock().await;
-    let snapshot = state.snapshot(5).to_string();
-    let result = match request.name.as_str() {
-        "status_brief" => {
-            let topic = args
-                .get("topic")
-                .and_then(|v| v.as_str())
-                .unwrap_or("mesh health");
-            let audience = args
-                .get("audience")
-                .and_then(|v| v.as_str())
-                .unwrap_or("operators");
-            get_prompt_result(vec![
-                PromptMessage::new_text(
-                    PromptMessageRole::User,
-                    format!("Write a concise status brief for {audience}. Focus on {topic}."),
-                ),
-                PromptMessage::new_text(PromptMessageRole::User, snapshot),
-            ])
-        }
-        "peer_focus" => {
-            let peer_id = args
-                .get("peer_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            let peer = state
-                .known_peers
-                .get(peer_id)
-                .map(|peer| serde_json::to_string(peer).unwrap_or_else(|_| "{}".into()))
-                .unwrap_or_else(|| "{\"missing\":true}".into());
-            get_prompt_result(vec![
-                PromptMessage::new_text(
-                    PromptMessageRole::User,
-                    format!("Summarize peer {peer_id} and its current role in the mesh."),
-                ),
-                PromptMessage::new_text(PromptMessageRole::User, peer),
-            ])
-        }
-        other => {
-            return Err(mesh_llm_plugin::PluginError::invalid_params(format!(
-                "Unknown prompt '{other}'"
-            )))
-        }
-    };
-    Ok(result)
-}
+fn resource_router(state: Arc<Mutex<ExampleState>>) -> ResourceRouter {
+    let mut router = ResourceRouter::new();
 
-fn list_resources_result() -> ListResourcesResult {
-    list_resources(vec![
+    let snapshot_state = state.clone();
+    router.add_exact(
         rmcp::model::RawResource::new("example://snapshot", "Example Snapshot")
             .with_description("Current high-level example plugin snapshot.")
             .with_mime_type("application/json")
             .no_annotation(),
+        move |request, _context| {
+            let state = snapshot_state.clone();
+            Box::pin(async move {
+                let state = state.lock().await;
+                Ok(read_resource_result(vec![
+                    rmcp::model::ResourceContents::text(
+                        state.resource_snapshot().to_string(),
+                        request.uri,
+                    )
+                    .with_mime_type("application/json"),
+                ]))
+            })
+        },
+    );
+
+    let peers_state = state.clone();
+    router.add_exact(
         rmcp::model::RawResource::new("example://peers", "Known Peers")
             .with_description("Current peer inventory seen by the example plugin.")
             .with_mime_type("application/json")
             .no_annotation(),
-    ])
-}
+        move |request, _context| {
+            let state = peers_state.clone();
+            Box::pin(async move {
+                let state = state.lock().await;
+                let payload =
+                    serde_json::to_string(&state.known_peers.values().cloned().collect::<Vec<_>>())
+                        .map_err(|err| mesh_llm_plugin::PluginError::internal(err.to_string()))?;
+                Ok(read_resource_result(vec![
+                    rmcp::model::ResourceContents::text(payload, request.uri)
+                        .with_mime_type("application/json"),
+                ]))
+            })
+        },
+    );
 
-fn list_resource_templates_result() -> ListResourceTemplatesResult {
-    list_resource_templates(vec![rmcp::model::RawResourceTemplate::new(
-        "example://peer/{peer_id}",
-        "Peer Detail",
-    )
-    .with_description("Dynamic resource for a specific peer.")
-    .with_mime_type("application/json")
-    .no_annotation()])
-}
+    let peer_state = state.clone();
+    router.add_prefix_template(
+        rmcp::model::RawResourceTemplate::new("example://peer/{peer_id}", "Peer Detail")
+            .with_description("Dynamic resource for a specific peer.")
+            .with_mime_type("application/json")
+            .no_annotation(),
+        "example://peer/",
+        move |request, _context| {
+            let state = peer_state.clone();
+            Box::pin(async move {
+                let peer_id = request.uri.trim_start_matches("example://peer/");
+                let state = state.lock().await;
+                let payload = state
+                    .known_peers
+                    .get(peer_id)
+                    .map(|peer| serde_json::to_string(peer).unwrap_or_else(|_| "{}".into()))
+                    .unwrap_or_else(|| "{\"missing\":true}".into());
+                Ok(read_resource_result(vec![
+                    rmcp::model::ResourceContents::text(payload, request.uri)
+                        .with_mime_type("application/json"),
+                ]))
+            })
+        },
+    );
 
-async fn read_example_resource(
-    state: &Arc<Mutex<ExampleState>>,
-    request: ReadResourceRequestParams,
-) -> PluginResult<ReadResourceResult> {
-    let state = state.lock().await;
-    let contents = match request.uri.as_str() {
-        "example://snapshot" => vec![rmcp::model::ResourceContents::text(
-            state.resource_snapshot().to_string(),
-            request.uri,
-        )
-        .with_mime_type("application/json")],
-        "example://peers" => vec![rmcp::model::ResourceContents::text(
-            serde_json::to_string(&state.known_peers.values().cloned().collect::<Vec<_>>())
-                .map_err(|err| mesh_llm_plugin::PluginError::internal(err.to_string()))?,
-            request.uri,
-        )
-        .with_mime_type("application/json")],
-        uri if uri.starts_with("example://peer/") => {
-            let peer_id = uri.trim_start_matches("example://peer/");
-            let payload = state
-                .known_peers
-                .get(peer_id)
-                .map(|peer| serde_json::to_string(peer).unwrap_or_else(|_| "{}".into()))
-                .unwrap_or_else(|| "{\"missing\":true}".into());
-            vec![
-                rmcp::model::ResourceContents::text(payload, uri.to_string())
-                    .with_mime_type("application/json"),
-            ]
-        }
-        other => {
-            return Err(mesh_llm_plugin::PluginError::invalid_params(format!(
-                "Unknown resource '{other}'"
-            )))
-        }
-    };
-    Ok(read_resource_result(contents))
+    router
 }
 
 fn complete_example(request: CompleteRequestParams) -> PluginResult<CompleteResult> {

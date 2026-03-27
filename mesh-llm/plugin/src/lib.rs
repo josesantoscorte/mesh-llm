@@ -23,8 +23,9 @@ pub use helpers::{
     parse_get_prompt_request, parse_optional_json, parse_read_resource_request, parse_rpc_params,
     parse_tool_call_request, plugin_server_info, plugin_server_info_full, prompt, prompt_argument,
     read_resource_result, resource_template, structured_tool_result, task, text_resource,
-    tool_error, tool_with_schema, BulkTransferSequence, JsonToolFuture, SubscriptionSet,
-    TaskRecord, TaskStore, ToolCallRequest, ToolFuture, ToolRouter,
+    tool_error, tool_with_schema, BulkTransferSequence, JsonToolFuture, PromptFuture, PromptRouter,
+    ResourceFuture, ResourceRouter, SubscriptionSet, TaskRecord, TaskStore, ToolCallRequest,
+    ToolFuture, ToolRouter,
 };
 pub use io::{
     connect_from_env, read_envelope, send_bulk_transfer_message, send_channel_message,

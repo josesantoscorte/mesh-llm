@@ -4,8 +4,8 @@ use rmcp::model::{
     GetPromptRequestParams, GetPromptResult, GetTaskPayloadResult, GetTaskResult, Implementation,
     ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, ListTasksResult,
     ListToolsResult, Prompt, PromptArgument, ReadResourceRequestParams, ReadResourceResult,
-    Resource, ResourceContents, ResourceTemplate, ServerCapabilities, ServerInfo, Task,
-    TaskStatus, Tool,
+    Resource, ResourceContents, ResourceTemplate, ServerCapabilities, ServerInfo, Task, TaskStatus,
+    Tool,
 };
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
@@ -486,7 +486,8 @@ pub fn parse_read_resource_request(
 
 pub type ToolFuture<'a> = Pin<Box<dyn Future<Output = PluginResult<CallToolResult>> + Send + 'a>>;
 pub type JsonToolFuture<'a, T> = Pin<Box<dyn Future<Output = PluginResult<T>> + Send + 'a>>;
-pub type PromptFuture<'a> = Pin<Box<dyn Future<Output = PluginResult<GetPromptResult>> + Send + 'a>>;
+pub type PromptFuture<'a> =
+    Pin<Box<dyn Future<Output = PluginResult<GetPromptResult>> + Send + 'a>>;
 pub type ResourceFuture<'a> =
     Pin<Box<dyn Future<Output = PluginResult<ReadResourceResult>> + Send + 'a>>;
 
@@ -607,7 +608,10 @@ impl PromptRouter {
 
     pub fn add<F>(&mut self, prompt: Prompt, handler: F)
     where
-        F: for<'a, 'ctx> Fn(GetPromptRequestParams, &'a mut PluginContext<'ctx>) -> PromptFuture<'a>
+        F: for<'a, 'ctx> Fn(
+                GetPromptRequestParams,
+                &'a mut PluginContext<'ctx>,
+            ) -> PromptFuture<'a>
             + Send
             + Sync
             + 'static,
@@ -657,7 +661,10 @@ impl ResourceReadMatcher {
 }
 
 type ResourceHandler = Arc<
-    dyn for<'a, 'ctx> Fn(ReadResourceRequestParams, &'a mut PluginContext<'ctx>) -> ResourceFuture<'a>
+    dyn for<'a, 'ctx> Fn(
+            ReadResourceRequestParams,
+            &'a mut PluginContext<'ctx>,
+        ) -> ResourceFuture<'a>
         + Send
         + Sync,
 >;
@@ -679,7 +686,10 @@ impl ResourceRouter {
 
     pub fn add_exact<F>(&mut self, resource: Resource, handler: F)
     where
-        F: for<'a, 'ctx> Fn(ReadResourceRequestParams, &'a mut PluginContext<'ctx>) -> ResourceFuture<'a>
+        F: for<'a, 'ctx> Fn(
+                ReadResourceRequestParams,
+                &'a mut PluginContext<'ctx>,
+            ) -> ResourceFuture<'a>
             + Send
             + Sync
             + 'static,
@@ -696,7 +706,10 @@ impl ResourceRouter {
         prefix: impl Into<String>,
         handler: F,
     ) where
-        F: for<'a, 'ctx> Fn(ReadResourceRequestParams, &'a mut PluginContext<'ctx>) -> ResourceFuture<'a>
+        F: for<'a, 'ctx> Fn(
+                ReadResourceRequestParams,
+                &'a mut PluginContext<'ctx>,
+            ) -> ResourceFuture<'a>
             + Send
             + Sync
             + 'static,
