@@ -208,9 +208,23 @@ impl MeshApi {
         // Snapshot inner fields and drop the lock before any async node queries.
         // This prevents deadlock: if node.peers() etc. block on node.state.lock(),
         // we don't hold inner.lock() hostage, so other handlers can still proceed.
-        let (node, node_id, token, my_vram_gb, inflight_requests,
-             model_name, model_size_bytes, llama_ready, is_host, is_client,
-             api_port, draft_name, mesh_name, latest_version, nostr_discovery) = {
+        let (
+            node,
+            node_id,
+            token,
+            my_vram_gb,
+            inflight_requests,
+            model_name,
+            model_size_bytes,
+            llama_ready,
+            is_host,
+            is_client,
+            api_port,
+            draft_name,
+            mesh_name,
+            latest_version,
+            nostr_discovery,
+        ) = {
             let inner = self.inner.lock().await;
             (
                 inner.node.clone(),
@@ -260,54 +274,72 @@ impl MeshApi {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let mesh_models: Vec<MeshModelPayload> = catalog.iter().map(|name| {
-            let is_warm = served.contains(name);
-            let node_count = if is_warm {
-                let peer_count = all_peers.iter()
-                    .filter(|p| {
-                        p.serving_models.iter().any(|s| s == name)
-                            || p.serving.as_deref() == Some(name.as_str())
+        let mesh_models: Vec<MeshModelPayload> = catalog
+            .iter()
+            .map(|name| {
+                let is_warm = served.contains(name);
+                let node_count = if is_warm {
+                    let peer_count = all_peers
+                        .iter()
+                        .filter(|p| {
+                            p.serving_models.iter().any(|s| s == name)
+                                || p.serving.as_deref() == Some(name.as_str())
+                        })
+                        .count();
+                    // Count self: check all serving models, fall back to primary model_name
+                    let me = if my_serving_models.iter().any(|s| s == name) || *name == model_name {
+                        1
+                    } else {
+                        0
+                    };
+                    peer_count + me
+                } else {
+                    0
+                };
+                let size_gb = if *name == model_name && model_size_bytes > 0 {
+                    model_size_bytes as f64 / 1e9
+                } else {
+                    download::parse_size_gb(
+                        download::MODEL_CATALOG
+                            .iter()
+                            .find(|m| {
+                                m.file.strip_suffix(".gguf").unwrap_or(m.file) == name.as_str()
+                                    || m.name == name.as_str()
+                            })
+                            .map(|m| m.size)
+                            .unwrap_or("0"),
+                    )
+                };
+                let (request_count, last_active_secs_ago) = match active_demand.get(name) {
+                    Some(d) => (
+                        Some(d.request_count),
+                        Some(now_ts.saturating_sub(d.last_active)),
+                    ),
+                    None => (None, None),
+                };
+                let vision = download::MODEL_CATALOG
+                    .iter()
+                    .find(|m| {
+                        m.name == name.as_str()
+                            || m.file.strip_suffix(".gguf").unwrap_or(m.file) == name.as_str()
                     })
-                    .count();
-                // Count self: check all serving models, fall back to primary model_name
-                let me = if my_serving_models.iter().any(|s| s == name) || *name == model_name { 1 } else { 0 };
-                peer_count + me
-            } else {
-                0
-            };
-            let size_gb = if *name == model_name && model_size_bytes > 0 {
-                model_size_bytes as f64 / 1e9
-            } else {
-                download::parse_size_gb(
-                    download::MODEL_CATALOG.iter()
-                        .find(|m| m.file.strip_suffix(".gguf").unwrap_or(m.file) == name.as_str()
-                            || m.name == name.as_str())
-                        .map(|m| m.size)
-                        .unwrap_or("0")
-                )
-            };
-            let (request_count, last_active_secs_ago) = match active_demand.get(name) {
-                Some(d) => (
-                    Some(d.request_count),
-                    Some(now_ts.saturating_sub(d.last_active)),
-                ),
-                None => (None, None),
-            };
-            let vision = download::MODEL_CATALOG.iter()
-                .find(|m| m.name == name.as_str()
-                    || m.file.strip_suffix(".gguf").unwrap_or(m.file) == name.as_str())
-                .map(|m| m.mmproj.is_some())
-                .unwrap_or(false);
-            MeshModelPayload {
-                name: name.clone(),
-                status: if is_warm { "warm".into() } else { "cold".into() },
-                node_count,
-                size_gb,
-                vision,
-                request_count,
-                last_active_secs_ago,
-            }
-        }).collect();
+                    .map(|m| m.mmproj.is_some())
+                    .unwrap_or(false);
+                MeshModelPayload {
+                    name: name.clone(),
+                    status: if is_warm {
+                        "warm".into()
+                    } else {
+                        "cold".into()
+                    },
+                    node_count,
+                    size_gb,
+                    vision,
+                    request_count,
+                    last_active_secs_ago,
+                }
+            })
+            .collect();
 
         let (launch_pi, launch_goose) = if llama_ready {
             (
@@ -324,10 +356,10 @@ impl MeshApi {
         let node_status = if is_client {
             "Client".to_string()
         } else if is_host && llama_ready {
-            let has_split_workers = all_peers.iter().any(|p|
-                matches!(p.role, mesh::NodeRole::Worker) &&
-                p.serving.as_deref() == Some(model_name.as_str())
-            );
+            let has_split_workers = all_peers.iter().any(|p| {
+                matches!(p.role, mesh::NodeRole::Worker)
+                    && p.serving.as_deref() == Some(model_name.as_str())
+            });
             if has_split_workers {
                 "Serving (split)".to_string()
             } else {
@@ -409,8 +441,7 @@ pub async fn start(
                 | election::InferenceTarget::MoeLocal(port) => {
                     state2.set_llama_port(Some(port)).await;
                 }
-                election::InferenceTarget::Remote(_)
-                | election::InferenceTarget::MoeRemote(_) => {
+                election::InferenceTarget::Remote(_) | election::InferenceTarget::MoeRemote(_) => {
                     let mut inner = state2.inner.lock().await;
                     inner.llama_ready = true;
                     inner.llama_port = None;
@@ -496,7 +527,9 @@ pub async fn start(
 
 async fn handle_request(mut stream: TcpStream, state: &MeshApi) -> anyhow::Result<()> {
     let mut buf = vec![0u8; 8192];
-    let n = match tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut buf)).await {
+    let n = match tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut buf))
+        .await
+    {
         Ok(Ok(n)) => n,
         Ok(Err(e)) => return Err(e.into()),
         Err(_) => return Ok(()), // read timeout — health check probe, just close
@@ -530,7 +563,11 @@ async fn handle_request(mut stream: TcpStream, state: &MeshApi) -> anyhow::Resul
         }
 
         // ── Frontend static assets (bundled UI dist) ──
-        ("GET", p) if p.starts_with("/assets/") || matches!(p.rsplit('.').next(), Some("png" | "ico" | "webmanifest")) || (p.ends_with(".json") && !p.starts_with("/api/")) => {
+        ("GET", p)
+            if p.starts_with("/assets/")
+                || matches!(p.rsplit('.').next(), Some("png" | "ico" | "webmanifest"))
+                || (p.ends_with(".json") && !p.starts_with("/api/")) =>
+        {
             if !respond_console_asset(&mut stream, p).await? {
                 respond_error(&mut stream, 404, "Not found").await?;
             }
@@ -652,7 +689,10 @@ async fn handle_request(mut stream: TcpStream, state: &MeshApi) -> anyhow::Resul
                 let body = req.split("\r\n\r\n").nth(1).unwrap_or("{}");
                 let payload = if body.trim().is_empty() { "{}" } else { body };
                 let plugin_manager = state.inner.lock().await.plugin_manager.clone();
-                match plugin_manager.call_tool(plugin_name, tool_name, payload).await {
+                match plugin_manager
+                    .call_tool(plugin_name, tool_name, payload)
+                    .await
+                {
                     Ok(result) if !result.is_error => {
                         let resp = format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
@@ -676,7 +716,10 @@ async fn handle_request(mut stream: TcpStream, state: &MeshApi) -> anyhow::Resul
         // ── Blackboard ──
         ("GET", "/api/blackboard/feed") => {
             let plugin_manager = state.inner.lock().await.plugin_manager.clone();
-            if !plugin_manager.is_enabled(plugin::BLACKBOARD_PLUGIN_ID).await {
+            if !plugin_manager
+                .is_enabled(plugin::BLACKBOARD_PLUGIN_ID)
+                .await
+            {
                 respond_error(&mut stream, 404, "Blackboard is disabled on this node").await?;
             } else {
                 let query_str = path.split('?').nth(1).unwrap_or("");
@@ -685,7 +728,10 @@ async fn handle_request(mut stream: TcpStream, state: &MeshApi) -> anyhow::Resul
                     .filter_map(|p| p.split_once('='))
                     .collect();
                 let request = crate::blackboard::FeedRequest {
-                    from: params.iter().find(|(k, _)| *k == "from").map(|(_, v)| (*v).to_string()),
+                    from: params
+                        .iter()
+                        .find(|(k, _)| *k == "from")
+                        .map(|(_, v)| (*v).to_string()),
                     limit: params
                         .iter()
                         .find(|(k, _)| *k == "limit")
@@ -726,7 +772,10 @@ async fn handle_request(mut stream: TcpStream, state: &MeshApi) -> anyhow::Resul
 
         ("GET", "/api/blackboard/search") => {
             let plugin_manager = state.inner.lock().await.plugin_manager.clone();
-            if !plugin_manager.is_enabled(plugin::BLACKBOARD_PLUGIN_ID).await {
+            if !plugin_manager
+                .is_enabled(plugin::BLACKBOARD_PLUGIN_ID)
+                .await
+            {
                 respond_error(&mut stream, 404, "Blackboard is disabled on this node").await?;
             } else {
                 let query_str = path.split('?').nth(1).unwrap_or("");
@@ -783,7 +832,10 @@ async fn handle_request(mut stream: TcpStream, state: &MeshApi) -> anyhow::Resul
                 let inner = state.inner.lock().await;
                 (inner.node.clone(), inner.plugin_manager.clone())
             };
-            if !plugin_manager.is_enabled(plugin::BLACKBOARD_PLUGIN_ID).await {
+            if !plugin_manager
+                .is_enabled(plugin::BLACKBOARD_PLUGIN_ID)
+                .await
+            {
                 respond_error(&mut stream, 404, "Blackboard is disabled on this node").await?;
             } else {
                 let body = req.split("\r\n\r\n").nth(1).unwrap_or("");
@@ -822,11 +874,16 @@ async fn handle_request(mut stream: TcpStream, state: &MeshApi) -> anyhow::Resul
                                     } else {
                                         400
                                     };
-                                    respond_error(&mut stream, status, &result.content_json).await?;
+                                    respond_error(&mut stream, status, &result.content_json)
+                                        .await?;
                                 }
                                 Err(e) => {
                                     let msg = e.to_string();
-                                    let status = if msg.contains("Rate limited") { 429 } else { 400 };
+                                    let status = if msg.contains("Rate limited") {
+                                        429
+                                    } else {
+                                        400
+                                    };
                                     respond_error(&mut stream, status, &msg).await?;
                                 }
                             }
@@ -927,7 +984,15 @@ async fn respond_console_asset(stream: &mut TcpStream, path: &str) -> anyhow::Re
     } else {
         "public, max-age=3600"
     };
-    respond_bytes_cached(stream, 200, "OK", content_type, cache_control, file.contents()).await?;
+    respond_bytes_cached(
+        stream,
+        200,
+        "OK",
+        content_type,
+        cache_control,
+        file.contents(),
+    )
+    .await?;
     Ok(true)
 }
 
@@ -1005,13 +1070,19 @@ mod tests {
         );
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].vram_bytes, 34_359_738_368);
-        assert_eq!(result[1].vram_bytes, 0, "missing VRAM entry should default to 0");
+        assert_eq!(
+            result[1].vram_bytes, 0,
+            "missing VRAM entry should default to 0"
+        );
     }
 
     #[test]
     fn test_build_gpus_vram_no_gpu_name() {
         let result = build_gpus(None, Some("34359738368"));
-        assert!(result.is_empty(), "no gpu_name means no entries even if vram present");
+        assert!(
+            result.is_empty(),
+            "no gpu_name means no entries even if vram present"
+        );
     }
 
     #[test]

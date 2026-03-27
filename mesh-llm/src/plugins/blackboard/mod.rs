@@ -7,18 +7,26 @@ pub mod mcp;
 
 use anyhow::Result;
 use mesh_llm_plugin::{
-    Plugin, PluginContext, PluginResult, PluginRuntime, ToolCallRequest, async_trait,
-    json_channel_message, json_schema_tool, list_tools, plugin_server_info, proto,
-    structured_tool_result,
+    async_trait, json_schema_tool, plugin_server_info, proto, MeshVisibility, Plugin,
+    PluginContext, PluginResult, PluginRuntime, ToolCallRequest, ToolRouter,
 };
 use rmcp::model::{CallToolResult, ListToolsResult, ServerInfo};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
 pub const BLACKBOARD_CHANNEL: &str = "blackboard.v1";
+
+pub(crate) fn should_launch(
+    mesh_visibility: MeshVisibility,
+    enable_in_public_meshes: bool,
+) -> bool {
+    match mesh_visibility {
+        MeshVisibility::Private => true,
+        MeshVisibility::Public => enable_in_public_meshes,
+    }
+}
 
 /// Max items to keep in memory.
 const MAX_ITEMS: usize = 500;
@@ -308,19 +316,70 @@ impl BlackboardPlugin {
     }
 }
 
-fn blackboard_channel_message(
-    target_peer_id: String,
-    payload: &BlackboardMessage,
-) -> PluginResult<proto::ChannelMessage> {
-    json_channel_message(BLACKBOARD_CHANNEL, target_peer_id, "blackboard", payload)
-}
+fn tool_router(store: BlackboardStore) -> ToolRouter {
+    let mut router = ToolRouter::new();
 
-fn tools() -> Vec<rmcp::model::Tool> {
-    vec![
+    let feed_store = store.clone();
+    router.add_json_default::<FeedRequest, Vec<BlackboardItem>, _>(
         json_schema_tool::<FeedRequest>("feed", "Read the recent blackboard feed."),
+        move |request, _context| {
+            let store = feed_store.clone();
+            Box::pin(async move {
+                Ok(store
+                    .feed(request.since, request.from.as_deref(), request.limit)
+                    .await)
+            })
+        },
+    );
+
+    let search_store = store.clone();
+    router.add_json::<SearchRequest, Vec<BlackboardItem>, _>(
         json_schema_tool::<SearchRequest>("search", "Search blackboard messages."),
+        move |request, _context| {
+            let store = search_store.clone();
+            Box::pin(async move {
+                let mut items = store.search(&request.query, request.since).await;
+                items.truncate(request.limit.max(1));
+                Ok(items)
+            })
+        },
+    );
+
+    router.add_json::<PostRequest, BlackboardItem, _>(
         json_schema_tool::<PostRequest>("post", "Post a blackboard message."),
-    ]
+        move |request, context| {
+            let store = store.clone();
+            Box::pin(async move {
+                let from = if request.from.trim().is_empty() {
+                    "mcp".to_string()
+                } else {
+                    request.from
+                };
+                let peer_id = if request.peer_id.trim().is_empty() {
+                    "mcp".to_string()
+                } else {
+                    request.peer_id
+                };
+                let item = BlackboardItem::new(from, peer_id, request.text);
+                let posted = store
+                    .post(item)
+                    .await
+                    .map_err(mesh_llm_plugin::PluginError::invalid_params)?;
+                context
+                    .send_json_channel(
+                        BLACKBOARD_CHANNEL,
+                        String::new(),
+                        "blackboard",
+                        &BlackboardMessage::Post(posted.clone()),
+                    )
+                    .await
+                    .map_err(mesh_llm_plugin::PluginError::from)?;
+                Ok(posted)
+            })
+        },
+    );
+
+    router
 }
 
 #[async_trait]
@@ -351,10 +410,12 @@ impl Plugin for BlackboardPlugin {
 
     async fn on_initialized(&mut self, context: &mut PluginContext<'_>) -> Result<()> {
         context
-            .send_channel(blackboard_channel_message(
+            .send_json_channel(
+                BLACKBOARD_CHANNEL,
                 String::new(),
+                "blackboard",
                 &BlackboardMessage::SyncRequest,
-            )?)
+            )
             .await
     }
 
@@ -366,7 +427,7 @@ impl Plugin for BlackboardPlugin {
         &mut self,
         _context: &mut PluginContext<'_>,
     ) -> PluginResult<Option<ListToolsResult>> {
-        Ok(Some(list_tools(tools())))
+        Ok(Some(tool_router(self.store.clone()).list_tools_result()))
     }
 
     async fn call_tool(
@@ -374,7 +435,11 @@ impl Plugin for BlackboardPlugin {
         request: ToolCallRequest,
         context: &mut PluginContext<'_>,
     ) -> PluginResult<Option<CallToolResult>> {
-        Ok(Some(self.handle_tool_call(request, context).await?))
+        Ok(Some(
+            tool_router(self.store.clone())
+                .call(request, context)
+                .await?,
+        ))
     }
 
     async fn on_channel_message(
@@ -394,31 +459,38 @@ impl Plugin for BlackboardPlugin {
             BlackboardMessage::SyncRequest => {
                 let ids = self.store.ids().await;
                 context
-                    .send_channel(blackboard_channel_message(
+                    .send_json_channel(
+                        BLACKBOARD_CHANNEL,
                         message.source_peer_id,
+                        "blackboard",
                         &BlackboardMessage::SyncDigest(ids),
-                    )?)
+                    )
                     .await?;
             }
             BlackboardMessage::SyncDigest(ids) => {
                 let our_ids = self.store.ids().await;
-                let missing: Vec<u64> = ids.into_iter().filter(|id| !our_ids.contains(id)).collect();
+                let missing: Vec<u64> =
+                    ids.into_iter().filter(|id| !our_ids.contains(id)).collect();
                 if !missing.is_empty() {
                     context
-                        .send_channel(blackboard_channel_message(
+                        .send_json_channel(
+                            BLACKBOARD_CHANNEL,
                             message.source_peer_id,
+                            "blackboard",
                             &BlackboardMessage::FetchRequest(missing),
-                        )?)
+                        )
                         .await?;
                 }
             }
             BlackboardMessage::FetchRequest(ids) => {
                 let items = self.store.get_by_ids(&ids).await;
                 context
-                    .send_channel(blackboard_channel_message(
+                    .send_json_channel(
+                        BLACKBOARD_CHANNEL,
                         message.source_peer_id,
+                        "blackboard",
                         &BlackboardMessage::FetchResponse(items),
-                    )?)
+                    )
                     .await?;
             }
             BlackboardMessage::FetchResponse(items) => {
@@ -431,63 +503,6 @@ impl Plugin for BlackboardPlugin {
         Ok(())
     }
 }
-
-impl BlackboardPlugin {
-    async fn handle_tool_call(
-        &self,
-        request: ToolCallRequest,
-        context: &mut PluginContext<'_>,
-    ) -> PluginResult<CallToolResult> {
-        match request.name.as_str() {
-            "feed" => {
-                let request: FeedRequest = request.arguments_or_default()?;
-                structured_tool_result(json!(
-                    self.store
-                        .feed(request.since, request.from.as_deref(), request.limit)
-                        .await
-                ))
-            }
-            "search" => {
-                let request: SearchRequest = request.arguments()?;
-                let mut items = self.store.search(&request.query, request.since).await;
-                items.truncate(request.limit.max(1));
-                structured_tool_result(json!(items))
-            }
-            "post" => {
-                let request: PostRequest = request.arguments()?;
-                let from = if request.from.trim().is_empty() {
-                    "mcp".to_string()
-                } else {
-                    request.from
-                };
-                let peer_id = if request.peer_id.trim().is_empty() {
-                    "mcp".to_string()
-                } else {
-                    request.peer_id
-                };
-                let item = BlackboardItem::new(from, peer_id, request.text);
-                let posted = self
-                    .store
-                    .post(item)
-                    .await
-                    .map_err(mesh_llm_plugin::PluginError::invalid_params)?;
-                context
-                    .send_channel(blackboard_channel_message(
-                        String::new(),
-                        &BlackboardMessage::Post(posted.clone()),
-                    )?)
-                    .await
-                    .map_err(|err| mesh_llm_plugin::PluginError::internal(err.to_string()))?;
-                structured_tool_result(json!(posted))
-            }
-            _ => Err(mesh_llm_plugin::PluginError::method_not_found(format!(
-                "Unknown tool '{}'",
-                request.name
-            ))),
-        }
-    }
-}
-
 // ── PII filter ──
 
 /// Check text for obvious PII/secrets. Returns list of issues found.

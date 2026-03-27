@@ -1,5 +1,6 @@
 use anyhow::{anyhow, bail, Context, Result};
 pub use mesh_llm_plugin::proto;
+use mesh_llm_plugin::MeshVisibility;
 use prost::Message;
 use rmcp::model::{
     CallToolResult as McpCallToolResult, ErrorCode, InitializeRequestParams, ListToolsResult,
@@ -42,6 +43,7 @@ pub struct PluginConfigEntry {
 #[derive(Clone, Debug)]
 pub struct ResolvedPlugins {
     pub externals: Vec<ExternalPluginSpec>,
+    pub inactive: Vec<PluginSummary>,
 }
 
 #[derive(Clone, Debug)]
@@ -49,6 +51,12 @@ pub struct ExternalPluginSpec {
     pub name: String,
     pub command: String,
     pub args: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PluginHostMode {
+    pub mesh_visibility: MeshVisibility,
+    pub blackboard_in_public_meshes: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -126,6 +134,7 @@ pub struct PluginManager {
 
 struct PluginManagerInner {
     plugins: BTreeMap<String, ExternalPlugin>,
+    inactive: BTreeMap<String, PluginSummary>,
     rpc_bridge: Arc<Mutex<Option<Arc<dyn PluginRpcBridge>>>>,
 }
 
@@ -183,8 +192,9 @@ pub fn load_config(override_path: Option<&Path>) -> Result<MeshConfig> {
     toml::from_str(&raw).with_context(|| format!("Failed to parse config {}", path.display()))
 }
 
-pub fn resolve_plugins(config: &MeshConfig) -> Result<ResolvedPlugins> {
+pub fn resolve_plugins(config: &MeshConfig, host_mode: PluginHostMode) -> Result<ResolvedPlugins> {
     let mut externals = Vec::new();
+    let mut inactive = Vec::new();
     let mut names = BTreeMap::<String, ()>::new();
     let mut blackboard_enabled = true;
     for entry in &config.plugins {
@@ -217,10 +227,26 @@ pub fn resolve_plugins(config: &MeshConfig) -> Result<ResolvedPlugins> {
     }
 
     if blackboard_enabled {
-        externals.insert(0, blackboard_plugin_spec()?);
+        if crate::plugins::blackboard::should_launch(
+            host_mode.mesh_visibility,
+            host_mode.blackboard_in_public_meshes,
+        ) {
+            externals.insert(0, blackboard_plugin_spec()?);
+        } else {
+            inactive.push(disabled_plugin_summary(
+                BLACKBOARD_PLUGIN_ID,
+                "builtin",
+                None,
+                Vec::new(),
+                "Disabled in public meshes",
+            ));
+        }
     }
 
-    Ok(ResolvedPlugins { externals })
+    Ok(ResolvedPlugins {
+        externals,
+        inactive,
+    })
 }
 
 pub fn blackboard_plugin_spec() -> Result<ExternalPluginSpec> {
@@ -233,6 +259,27 @@ pub fn blackboard_plugin_spec() -> Result<ExternalPluginSpec> {
         command,
         args: vec!["--plugin".into(), BLACKBOARD_PLUGIN_ID.into()],
     })
+}
+
+fn disabled_plugin_summary(
+    name: impl Into<String>,
+    kind: impl Into<String>,
+    command: Option<String>,
+    args: Vec<String>,
+    reason: impl Into<String>,
+) -> PluginSummary {
+    PluginSummary {
+        name: name.into(),
+        kind: kind.into(),
+        enabled: false,
+        status: "disabled".into(),
+        version: None,
+        capabilities: Vec::new(),
+        command,
+        args,
+        tools: Vec::new(),
+        error: Some(reason.into()),
+    }
 }
 
 impl PluginManager {
@@ -290,6 +337,12 @@ impl PluginManager {
         let manager = Self {
             inner: Arc::new(PluginManagerInner {
                 plugins,
+                inactive: specs
+                    .inactive
+                    .iter()
+                    .cloned()
+                    .map(|summary| (summary.name.clone(), summary))
+                    .collect(),
                 rpc_bridge,
             }),
         };
@@ -298,10 +351,13 @@ impl PluginManager {
     }
 
     pub async fn list(&self) -> Vec<PluginSummary> {
-        let mut summaries = Vec::with_capacity(self.inner.plugins.len());
+        let mut summaries =
+            Vec::with_capacity(self.inner.plugins.len() + self.inner.inactive.len());
         for plugin in self.inner.plugins.values() {
             summaries.push(plugin.summary.lock().await.clone());
         }
+        summaries.extend(self.inner.inactive.values().cloned());
+        summaries.sort_by(|a, b| a.name.cmp(&b.name));
         summaries
     }
 
@@ -315,6 +371,13 @@ impl PluginManager {
     }
 
     pub async fn tools(&self, name: &str) -> Result<Vec<ToolSummary>> {
+        if let Some(summary) = self.inner.inactive.get(name) {
+            bail!(
+                "Plugin '{}' is disabled: {}",
+                name,
+                summary.error.as_deref().unwrap_or("unavailable")
+            );
+        }
         let plugin = self
             .inner
             .plugins
@@ -329,6 +392,13 @@ impl PluginManager {
         tool_name: &str,
         arguments_json: &str,
     ) -> Result<ToolCallResult> {
+        if let Some(summary) = self.inner.inactive.get(plugin_name) {
+            bail!(
+                "Plugin '{}' is disabled: {}",
+                plugin_name,
+                summary.error.as_deref().unwrap_or("unavailable")
+            );
+        }
         let plugin = self
             .inner
             .plugins
@@ -342,6 +412,13 @@ impl PluginManager {
         T: serde::de::DeserializeOwned,
         P: Serialize,
     {
+        if let Some(summary) = self.inner.inactive.get(plugin_name) {
+            bail!(
+                "Plugin '{}' is disabled: {}",
+                plugin_name,
+                summary.error.as_deref().unwrap_or("unavailable")
+            );
+        }
         let plugin = self
             .inner
             .plugins
@@ -354,6 +431,13 @@ impl PluginManager {
     where
         P: Serialize,
     {
+        if let Some(summary) = self.inner.inactive.get(plugin_name) {
+            bail!(
+                "Plugin '{}' is disabled: {}",
+                plugin_name,
+                summary.error.as_deref().unwrap_or("unavailable")
+            );
+        }
         let plugin = self
             .inner
             .plugins
@@ -1340,11 +1424,19 @@ fn format_tool_names_for_log(tools: &[ToolSummary]) -> String {
 mod tests {
     use super::*;
 
+    fn private_host_mode() -> PluginHostMode {
+        PluginHostMode {
+            mesh_visibility: MeshVisibility::Private,
+            blackboard_in_public_meshes: false,
+        }
+    }
+
     #[test]
     fn resolves_default_blackboard_plugin() {
-        let resolved = resolve_plugins(&MeshConfig::default()).unwrap();
+        let resolved = resolve_plugins(&MeshConfig::default(), private_host_mode()).unwrap();
         assert_eq!(resolved.externals.len(), 1);
         assert_eq!(resolved.externals[0].name, BLACKBOARD_PLUGIN_ID);
+        assert!(resolved.inactive.is_empty());
     }
 
     #[test]
@@ -1357,8 +1449,41 @@ mod tests {
                 args: Vec::new(),
             }],
         };
-        let resolved = resolve_plugins(&config).unwrap();
+        let resolved = resolve_plugins(&config, private_host_mode()).unwrap();
         assert!(resolved.externals.is_empty());
+        assert!(resolved.inactive.is_empty());
+    }
+
+    #[test]
+    fn blackboard_is_not_launched_on_public_meshes_by_default() {
+        let resolved = resolve_plugins(
+            &MeshConfig::default(),
+            PluginHostMode {
+                mesh_visibility: MeshVisibility::Public,
+                blackboard_in_public_meshes: false,
+            },
+        )
+        .unwrap();
+        assert!(resolved.externals.is_empty());
+        assert_eq!(resolved.inactive.len(), 1);
+        assert_eq!(resolved.inactive[0].name, BLACKBOARD_PLUGIN_ID);
+        assert!(!resolved.inactive[0].enabled);
+        assert_eq!(resolved.inactive[0].status, "disabled");
+    }
+
+    #[test]
+    fn blackboard_can_be_enabled_on_public_meshes() {
+        let resolved = resolve_plugins(
+            &MeshConfig::default(),
+            PluginHostMode {
+                mesh_visibility: MeshVisibility::Public,
+                blackboard_in_public_meshes: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(resolved.externals.len(), 1);
+        assert_eq!(resolved.externals[0].name, BLACKBOARD_PLUGIN_ID);
+        assert!(resolved.inactive.is_empty());
     }
 
     #[test]
@@ -1371,8 +1496,9 @@ mod tests {
                 args: vec!["--flag".into()],
             }],
         };
-        let resolved = resolve_plugins(&config).unwrap();
+        let resolved = resolve_plugins(&config, private_host_mode()).unwrap();
         assert_eq!(resolved.externals.len(), 2);
         assert_eq!(resolved.externals[1].name, "demo");
+        assert!(resolved.inactive.is_empty());
     }
 }

@@ -1,26 +1,26 @@
 use anyhow::Result;
 use mesh_llm_plugin::{
-    Plugin, PluginContext, PluginResult, PluginRuntime, ToolCallRequest, async_trait,
-    bulk_transfer_message, channel_message, empty_object_schema, json_bytes, json_schema_tool,
-    json_string, list_prompts, list_resource_templates, list_resources, list_tasks, list_tools,
-    parse_optional_json, prompt, prompt_argument, proto, read_resource_result,
-    structured_tool_result, task, tool_error, tool_with_schema,
-    complete_result, get_prompt_result, get_task_payload_result, get_task_result,
-    cancel_task_result,
+    accept_bulk_transfer_message, async_trait, bulk_transfer_sequence, cancel_task_result,
+    complete_result, empty_object_schema, get_prompt_result, get_task_payload_result,
+    get_task_result, json_reply_channel_message, json_schema_tool, json_string, list_prompts,
+    list_resource_templates, list_resources, list_tasks, parse_optional_json,
+    plugin_server_info_full, prompt, prompt_argument, proto, read_resource_result, task,
+    tool_with_schema, Plugin, PluginContext, PluginResult, PluginRuntime, SubscriptionSet,
+    TaskStore, ToolCallRequest, ToolRouter,
 };
 use rmcp::model::{
-    CallToolResult, CancelTaskParams, CancelTaskResult, CompleteRequestParams, CompleteResult,
-    GetPromptRequestParams, GetPromptResult, GetTaskInfoParams, GetTaskPayloadResult,
-    GetTaskResult, GetTaskResultParams, ListPromptsResult, ListResourceTemplatesResult,
-    ListResourcesResult, ListTasksResult, ListToolsResult, LoggingLevel, PaginatedRequestParams,
-    ReadResourceRequestParams, ReadResourceResult, ServerCapabilities, ServerInfo, SetLevelRequestParams,
-    SubscribeRequestParams, Task, TaskStatus, PromptMessage, PromptMessageRole,
-    UnsubscribeRequestParams, AnnotateAble, RawResource, RawResourceTemplate,
+    AnnotateAble, CallToolResult, CancelTaskParams, CancelTaskResult, CompleteRequestParams,
+    CompleteResult, GetPromptRequestParams, GetPromptResult, GetTaskInfoParams,
+    GetTaskPayloadResult, GetTaskResult, GetTaskResultParams, ListPromptsResult,
+    ListResourceTemplatesResult, ListResourcesResult, ListTasksResult, ListToolsResult,
+    LoggingLevel, PaginatedRequestParams, PromptMessage, PromptMessageRole,
+    ReadResourceRequestParams, ReadResourceResult, ServerInfo, SetLevelRequestParams,
+    SubscribeRequestParams, TaskStatus, UnsubscribeRequestParams,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -141,15 +141,9 @@ struct ExampleState {
     sent_channel_messages: usize,
     sent_bulk_transfers: usize,
     next_id: u64,
-    subscriptions: BTreeSet<String>,
+    subscriptions: SubscriptionSet,
     log_level: LoggingLevel,
-    tasks: BTreeMap<String, ExampleTask>,
-}
-
-#[derive(Clone)]
-struct ExampleTask {
-    task: Task,
-    payload: serde_json::Value,
+    tasks: TaskStore<serde_json::Value>,
 }
 
 impl ExampleState {
@@ -184,7 +178,7 @@ impl ExampleState {
             "recent_channel_messages": recent_items(&self.channel_messages, limit),
             "recent_bulk_events": recent_items(&self.bulk_events, limit),
             "completed_transfers": recent_items(&completed_transfers, limit),
-            "subscriptions": self.subscriptions.iter().cloned().collect::<Vec<_>>(),
+            "subscriptions": self.subscriptions.list(),
             "log_level": format!("{:?}", self.log_level).to_lowercase(),
             "tasks": self.tasks.values().map(|task| json!({
                 "task_id": task.task.task_id,
@@ -344,7 +338,7 @@ impl ExampleState {
             "local_peer_id": self.local_peer_id,
             "mesh_id": self.mesh_id,
             "log_level": format!("{:?}", self.log_level).to_lowercase(),
-            "subscriptions": self.subscriptions.iter().cloned().collect::<Vec<_>>(),
+            "subscriptions": self.subscriptions.list(),
         })
     }
 }
@@ -355,7 +349,7 @@ struct ExamplePlugin {
 
 impl Default for ExampleState {
     fn default() -> Self {
-        let bootstrap_task = example_task(
+        let (bootstrap_task, bootstrap_payload) = example_task(
             "example-bootstrap",
             TaskStatus::Completed,
             "Bootstrap complete",
@@ -365,7 +359,7 @@ impl Default for ExampleState {
                 "plugin": PLUGIN_ID,
             }),
         );
-        let long_running_task = example_task(
+        let (long_running_task, long_running_payload) = example_task(
             "example-watch",
             TaskStatus::Working,
             "Watching mesh events",
@@ -376,9 +370,9 @@ impl Default for ExampleState {
             }),
         );
 
-        let mut tasks = BTreeMap::new();
-        tasks.insert(bootstrap_task.task.task_id.clone(), bootstrap_task);
-        tasks.insert(long_running_task.task.task_id.clone(), long_running_task);
+        let mut tasks = TaskStore::default();
+        tasks.insert(bootstrap_task, bootstrap_payload);
+        tasks.insert(long_running_task, long_running_payload);
 
         Self {
             local_peer_id: String::new(),
@@ -392,7 +386,7 @@ impl Default for ExampleState {
             sent_channel_messages: 0,
             sent_bulk_transfers: 0,
             next_id: 0,
-            subscriptions: BTreeSet::new(),
+            subscriptions: SubscriptionSet::default(),
             log_level: LoggingLevel::Info,
             tasks,
         }
@@ -436,7 +430,7 @@ impl Plugin for ExamplePlugin {
         &mut self,
         _context: &mut PluginContext<'_>,
     ) -> PluginResult<Option<ListToolsResult>> {
-        Ok(Some(list_tools_result()))
+        Ok(Some(tool_router(self.state.clone()).list_tools_result()))
     }
 
     async fn call_tool(
@@ -444,7 +438,11 @@ impl Plugin for ExamplePlugin {
         request: ToolCallRequest,
         context: &mut PluginContext<'_>,
     ) -> PluginResult<Option<CallToolResult>> {
-        Ok(Some(handle_tool_call(&self.state, context, request).await?))
+        Ok(Some(
+            tool_router(self.state.clone())
+                .call(request, context)
+                .await?,
+        ))
     }
 
     async fn list_prompts(
@@ -492,7 +490,7 @@ impl Plugin for ExamplePlugin {
         request: SubscribeRequestParams,
         _context: &mut PluginContext<'_>,
     ) -> PluginResult<Option<()>> {
-        self.state.lock().await.subscriptions.insert(request.uri);
+        self.state.lock().await.subscriptions.subscribe(request.uri);
         Ok(Some(()))
     }
 
@@ -501,7 +499,11 @@ impl Plugin for ExamplePlugin {
         request: UnsubscribeRequestParams,
         _context: &mut PluginContext<'_>,
     ) -> PluginResult<Option<()>> {
-        self.state.lock().await.subscriptions.remove(&request.uri);
+        self.state
+            .lock()
+            .await
+            .subscriptions
+            .unsubscribe(&request.uri);
         Ok(Some(()))
     }
 
@@ -528,9 +530,7 @@ impl Plugin for ExamplePlugin {
         _context: &mut PluginContext<'_>,
     ) -> PluginResult<Option<ListTasksResult>> {
         let state = self.state.lock().await;
-        Ok(Some(list_tasks(
-            state.tasks.values().map(|task| task.task.clone()).collect(),
-        )))
+        Ok(Some(list_tasks(state.tasks.list())))
     }
 
     async fn get_task_info(
@@ -539,10 +539,7 @@ impl Plugin for ExamplePlugin {
         _context: &mut PluginContext<'_>,
     ) -> PluginResult<Option<GetTaskResult>> {
         let state = self.state.lock().await;
-        let task = state
-            .tasks
-            .get(&request.task_id)
-            .ok_or_else(|| mesh_llm_plugin::PluginError::invalid_params(format!("Unknown task '{}'", request.task_id)))?;
+        let task = state.tasks.get(&request.task_id)?;
         Ok(Some(get_task_result(task.task.clone())))
     }
 
@@ -552,10 +549,7 @@ impl Plugin for ExamplePlugin {
         _context: &mut PluginContext<'_>,
     ) -> PluginResult<Option<GetTaskPayloadResult>> {
         let state = self.state.lock().await;
-        let task = state
-            .tasks
-            .get(&request.task_id)
-            .ok_or_else(|| mesh_llm_plugin::PluginError::invalid_params(format!("Unknown task '{}'", request.task_id)))?;
+        let task = state.tasks.get(&request.task_id)?;
         Ok(Some(get_task_payload_result(task.payload.clone())?))
     }
 
@@ -565,10 +559,7 @@ impl Plugin for ExamplePlugin {
         _context: &mut PluginContext<'_>,
     ) -> PluginResult<Option<CancelTaskResult>> {
         let mut state = self.state.lock().await;
-        let task = state
-            .tasks
-            .get_mut(&request.task_id)
-            .ok_or_else(|| mesh_llm_plugin::PluginError::invalid_params(format!("Unknown task '{}'", request.task_id)))?;
+        let task = state.tasks.get_mut(&request.task_id)?;
         task.task.status = TaskStatus::Cancelled;
         task.task.status_message = Some("Cancelled by MCP client".into());
         task.payload = json!({
@@ -587,31 +578,21 @@ impl Plugin for ExamplePlugin {
         let mut state = self.state.lock().await;
         state.record_channel_message("inbound", &message);
         if should_ack_channel(&message) {
-            let ack = proto::ChannelMessage {
-                body: json_bytes(&json!({
+            let mut ack = json_reply_channel_message(
+                &message,
+                "example.ack",
+                &json!({
                     "acknowledged_kind": message.message_kind,
                     "received_bytes": message.body.len(),
                     "received_by": state.local_peer_id,
-                }))?,
-                ..channel_message(
-                    message.channel.clone(),
-                    message.source_peer_id.clone(),
-                    "application/json",
-                    Vec::new(),
-                    "example.ack",
-                )
-            };
-            let ack = proto::ChannelMessage {
-                correlation_id: if message.correlation_id.is_empty() {
-                    state.next_token("ack")
-                } else {
-                    message.correlation_id.clone()
-                },
-                metadata_json: json_string(&json!({
-                    "reply_to": message.correlation_id,
-                }))?,
-                ..ack
-            };
+                }),
+            )?;
+            if ack.correlation_id.is_empty() {
+                ack.correlation_id = state.next_token("ack");
+            }
+            ack.metadata_json = json_string(&json!({
+                "reply_to": message.correlation_id,
+            }))?;
             state.record_channel_message("outbound", &ack);
             context.send_channel(ack).await?;
         }
@@ -627,23 +608,10 @@ impl Plugin for ExamplePlugin {
         state.record_bulk_message("inbound", &message);
         state.note_bulk_receive(&message);
         if should_ack_bulk_offer(&message) {
-            let ack = proto::BulkTransferMessage {
-                transfer_id: message.transfer_id.clone(),
-                correlation_id: message.correlation_id.clone(),
-                metadata_json: json_string(&json!({
-                    "accepted_by": state.local_peer_id,
-                }))?,
-                ..bulk_transfer_message(
-                    proto::bulk_transfer_message::Kind::Accept as i32,
-                    message.channel.clone(),
-                    message.source_peer_id.clone(),
-                    message.content_type.clone(),
-                    message.total_bytes,
-                    0,
-                    Vec::new(),
-                    false,
-                )
-            };
+            let mut ack = accept_bulk_transfer_message(&message);
+            ack.metadata_json = json_string(&json!({
+                "accepted_by": state.local_peer_id,
+            }))?;
             state.record_bulk_message("outbound", &ack);
             context.send_bulk(ack).await?;
         }
@@ -668,161 +636,11 @@ async fn main() -> Result<()> {
     .await
 }
 
-async fn handle_tool_call(
-    state: &Arc<Mutex<ExampleState>>,
-    context: &mut PluginContext<'_>,
-    request: ToolCallRequest,
-) -> PluginResult<CallToolResult> {
-    match request.name.as_str() {
-        "snapshot" => {
-            let params: SnapshotParams = request.arguments_or_default()?;
-            let snapshot = state
-                .lock()
-                .await
-                .snapshot(params.limit.unwrap_or(DEFAULT_SNAPSHOT_LIMIT));
-            structured_tool_result(snapshot)
-        }
-        "clear" => {
-            let _params: ClearParams = request.arguments_or_default()?;
-            state.lock().await.clear_history();
-            structured_tool_result(json!({
-                "ok": true,
-                "cleared": ["mesh_events", "channel_messages", "bulk_events", "completed_transfers"],
-            }))
-        }
-        "send_message" => {
-            let params: SendMessageArguments = request.arguments()?;
-            let mut state = state.lock().await;
-            let target_peer_id = normalize_target_peer_id(params.target_peer_id);
-            let correlation_id = state.next_token("msg");
-            let message = proto::ChannelMessage {
-                correlation_id: correlation_id.clone(),
-                metadata_json: json_string(&json!({
-                    "request_ack": params.request_ack.unwrap_or(true),
-                }))?,
-                ..channel_message(
-                    EXAMPLE_CHANNEL,
-                    target_peer_id.clone(),
-                    "text/plain",
-                    params.text.into_bytes(),
-                    "example.message",
-                )
-            };
-            state.record_channel_message("outbound", &message);
-            context.send_channel(message).await?;
-            structured_tool_result(json!({
-                "ok": true,
-                "channel": EXAMPLE_CHANNEL,
-                "target_peer_id": render_target(&target_peer_id),
-                "correlation_id": correlation_id,
-            }))
-        }
-        "send_bulk" => {
-            let params: SendBulkArguments = request.arguments()?;
-            let mut state = state.lock().await;
-            let target_peer_id = normalize_target_peer_id(params.target_peer_id);
-            let correlation_id = state.next_token("bulk-corr");
-            let transfer_id = state.next_token("bulk");
-            let bytes = params.text.into_bytes();
-            let chunk_size = params.chunk_size.unwrap_or(DEFAULT_BULK_CHUNK_SIZE).max(1);
-            let metadata_json = json_string(&json!({
-                "request_ack": params.request_ack.unwrap_or(true),
-            }))?;
+fn tool_router(state: Arc<Mutex<ExampleState>>) -> ToolRouter {
+    let mut router = ToolRouter::new();
 
-            let offer = proto::BulkTransferMessage {
-                transfer_id: transfer_id.clone(),
-                correlation_id: correlation_id.clone(),
-                metadata_json: metadata_json.clone(),
-                ..bulk_transfer_message(
-                    proto::bulk_transfer_message::Kind::Offer as i32,
-                    EXAMPLE_CHANNEL,
-                    target_peer_id.clone(),
-                    "text/plain",
-                    bytes.len() as u64,
-                    0,
-                    Vec::new(),
-                    false,
-                )
-            };
-            state.record_bulk_message("outbound", &offer);
-            context.send_bulk(offer).await?;
-
-            let mut offset = 0usize;
-            for chunk in bytes.chunks(chunk_size) {
-                let message = proto::BulkTransferMessage {
-                    transfer_id: transfer_id.clone(),
-                    correlation_id: correlation_id.clone(),
-                    metadata_json: metadata_json.clone(),
-                    ..bulk_transfer_message(
-                        proto::bulk_transfer_message::Kind::Chunk as i32,
-                        EXAMPLE_CHANNEL,
-                        target_peer_id.clone(),
-                        "text/plain",
-                        bytes.len() as u64,
-                        offset as u64,
-                        chunk.to_vec(),
-                        false,
-                    )
-                };
-                offset += chunk.len();
-                state.record_bulk_message("outbound", &message);
-                context.send_bulk(message).await?;
-            }
-
-            let complete = proto::BulkTransferMessage {
-                transfer_id: transfer_id.clone(),
-                correlation_id: correlation_id.clone(),
-                metadata_json,
-                ..bulk_transfer_message(
-                    proto::bulk_transfer_message::Kind::Complete as i32,
-                    EXAMPLE_CHANNEL,
-                    target_peer_id.clone(),
-                    "text/plain",
-                    bytes.len() as u64,
-                    bytes.len() as u64,
-                    Vec::new(),
-                    true,
-                )
-            };
-            state.record_bulk_message("outbound", &complete);
-            context.send_bulk(complete).await?;
-
-            structured_tool_result(json!({
-                "ok": true,
-                "transfer_id": transfer_id,
-                "target_peer_id": render_target(&target_peer_id),
-                "total_bytes": bytes.len(),
-                "chunk_size": chunk_size,
-            }))
-        }
-        other => Ok(tool_error(format!("unknown tool '{other}'"))),
-    }
-}
-
-fn server_info() -> ServerInfo {
-    let capabilities = ServerCapabilities::builder()
-        .enable_tools()
-        .enable_tool_list_changed()
-        .enable_prompts()
-        .enable_prompts_list_changed()
-        .enable_resources()
-        .enable_resources_list_changed()
-        .enable_resources_subscribe()
-        .enable_completions()
-        .enable_logging()
-        .enable_tasks()
-        .build();
-    ServerInfo::new(capabilities).with_server_info(
-        rmcp::model::Implementation::new(PLUGIN_ID, env!("CARGO_PKG_VERSION"))
-            .with_title("Plugin Surface Example")
-            .with_description(
-                "Standalone example plugin that exercises tools, prompts, resources, completion, logging, tasks, channel messages, bulk transfers, and mesh events.",
-            ),
-    )
-}
-
-fn list_tools_result() -> ListToolsResult {
-    list_tools(vec![
+    let snapshot_state = state.clone();
+    router.add_json_default::<SnapshotParams, serde_json::Value, _>(
         tool_with_schema(
             "snapshot",
             "Inspect the example plugin state: known peers, mesh events, recent channel messages, recent bulk transfers, and counters.",
@@ -836,20 +654,127 @@ fn list_tools_result() -> ListToolsResult {
             .cloned()
             .unwrap(),
         ),
+        move |params, _context| {
+            let state = snapshot_state.clone();
+            Box::pin(async move {
+                Ok(state
+                    .lock()
+                    .await
+                    .snapshot(params.limit.unwrap_or(DEFAULT_SNAPSHOT_LIMIT)))
+            })
+        },
+    );
+
+    let send_message_state = state.clone();
+    router.add_json::<SendMessageArguments, serde_json::Value, _>(
         json_schema_tool::<SendMessageArguments>(
             "send_message",
             "Send a plugin channel message to one peer or broadcast to all peers. Leave target_peer_id empty or set it to 'all' to broadcast.",
         ),
+        move |params, context| {
+            let state = send_message_state.clone();
+            Box::pin(async move {
+                let mut state = state.lock().await;
+                let target_peer_id = normalize_target_peer_id(params.target_peer_id);
+                let correlation_id = state.next_token("msg");
+                let mut message = mesh_llm_plugin::channel_message(
+                    EXAMPLE_CHANNEL,
+                    target_peer_id.clone(),
+                    "text/plain",
+                    params.text.into_bytes(),
+                    "example.message",
+                );
+                message.correlation_id = correlation_id.clone();
+                message.metadata_json = json_string(&json!({
+                    "request_ack": params.request_ack.unwrap_or(true),
+                }))?;
+                state.record_channel_message("outbound", &message);
+                context.send_channel(message).await?;
+                Ok(json!({
+                    "ok": true,
+                    "channel": EXAMPLE_CHANNEL,
+                    "target_peer_id": render_target(&target_peer_id),
+                    "correlation_id": correlation_id,
+                }))
+            })
+        },
+    );
+
+    let send_bulk_state = state.clone();
+    router.add_json::<SendBulkArguments, serde_json::Value, _>(
         json_schema_tool::<SendBulkArguments>(
             "send_bulk",
             "Send a bulk transfer to one peer or broadcast to all peers. This emits OFFER, CHUNK, and COMPLETE frames so the full bulk transport path is exercised.",
         ),
+        move |params, context| {
+            let state = send_bulk_state.clone();
+            Box::pin(async move {
+                let mut state = state.lock().await;
+                let target_peer_id = normalize_target_peer_id(params.target_peer_id);
+                let correlation_id = state.next_token("bulk-corr");
+                let transfer_id = state.next_token("bulk");
+                let bytes = params.text.into_bytes();
+                let chunk_size = params.chunk_size.unwrap_or(DEFAULT_BULK_CHUNK_SIZE).max(1);
+                let metadata_json = json_string(&json!({
+                    "request_ack": params.request_ack.unwrap_or(true),
+                }))?;
+
+                let sequence = bulk_transfer_sequence(
+                    EXAMPLE_CHANNEL,
+                    target_peer_id.clone(),
+                    "text/plain",
+                    bytes,
+                    chunk_size,
+                    correlation_id.clone(),
+                    transfer_id.clone(),
+                    metadata_json,
+                );
+                for message in sequence.messages {
+                    state.record_bulk_message("outbound", &message);
+                    context.send_bulk(message).await?;
+                }
+
+                Ok(json!({
+                    "ok": true,
+                    "transfer_id": sequence.transfer_id,
+                    "correlation_id": sequence.correlation_id,
+                    "target_peer_id": render_target(&target_peer_id),
+                    "chunk_size": chunk_size,
+                }))
+            })
+        },
+    );
+
+    let clear_state = state.clone();
+    router.add_json_default::<ClearParams, serde_json::Value, _>(
         tool_with_schema(
             "clear",
             "Clear recorded example-plugin history while keeping the current peer snapshot.",
             empty_object_schema(),
         ),
-    ])
+        move |_params, _context| {
+            let state = clear_state.clone();
+            Box::pin(async move {
+                state.lock().await.clear_history();
+                Ok(json!({
+                    "ok": true,
+                    "cleared": ["mesh_events", "channel_messages", "bulk_events", "completed_transfers"],
+                }))
+            })
+        },
+    );
+
+    router
+}
+
+fn server_info() -> ServerInfo {
+    plugin_server_info_full(
+        PLUGIN_ID,
+        env!("CARGO_PKG_VERSION"),
+        "Plugin Surface Example",
+        "Standalone example plugin that exercises tools, prompts, resources, completion, logging, tasks, channel messages, bulk transfers, and mesh events.",
+        None::<String>,
+    )
 }
 
 fn list_prompts_result() -> ListPromptsResult {
@@ -865,7 +790,11 @@ fn list_prompts_result() -> ListPromptsResult {
         prompt(
             "peer_focus",
             "Summarize a specific peer from the current example state.",
-            Some(vec![prompt_argument("peer_id", "Peer ID to focus on.", true)]),
+            Some(vec![prompt_argument(
+                "peer_id",
+                "Peer ID to focus on.",
+                true,
+            )]),
         ),
     ])
 }
@@ -879,14 +808,18 @@ async fn get_example_prompt(
     let snapshot = state.snapshot(5).to_string();
     let result = match request.name.as_str() {
         "status_brief" => {
-            let topic = args.get("topic").and_then(|v| v.as_str()).unwrap_or("mesh health");
-            let audience = args.get("audience").and_then(|v| v.as_str()).unwrap_or("operators");
+            let topic = args
+                .get("topic")
+                .and_then(|v| v.as_str())
+                .unwrap_or("mesh health");
+            let audience = args
+                .get("audience")
+                .and_then(|v| v.as_str())
+                .unwrap_or("operators");
             get_prompt_result(vec![
                 PromptMessage::new_text(
                     PromptMessageRole::User,
-                    format!(
-                        "Write a concise status brief for {audience}. Focus on {topic}."
-                    ),
+                    format!("Write a concise status brief for {audience}. Focus on {topic}."),
                 ),
                 PromptMessage::new_text(PromptMessageRole::User, snapshot),
             ])
@@ -920,22 +853,25 @@ async fn get_example_prompt(
 
 fn list_resources_result() -> ListResourcesResult {
     list_resources(vec![
-        RawResource::new("example://snapshot", "Example Snapshot")
+        rmcp::model::RawResource::new("example://snapshot", "Example Snapshot")
             .with_description("Current high-level example plugin snapshot.")
+            .with_mime_type("application/json")
             .no_annotation(),
-        RawResource::new("example://peers", "Known Peers")
+        rmcp::model::RawResource::new("example://peers", "Known Peers")
             .with_description("Current peer inventory seen by the example plugin.")
+            .with_mime_type("application/json")
             .no_annotation(),
     ])
 }
 
 fn list_resource_templates_result() -> ListResourceTemplatesResult {
-    list_resource_templates(vec![
-        RawResourceTemplate::new("example://peer/{peer_id}", "Peer Detail")
-            .with_description("Dynamic resource for a specific peer.")
-            .with_mime_type("application/json")
-            .no_annotation(),
-    ])
+    list_resource_templates(vec![rmcp::model::RawResourceTemplate::new(
+        "example://peer/{peer_id}",
+        "Peer Detail",
+    )
+    .with_description("Dynamic resource for a specific peer.")
+    .with_mime_type("application/json")
+    .no_annotation()])
 }
 
 async fn read_example_resource(
@@ -962,8 +898,10 @@ async fn read_example_resource(
                 .get(peer_id)
                 .map(|peer| serde_json::to_string(peer).unwrap_or_else(|_| "{}".into()))
                 .unwrap_or_else(|| "{\"missing\":true}".into());
-            vec![rmcp::model::ResourceContents::text(payload, uri.to_string())
-                .with_mime_type("application/json")]
+            vec![
+                rmcp::model::ResourceContents::text(payload, uri.to_string())
+                    .with_mime_type("application/json"),
+            ]
         }
         other => {
             return Err(mesh_llm_plugin::PluginError::invalid_params(format!(
@@ -982,11 +920,9 @@ fn complete_example(request: CompleteRequestParams) -> PluginResult<CompleteResu
                 "plugin runtime".into(),
                 "bulk transfers".into(),
             ],
-            ("status_brief", "audience") => vec![
-                "operators".into(),
-                "developers".into(),
-                "testers".into(),
-            ],
+            ("status_brief", "audience") => {
+                vec!["operators".into(), "developers".into(), "testers".into()]
+            }
             ("peer_focus", "peer_id") => vec!["peer-alpha".into(), "peer-beta".into()],
             _ => vec![request.argument.value],
         }
@@ -1006,16 +942,11 @@ fn example_task(
     status: TaskStatus,
     status_message: &str,
     payload: serde_json::Value,
-) -> ExampleTask {
-    let task = task(
-        id,
-        status,
-        "2026-01-01T00:00:00Z",
-        "2026-01-01T00:00:00Z",
-    )
-    .with_status_message(status_message)
-    .with_poll_interval(1000);
-    ExampleTask { task, payload }
+) -> (rmcp::model::Task, serde_json::Value) {
+    let task = task(id, status, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z")
+        .with_status_message(status_message)
+        .with_poll_interval(1000);
+    (task, payload)
 }
 
 fn task_status_name(status: &TaskStatus) -> &'static str {

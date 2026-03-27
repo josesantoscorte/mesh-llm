@@ -15,20 +15,22 @@ pub use async_trait::async_trait;
 pub use context::PluginContext;
 pub use error::{PluginError, PluginResult, PluginRpcResult};
 pub use helpers::{
-    ToolCallRequest, bulk_transfer_message, channel_message, empty_object_schema,
-    cancel_task_result, complete_result, get_prompt_result, get_task_payload_result,
-    get_task_result, json_bytes, json_channel_message, json_response, json_schema_for,
-    json_schema_tool, json_string, list_prompts, list_resource_templates, list_resources,
-    list_tasks, list_tools, parse_get_prompt_request, parse_optional_json,
-    parse_read_resource_request, parse_rpc_params, parse_tool_call_request, plugin_server_info,
-    prompt, prompt_argument, read_resource_result, resource_template, structured_tool_result,
-    task, text_resource, tool_error, tool_with_schema,
+    accept_bulk_transfer_message, bulk_transfer_message, bulk_transfer_sequence,
+    cancel_task_result, channel_message, complete_result, empty_object_schema, get_prompt_result,
+    get_task_payload_result, get_task_result, json_bytes, json_channel_message,
+    json_reply_channel_message, json_response, json_schema_for, json_schema_tool, json_string,
+    list_prompts, list_resource_templates, list_resources, list_tasks, list_tools,
+    parse_get_prompt_request, parse_optional_json, parse_read_resource_request, parse_rpc_params,
+    parse_tool_call_request, plugin_server_info, plugin_server_info_full, prompt, prompt_argument,
+    read_resource_result, resource_template, structured_tool_result, task, text_resource,
+    tool_error, tool_with_schema, BulkTransferSequence, JsonToolFuture, SubscriptionSet,
+    TaskRecord, TaskStore, ToolCallRequest, ToolFuture, ToolRouter,
 };
 pub use io::{
-    LocalStream, connect_from_env, read_envelope, send_bulk_transfer_message, send_channel_message,
-    write_envelope,
+    connect_from_env, read_envelope, send_bulk_transfer_message, send_channel_message,
+    write_envelope, LocalStream,
 };
-pub use runtime::{Plugin, PluginRuntime};
+pub use runtime::{MeshVisibility, Plugin, PluginRuntime};
 
 #[allow(dead_code)]
 pub mod proto {

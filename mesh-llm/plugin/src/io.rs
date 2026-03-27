@@ -1,8 +1,8 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use prost::Message;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::{PROTOCOL_VERSION, proto};
+use crate::{proto, PROTOCOL_VERSION};
 
 pub enum LocalStream {
     #[cfg(unix)]

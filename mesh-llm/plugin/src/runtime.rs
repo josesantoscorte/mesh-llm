@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use rmcp::model::{
     CallToolResult, CancelTaskParams, CancelTaskResult, CompleteRequestParams, CompleteResult,
     GetPromptRequestParams, GetPromptResult, GetTaskInfoParams, GetTaskPayloadResult,
@@ -11,14 +11,22 @@ use rmcp::model::{
 use crate::{
     context::PluginContext,
     error::{PluginError, PluginResult, PluginRpcResult},
-        helpers::{
-        ToolCallRequest, json_response, parse_get_prompt_request, parse_read_resource_request,
-        parse_rpc_params, parse_tool_call_request,
+    helpers::{
+        json_response, parse_get_prompt_request, parse_read_resource_request, parse_rpc_params,
+        parse_tool_call_request, ToolCallRequest,
     },
-    io::{LocalStream, connect_from_env, read_envelope, write_envelope},
-    proto,
-    PROTOCOL_VERSION,
+    io::{connect_from_env, read_envelope, write_envelope, LocalStream},
+    proto, PROTOCOL_VERSION,
 };
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MeshVisibility {
+    #[default]
+    Private,
+    Public,
+}
 
 #[crate::async_trait]
 pub trait Plugin: Send {
@@ -442,7 +450,9 @@ impl PluginRuntime {
                         stream: &mut stream,
                         plugin_id: &plugin_id,
                     };
-                    plugin.on_rpc_notification(notification, &mut context).await?;
+                    plugin
+                        .on_rpc_notification(notification, &mut context)
+                        .await?;
                 }
                 Some(proto::envelope::Payload::ChannelMessage(message)) => {
                     let mut context = PluginContext {
@@ -456,7 +466,9 @@ impl PluginRuntime {
                         stream: &mut stream,
                         plugin_id: &plugin_id,
                     };
-                    plugin.on_bulk_transfer_message(message, &mut context).await?;
+                    plugin
+                        .on_bulk_transfer_message(message, &mut context)
+                        .await?;
                 }
                 Some(proto::envelope::Payload::MeshEvent(event)) => {
                     let mut context = PluginContext {

@@ -1,18 +1,23 @@
+use rmcp::model::{AnnotateAble, RawResource, RawResourceTemplate};
 use rmcp::model::{
-    CallToolResult, Content, GetPromptRequestParams, GetPromptResult, Implementation,
+    CallToolResult, CancelTaskResult, CompleteResult, CompletionInfo, Content,
+    GetPromptRequestParams, GetPromptResult, GetTaskPayloadResult, GetTaskResult, Implementation,
     ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, ListTasksResult,
     ListToolsResult, Prompt, PromptArgument, ReadResourceRequestParams, ReadResourceResult,
-    Resource, ResourceContents, ResourceTemplate, ServerCapabilities, ServerInfo, Task, TaskStatus,
-    Tool, CompleteResult, CompletionInfo, GetTaskPayloadResult, GetTaskResult, CancelTaskResult,
+    Resource, ResourceContents, ResourceTemplate, ServerCapabilities, ServerInfo, Task,
+    TaskStatus, Tool,
 };
-use rmcp::model::{AnnotateAble, RawResource, RawResourceTemplate};
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::{
+    context::PluginContext,
     error::{PluginError, PluginResult, PluginRpcResult},
     proto,
 };
@@ -55,7 +60,8 @@ pub fn json_bytes<T: Serialize>(value: &T) -> PluginResult<Vec<u8>> {
 }
 
 pub fn structured_tool_result<T: Serialize>(value: T) -> PluginResult<CallToolResult> {
-    let value = serde_json::to_value(value).map_err(|err| PluginError::internal(err.to_string()))?;
+    let value =
+        serde_json::to_value(value).map_err(|err| PluginError::internal(err.to_string()))?;
     Ok(CallToolResult::structured(value))
 }
 
@@ -87,7 +93,9 @@ pub fn list_resources(resources: Vec<Resource>) -> ListResourcesResult {
     }
 }
 
-pub fn list_resource_templates(resource_templates: Vec<ResourceTemplate>) -> ListResourceTemplatesResult {
+pub fn list_resource_templates(
+    resource_templates: Vec<ResourceTemplate>,
+) -> ListResourceTemplatesResult {
     ListResourceTemplatesResult {
         resource_templates,
         meta: None,
@@ -108,8 +116,8 @@ pub fn get_prompt_result(messages: Vec<rmcp::model::PromptMessage>) -> GetPrompt
 }
 
 pub fn complete_result(values: Vec<String>) -> PluginResult<CompleteResult> {
-    let completion = CompletionInfo::with_all_values(values)
-        .map_err(PluginError::invalid_params)?;
+    let completion =
+        CompletionInfo::with_all_values(values).map_err(PluginError::invalid_params)?;
     Ok(CompleteResult::new(completion))
 }
 
@@ -135,7 +143,10 @@ pub fn text_resource(uri: impl Into<String>, name: impl Into<String>) -> Resourc
     RawResource::new(uri, name).no_annotation()
 }
 
-pub fn resource_template(uri_template: impl Into<String>, name: impl Into<String>) -> ResourceTemplate {
+pub fn resource_template(
+    uri_template: impl Into<String>,
+    name: impl Into<String>,
+) -> ResourceTemplate {
     RawResourceTemplate::new(uri_template, name).no_annotation()
 }
 
@@ -145,7 +156,12 @@ pub fn task(
     created_at: impl Into<String>,
     last_updated_at: impl Into<String>,
 ) -> Task {
-    Task::new(task_id.into(), status, created_at.into(), last_updated_at.into())
+    Task::new(
+        task_id.into(),
+        status,
+        created_at.into(),
+        last_updated_at.into(),
+    )
 }
 
 pub fn get_task_result(task: Task) -> GetTaskResult {
@@ -153,12 +169,45 @@ pub fn get_task_result(task: Task) -> GetTaskResult {
 }
 
 pub fn get_task_payload_result<T: Serialize>(value: T) -> PluginResult<GetTaskPayloadResult> {
-    let value = serde_json::to_value(value).map_err(|err| PluginError::internal(err.to_string()))?;
+    let value =
+        serde_json::to_value(value).map_err(|err| PluginError::internal(err.to_string()))?;
     Ok(GetTaskPayloadResult::new(value))
 }
 
 pub fn cancel_task_result(task: Task) -> CancelTaskResult {
     CancelTaskResult { meta: None, task }
+}
+
+pub fn plugin_server_info_full(
+    implementation_name: impl Into<String>,
+    implementation_version: impl Into<String>,
+    title: impl Into<String>,
+    description: impl Into<String>,
+    instructions: Option<impl Into<String>>,
+) -> ServerInfo {
+    let info = ServerInfo::new(
+        ServerCapabilities::builder()
+            .enable_tools()
+            .enable_tool_list_changed()
+            .enable_prompts()
+            .enable_prompts_list_changed()
+            .enable_resources()
+            .enable_resources_list_changed()
+            .enable_resources_subscribe()
+            .enable_completions()
+            .enable_logging()
+            .enable_tasks()
+            .build(),
+    )
+    .with_server_info(
+        Implementation::new(implementation_name, implementation_version)
+            .with_title(title)
+            .with_description(description),
+    );
+    match instructions {
+        Some(instructions) => info.with_instructions(instructions.into()),
+        None => info,
+    }
 }
 
 pub fn plugin_server_info(
@@ -254,6 +303,21 @@ pub fn json_channel_message<T: Serialize>(
     ))
 }
 
+pub fn json_reply_channel_message<T: Serialize>(
+    message: &proto::ChannelMessage,
+    message_kind: impl Into<String>,
+    payload: &T,
+) -> PluginResult<proto::ChannelMessage> {
+    let mut reply = json_channel_message(
+        message.channel.clone(),
+        message.source_peer_id.clone(),
+        message_kind,
+        payload,
+    )?;
+    reply.correlation_id = message.correlation_id.clone();
+    Ok(reply)
+}
+
 pub fn bulk_transfer_message(
     kind: i32,
     channel: impl Into<String>,
@@ -277,6 +341,107 @@ pub fn bulk_transfer_message(
         offset,
         body,
         final_chunk,
+    }
+}
+
+pub fn accept_bulk_transfer_message(
+    message: &proto::BulkTransferMessage,
+) -> proto::BulkTransferMessage {
+    let mut response = bulk_transfer_message(
+        proto::bulk_transfer_message::Kind::Accept as i32,
+        message.channel.clone(),
+        message.source_peer_id.clone(),
+        message.content_type.clone(),
+        message.total_bytes,
+        0,
+        Vec::new(),
+        false,
+    );
+    response.transfer_id = message.transfer_id.clone();
+    response.correlation_id = message.correlation_id.clone();
+    response
+}
+
+pub struct BulkTransferSequence {
+    pub transfer_id: String,
+    pub correlation_id: String,
+    pub messages: Vec<proto::BulkTransferMessage>,
+}
+
+pub fn bulk_transfer_sequence(
+    channel: impl Into<String>,
+    target_peer_id: impl Into<String>,
+    content_type: impl Into<String>,
+    bytes: Vec<u8>,
+    chunk_size: usize,
+    correlation_id: impl Into<String>,
+    transfer_id: impl Into<String>,
+    metadata_json: impl Into<String>,
+) -> BulkTransferSequence {
+    let channel = channel.into();
+    let target_peer_id = target_peer_id.into();
+    let content_type = content_type.into();
+    let correlation_id = correlation_id.into();
+    let transfer_id = transfer_id.into();
+    let metadata_json = metadata_json.into();
+    let total_bytes = bytes.len() as u64;
+    let chunk_size = chunk_size.max(1);
+
+    let mut messages = Vec::new();
+
+    let mut offer = bulk_transfer_message(
+        proto::bulk_transfer_message::Kind::Offer as i32,
+        channel.clone(),
+        target_peer_id.clone(),
+        content_type.clone(),
+        total_bytes,
+        0,
+        Vec::new(),
+        false,
+    );
+    offer.transfer_id = transfer_id.clone();
+    offer.correlation_id = correlation_id.clone();
+    offer.metadata_json = metadata_json.clone();
+    messages.push(offer);
+
+    let mut offset = 0usize;
+    for chunk in bytes.chunks(chunk_size) {
+        let mut message = bulk_transfer_message(
+            proto::bulk_transfer_message::Kind::Chunk as i32,
+            channel.clone(),
+            target_peer_id.clone(),
+            content_type.clone(),
+            total_bytes,
+            offset as u64,
+            chunk.to_vec(),
+            false,
+        );
+        message.transfer_id = transfer_id.clone();
+        message.correlation_id = correlation_id.clone();
+        message.metadata_json = metadata_json.clone();
+        messages.push(message);
+        offset += chunk.len();
+    }
+
+    let mut complete = bulk_transfer_message(
+        proto::bulk_transfer_message::Kind::Complete as i32,
+        channel,
+        target_peer_id,
+        content_type,
+        total_bytes,
+        total_bytes,
+        Vec::new(),
+        true,
+    );
+    complete.transfer_id = transfer_id.clone();
+    complete.correlation_id = correlation_id.clone();
+    complete.metadata_json = metadata_json;
+    messages.push(complete);
+
+    BulkTransferSequence {
+        transfer_id,
+        correlation_id,
+        messages,
     }
 }
 
@@ -317,4 +482,318 @@ pub fn parse_read_resource_request(
     request: &proto::RpcRequest,
 ) -> PluginResult<ReadResourceRequestParams> {
     parse_rpc_params(request)
+}
+
+pub type ToolFuture<'a> = Pin<Box<dyn Future<Output = PluginResult<CallToolResult>> + Send + 'a>>;
+pub type JsonToolFuture<'a, T> = Pin<Box<dyn Future<Output = PluginResult<T>> + Send + 'a>>;
+pub type PromptFuture<'a> = Pin<Box<dyn Future<Output = PluginResult<GetPromptResult>> + Send + 'a>>;
+pub type ResourceFuture<'a> =
+    Pin<Box<dyn Future<Output = PluginResult<ReadResourceResult>> + Send + 'a>>;
+
+type ToolHandler = Arc<
+    dyn for<'a, 'ctx> Fn(ToolCallRequest, &'a mut PluginContext<'ctx>) -> ToolFuture<'a>
+        + Send
+        + Sync,
+>;
+
+pub struct ToolRouter {
+    tools: Vec<Tool>,
+    handlers: HashMap<String, ToolHandler>,
+}
+
+impl ToolRouter {
+    pub fn new() -> Self {
+        Self {
+            tools: Vec::new(),
+            handlers: HashMap::new(),
+        }
+    }
+
+    pub fn add_raw<F>(&mut self, tool: Tool, handler: F)
+    where
+        F: for<'a, 'ctx> Fn(ToolCallRequest, &'a mut PluginContext<'ctx>) -> ToolFuture<'a>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let name = tool.name.to_string();
+        self.tools.push(tool);
+        self.handlers.insert(name, Arc::new(handler));
+    }
+
+    pub fn add_json<TArgs, TResult, F>(&mut self, tool: Tool, handler: F)
+    where
+        TArgs: DeserializeOwned + Send + 'static,
+        TResult: Serialize + Send + 'static,
+        F: for<'a, 'ctx> Fn(TArgs, &'a mut PluginContext<'ctx>) -> JsonToolFuture<'a, TResult>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let handler = Arc::new(handler);
+        self.add_raw(tool, move |request, context| {
+            let handler = Arc::clone(&handler);
+            Box::pin(async move {
+                let args: TArgs = request.arguments()?;
+                let value = handler(args, context).await?;
+                structured_tool_result(value)
+            })
+        });
+    }
+
+    pub fn add_json_default<TArgs, TResult, F>(&mut self, tool: Tool, handler: F)
+    where
+        TArgs: DeserializeOwned + Default + Send + 'static,
+        TResult: Serialize + Send + 'static,
+        F: for<'a, 'ctx> Fn(TArgs, &'a mut PluginContext<'ctx>) -> JsonToolFuture<'a, TResult>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let handler = Arc::new(handler);
+        self.add_raw(tool, move |request, context| {
+            let handler = Arc::clone(&handler);
+            Box::pin(async move {
+                let args: TArgs = request.arguments_or_default()?;
+                let value = handler(args, context).await?;
+                structured_tool_result(value)
+            })
+        });
+    }
+
+    pub fn list_tools_result(&self) -> ListToolsResult {
+        list_tools(self.tools.clone())
+    }
+
+    pub async fn call(
+        &self,
+        request: ToolCallRequest,
+        context: &mut PluginContext<'_>,
+    ) -> PluginResult<CallToolResult> {
+        let Some(handler) = self.handlers.get(&request.name).cloned() else {
+            return Err(PluginError::method_not_found(format!(
+                "Unknown tool '{}'",
+                request.name
+            )));
+        };
+        handler(request, context).await
+    }
+}
+
+impl Default for ToolRouter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+type PromptHandler = Arc<
+    dyn for<'a, 'ctx> Fn(GetPromptRequestParams, &'a mut PluginContext<'ctx>) -> PromptFuture<'a>
+        + Send
+        + Sync,
+>;
+
+pub struct PromptRouter {
+    prompts: Vec<Prompt>,
+    handlers: HashMap<String, PromptHandler>,
+}
+
+impl PromptRouter {
+    pub fn new() -> Self {
+        Self {
+            prompts: Vec::new(),
+            handlers: HashMap::new(),
+        }
+    }
+
+    pub fn add<F>(&mut self, prompt: Prompt, handler: F)
+    where
+        F: for<'a, 'ctx> Fn(GetPromptRequestParams, &'a mut PluginContext<'ctx>) -> PromptFuture<'a>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let name = prompt.name.to_string();
+        self.prompts.push(prompt);
+        self.handlers.insert(name, Arc::new(handler));
+    }
+
+    pub fn list_prompts_result(&self) -> ListPromptsResult {
+        list_prompts(self.prompts.clone())
+    }
+
+    pub async fn get(
+        &self,
+        request: GetPromptRequestParams,
+        context: &mut PluginContext<'_>,
+    ) -> PluginResult<GetPromptResult> {
+        let Some(handler) = self.handlers.get(&request.name).cloned() else {
+            return Err(PluginError::invalid_params(format!(
+                "Unknown prompt '{}'",
+                request.name
+            )));
+        };
+        handler(request, context).await
+    }
+}
+
+impl Default for PromptRouter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+enum ResourceReadMatcher {
+    Exact(String),
+    Prefix(String),
+}
+
+impl ResourceReadMatcher {
+    fn matches(&self, uri: &str) -> bool {
+        match self {
+            Self::Exact(expected) => uri == expected,
+            Self::Prefix(prefix) => uri.starts_with(prefix),
+        }
+    }
+}
+
+type ResourceHandler = Arc<
+    dyn for<'a, 'ctx> Fn(ReadResourceRequestParams, &'a mut PluginContext<'ctx>) -> ResourceFuture<'a>
+        + Send
+        + Sync,
+>;
+
+pub struct ResourceRouter {
+    resources: Vec<Resource>,
+    resource_templates: Vec<ResourceTemplate>,
+    handlers: Vec<(ResourceReadMatcher, ResourceHandler)>,
+}
+
+impl ResourceRouter {
+    pub fn new() -> Self {
+        Self {
+            resources: Vec::new(),
+            resource_templates: Vec::new(),
+            handlers: Vec::new(),
+        }
+    }
+
+    pub fn add_exact<F>(&mut self, resource: Resource, handler: F)
+    where
+        F: for<'a, 'ctx> Fn(ReadResourceRequestParams, &'a mut PluginContext<'ctx>) -> ResourceFuture<'a>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let uri = resource.raw.uri.to_string();
+        self.resources.push(resource);
+        self.handlers
+            .push((ResourceReadMatcher::Exact(uri), Arc::new(handler)));
+    }
+
+    pub fn add_prefix_template<F>(
+        &mut self,
+        resource_template: ResourceTemplate,
+        prefix: impl Into<String>,
+        handler: F,
+    ) where
+        F: for<'a, 'ctx> Fn(ReadResourceRequestParams, &'a mut PluginContext<'ctx>) -> ResourceFuture<'a>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.resource_templates.push(resource_template);
+        self.handlers.push((
+            ResourceReadMatcher::Prefix(prefix.into()),
+            Arc::new(handler),
+        ));
+    }
+
+    pub fn list_resources_result(&self) -> ListResourcesResult {
+        list_resources(self.resources.clone())
+    }
+
+    pub fn list_resource_templates_result(&self) -> ListResourceTemplatesResult {
+        list_resource_templates(self.resource_templates.clone())
+    }
+
+    pub async fn read(
+        &self,
+        request: ReadResourceRequestParams,
+        context: &mut PluginContext<'_>,
+    ) -> PluginResult<ReadResourceResult> {
+        let Some((_, handler)) = self
+            .handlers
+            .iter()
+            .find(|(matcher, _)| matcher.matches(&request.uri))
+        else {
+            return Err(PluginError::invalid_params(format!(
+                "Unknown resource '{}'",
+                request.uri
+            )));
+        };
+        handler(request, context).await
+    }
+}
+
+impl Default for ResourceRouter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SubscriptionSet {
+    uris: BTreeSet<String>,
+}
+
+impl SubscriptionSet {
+    pub fn subscribe(&mut self, uri: impl Into<String>) {
+        self.uris.insert(uri.into());
+    }
+
+    pub fn unsubscribe(&mut self, uri: &str) {
+        self.uris.remove(uri);
+    }
+
+    pub fn list(&self) -> Vec<String> {
+        self.uris.iter().cloned().collect()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct TaskRecord<T> {
+    pub task: Task,
+    pub payload: T,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct TaskStore<T> {
+    tasks: BTreeMap<String, TaskRecord<T>>,
+}
+
+impl<T> TaskStore<T> {
+    pub fn insert(&mut self, task: Task, payload: T) {
+        self.tasks
+            .insert(task.task_id.clone(), TaskRecord { task, payload });
+    }
+
+    pub fn list(&self) -> Vec<Task> {
+        self.tasks.values().map(|task| task.task.clone()).collect()
+    }
+
+    pub fn get(&self, task_id: &str) -> PluginResult<&TaskRecord<T>> {
+        self.tasks
+            .get(task_id)
+            .ok_or_else(|| PluginError::invalid_params(format!("Unknown task '{task_id}'")))
+    }
+
+    pub fn get_mut(&mut self, task_id: &str) -> PluginResult<&mut TaskRecord<T>> {
+        self.tasks
+            .get_mut(task_id)
+            .ok_or_else(|| PluginError::invalid_params(format!("Unknown task '{task_id}'")))
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = &TaskRecord<T>> {
+        self.tasks.values()
+    }
 }
