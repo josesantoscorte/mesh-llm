@@ -84,7 +84,7 @@ switch ($Backend.ToLowerInvariant()) {
 
                 $downloadErrors += "Downloaded $filename, but the payload was not a Windows executable."
             } catch {
-                $downloadErrors += "Failed to download $filename: $($_.Exception.Message)"
+                $downloadErrors += "Failed to download ${filename}: $($_.Exception.Message)"
             }
 
             Remove-Item -Path $installer -ErrorAction SilentlyContinue
