@@ -155,6 +155,19 @@ mesh-llm --model Qwen2.5-32B    # dashboard at http://localhost:3131
 
 Live topology, VRAM bars per node, model picker, built-in chat. Everything comes from `/api/status` (JSON) and `/api/events` (SSE).
 
+Model management is also available on the console port:
+
+```bash
+curl 'http://localhost:3131/api/models'
+curl 'http://localhost:3131/api/models/search?q=qwen+coder+30b'
+curl 'http://localhost:3131/api/models/show?ref=Qwen3-8B-Q4_K_M'
+curl -X POST http://localhost:3131/api/models/download \
+  -H 'Content-Type: application/json' \
+  -d '{"ref":"Qwen3-8B-Q4_K_M","draft":true}'
+curl 'http://localhost:3131/api/models/download?ref=Qwen3-8B-Q4_K_M&draft=true'
+curl -X DELETE 'http://localhost:3131/api/models/download?ref=Qwen3-8B-Q4_K_M&draft=true'
+```
+
 ### Development
 
 Build-from-source and UI development instructions are in [CONTRIBUTING.md](CONTRIBUTING.md).

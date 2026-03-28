@@ -1,5 +1,5 @@
 use anyhow::{anyhow, bail, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -29,7 +29,7 @@ pub struct RemoteAsset {
     pub url: &'static str,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct MoeConfig {
     pub n_expert: u32,
     pub n_expert_used: u32,
@@ -626,7 +626,14 @@ pub async fn download_huggingface_model(repo: &str, file: &str) -> Result<PathBu
 }
 
 pub async fn download_url(url: &str, dest: &Path) -> Result<()> {
-    download_with_resume(dest, url).await
+    download_with_resume(dest, url, |_, _| {}).await
+}
+
+pub async fn download_url_with_progress<F>(url: &str, dest: &Path, on_progress: F) -> Result<()>
+where
+    F: FnMut(u64, Option<u64>) + Send,
+{
+    download_with_resume(dest, url, on_progress).await
 }
 
 pub fn huggingface_resolve_url(repo: &str, file: &str) -> String {
@@ -720,7 +727,10 @@ fn http_client() -> Result<reqwest::Client> {
         .context("build HTTP client")
 }
 
-async fn download_with_resume(dest: &Path, url: &str) -> Result<()> {
+async fn download_with_resume<F>(dest: &Path, url: &str, mut on_progress: F) -> Result<()>
+where
+    F: FnMut(u64, Option<u64>) + Send,
+{
     if let Some(parent) = dest.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
@@ -794,6 +804,7 @@ async fn download_with_resume(dest: &Path, url: &str) -> Result<()> {
                 .content_length()
                 .map(|value| value + existing_bytes)
         };
+        on_progress(existing_bytes, total_bytes);
 
         if attempt == 1 || existing_bytes == 0 {
             if let Some(total) = total_bytes {
@@ -835,6 +846,7 @@ async fn download_with_resume(dest: &Path, url: &str) -> Result<()> {
                     got_data = true;
 
                     if last_progress.elapsed() >= std::time::Duration::from_millis(500) {
+                        on_progress(downloaded, total_bytes);
                         print_progress(downloaded, total_bytes);
                         last_progress = std::time::Instant::now();
                     }
@@ -857,6 +869,7 @@ async fn download_with_resume(dest: &Path, url: &str) -> Result<()> {
                 None => {
                     file.flush().await?;
                     eprint!("\r");
+                    on_progress(downloaded, total_bytes);
                     print_progress(downloaded, total_bytes);
                     eprintln!();
                     tokio::fs::rename(&tmp, dest)
