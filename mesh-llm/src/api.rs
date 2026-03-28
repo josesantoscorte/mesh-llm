@@ -299,16 +299,9 @@ impl MeshApi {
                 let size_gb = if *name == model_name && model_size_bytes > 0 {
                     model_size_bytes as f64 / 1e9
                 } else {
-                    download::parse_size_gb(
-                        download::MODEL_CATALOG
-                            .iter()
-                            .find(|m| {
-                                m.file.strip_suffix(".gguf").unwrap_or(m.file) == name.as_str()
-                                    || m.name == name.as_str()
-                            })
-                            .map(|m| m.size)
-                            .unwrap_or("0"),
-                    )
+                    crate::models::metadata_for_model_name(name)
+                        .map(|m| download::parse_size_gb(m.size))
+                        .unwrap_or(0.0)
                 };
                 let (request_count, last_active_secs_ago) = match active_demand.get(name) {
                     Some(d) => (
@@ -317,12 +310,7 @@ impl MeshApi {
                     ),
                     None => (None, None),
                 };
-                let vision = download::MODEL_CATALOG
-                    .iter()
-                    .find(|m| {
-                        m.name == name.as_str()
-                            || m.file.strip_suffix(".gguf").unwrap_or(m.file) == name.as_str()
-                    })
+                let vision = crate::models::metadata_for_model_name(name)
                     .map(|m| m.mmproj.is_some())
                     .unwrap_or(false);
                 MeshModelPayload {

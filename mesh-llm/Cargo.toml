@@ -30,5 +30,9 @@ schemars = "1"
 prost = "0.14"
 toml = "0.9"
 
+[build-dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+
 [dev-dependencies]
 serial_test = "3"

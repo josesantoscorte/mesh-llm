@@ -329,9 +329,11 @@ Stock llama.cpp RPC transfers 16.88GB on connect. This fork: **0 bytes, ~9 secon
 ## Model catalog
 
 ```bash
-mesh-llm download           # list models
-mesh-llm download 32b       # Qwen2.5-32B (~20GB)
-mesh-llm download 72b --draft  # Qwen2.5-72B + draft model
+mesh-llm models                     # list curated mesh-llm models
+mesh-llm search qwen coder 30b      # search Hugging Face GGUFs
+mesh-llm search --curated qwen      # search curated metadata only
+mesh-llm show Qwen3-8B-Q4_K_M       # inspect one exact model ref
+mesh-llm download Qwen3-8B-Q4_K_M --draft
 ```
 
 Draft pairings for speculative decoding:
@@ -345,7 +347,7 @@ Draft pairings for speculative decoding:
 
 ## Specifying models
 
-`--model` accepts several formats. Models are auto-downloaded to `~/.models/` on first use.
+`--model` accepts several formats. Models are auto-downloaded to your configured model directory on first use (defaults to `~/.models/`).
 
 ```bash
 # Catalog name (fuzzy match — finds Qwen3-8B-Q4_K_M)
@@ -364,7 +366,27 @@ mesh-llm --model bartowski/Llama-3.2-3B-Instruct-GGUF/Llama-3.2-3B-Instruct-Q4_K
 mesh-llm --model ~/my-models/custom-model.gguf
 ```
 
-Catalog models are downloaded with resume support — if a download is interrupted, it picks up where it left off. Use `mesh-llm download` to browse the catalog.
+Downloads have resume support, so interrupted transfers pick up where they left off.
+
+## Config
+
+Create `~/.mesh-llm/config.toml` to customize storage and Hugging Face auth:
+
+```toml
+[huggingface]
+token = "hf_..."
+
+[models]
+dirs = [
+  "/Volumes/LLM/models",
+  "~/.models",
+]
+```
+
+- `HF_TOKEN` overrides the config token when set.
+- `models.dir` also works for a single directory.
+- The first configured model directory is the default download destination.
+- Without a Hugging Face token, search and download still work, but requests may be slower or throttled.
 
 ## Contributing
 

@@ -174,9 +174,12 @@ pub fn build_moe_targets(
 fn lookup_moe_config(model_name: &str, model_path: &Path) -> Option<download::MoeConfig> {
     // Tier 1: catalog lookup (has ranking)
     let q = model_name.to_lowercase();
-    if let Some(cfg) = download::MODEL_CATALOG
-        .iter()
-        .find(|m| m.name.to_lowercase() == q || m.file.to_lowercase().contains(&q))
+    if let Some(cfg) = crate::models::metadata_for_model_name(model_name)
+        .or_else(|| {
+            download::MODEL_CATALOG
+                .iter()
+                .find(|m| m.file.to_lowercase().contains(&q))
+        })
         .and_then(|m| m.moe.clone())
     {
         if !cfg.ranking.is_empty() {
@@ -1079,19 +1082,19 @@ async fn start_llama(
     };
 
     // Look up mmproj for vision models
-    let mmproj_path = download::MODEL_CATALOG
-        .iter()
-        .find(|m| {
-            m.name == model_name || m.file.strip_suffix(".gguf").unwrap_or(m.file) == model_name
-        })
-        .and_then(|m| m.mmproj)
-        .map(|(filename, _url)| download::models_dir().join(filename))
+    let mmproj_path = crate::models::metadata_for_model_name(model_name)
+        .and_then(|m| m.mmproj.as_ref())
+        .map(|asset| download::models_dir().join(asset.file))
         .filter(|p| p.exists());
 
     // In split mode (pipeline parallel), pass total group VRAM so context size
     // accounts for the host only holding its share of layers. KV cache is also
     // distributed — each node holds KV for its own layers.
-    let group_vram = if !rpc_ports.is_empty() { Some(total as u64) } else { None };
+    let group_vram = if !rpc_ports.is_empty() {
+        Some(total as u64)
+    } else {
+        None
+    };
 
     match launch::start_llama_server(
         bin_dir,

@@ -212,94 +212,21 @@ pub struct PeerInfo {
 /// and excluded from gossip propagation. After 2x this duration they're removed entirely.
 const PEER_STALE_SECS: u64 = 180; // 3 minutes
 
-/// Directories to scan for GGUF models.
-pub fn model_dirs() -> Vec<std::path::PathBuf> {
-    let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
-    let mut dirs = vec![home.join(".models")];
-    // Also scan goose's model directory (~/Library/Application Support/Block.goose/models/)
-    if let Some(data_dir) = dirs::data_dir() {
-        let goose_dir = data_dir.join("Block.goose").join("models");
-        if goose_dir.exists() {
-            dirs.push(goose_dir);
-        }
-    }
-    dirs
-}
-
 /// Scan model directories for GGUF files and return their stem names.
 pub fn scan_local_models() -> Vec<String> {
-    let mut names = Vec::new();
-    for models_dir in model_dirs() {
-        if let Ok(entries) = std::fs::read_dir(&models_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) == Some("gguf") {
-                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                        // Skip draft models (tiny) and partial downloads
-                        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                        if size > 500_000_000 {
-                            // > 500MB, skip draft models
-                            // For split GGUFs (name-00001-of-00006.gguf), use base name
-                            let name = split_gguf_base_name(stem).unwrap_or(stem).to_string();
-                            if !names.contains(&name) {
-                                names.push(name);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    names.sort();
-    names
+    crate::models::scan_local_models()
 }
 
-/// Extract the base model name from a split GGUF stem.
-/// "GLM-5-UD-IQ2_XXS-00001-of-00006" → Some("GLM-5-UD-IQ2_XXS")
-/// "Qwen3-8B-Q4_K_M" → None (not a split file)
+#[cfg(test)]
 fn split_gguf_base_name(stem: &str) -> Option<&str> {
-    // Pattern: ...-NNNNN-of-NNNNN
-    let suffix = stem.rfind("-of-")?;
-    let part_num = &stem[suffix + 4..];
-    if part_num.len() != 5 || !part_num.chars().all(|c| c.is_ascii_digit()) {
-        return None;
-    }
-    let dash = stem[..suffix].rfind('-')?;
-    let seq = &stem[dash + 1..suffix];
-    if seq.len() != 5 || !seq.chars().all(|c| c.is_ascii_digit()) {
-        return None;
-    }
-    Some(&stem[..dash])
+    crate::models::split_gguf_base_name(stem)
 }
 
 /// Find a GGUF model file by stem name, searching all model directories.
 /// Returns the first match found (prefers ~/.models/ over goose dir).
 /// For split GGUFs, finds the first part (name-00001-of-NNNNN.gguf).
 pub fn find_model_path(stem: &str) -> std::path::PathBuf {
-    let filename = format!("{}.gguf", stem);
-    for dir in model_dirs() {
-        // Try single-file first
-        let candidate = dir.join(&filename);
-        if candidate.exists() {
-            return candidate;
-        }
-        // Try split GGUF: stem-00001-of-*.gguf
-        let split_prefix = format!("{}-00001-of-", stem);
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                if let Some(name) = entry.file_name().to_str() {
-                    if name.starts_with(&split_prefix) && name.ends_with(".gguf") {
-                        return entry.path();
-                    }
-                }
-            }
-        }
-    }
-    // Fallback: return ~/.models/ path even if it doesn't exist
-    dirs::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".models")
-        .join(&filename)
+    crate::models::find_model_path(stem)
 }
 
 /// Detect available VRAM. On Apple Silicon, uses ~75% of system RAM
