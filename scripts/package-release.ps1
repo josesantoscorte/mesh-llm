@@ -14,6 +14,48 @@ $releaseBinDir = Join-Path $repoRoot "target\release"
 
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 
+function Normalize-RecipeArgument {
+    param(
+        [AllowEmptyString()]
+        [string]$Value,
+        [string[]]$KnownNames = @()
+    )
+
+    if ($null -eq $Value) {
+        return $Value
+    }
+
+    $normalized = $Value.Trim()
+    if (-not $normalized) {
+        return ""
+    }
+
+    if ($normalized -match '^(?<name>[A-Za-z_][A-Za-z0-9_-]*)=(?<value>.*)$') {
+        $matchedName = $Matches.name
+        $isKnownName = $KnownNames.Count -eq 0
+        foreach ($knownName in $KnownNames) {
+            if ($matchedName.Equals($knownName, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $isKnownName = $true
+                break
+            }
+        }
+
+        if ($isKnownName) {
+            $normalized = $Matches.value
+        }
+    }
+
+    if ($normalized.Length -ge 2) {
+        $first = $normalized[0]
+        $last = $normalized[$normalized.Length - 1]
+        if (($first -eq '"' -and $last -eq '"') -or ($first -eq "'" -and $last -eq "'")) {
+            $normalized = $normalized.Substring(1, $normalized.Length - 2)
+        }
+    }
+
+    return $normalized.Trim()
+}
+
 function Get-BinaryFlavor {
     param([string]$RequestedFlavor)
 
@@ -82,6 +124,10 @@ function Require-File {
         throw "Required file not found: $Path"
     }
 }
+
+$Version = Normalize-RecipeArgument $Version @("version")
+$OutputDir = Normalize-RecipeArgument $OutputDir @("output", "output_dir", "outputdir")
+$Flavor = Normalize-RecipeArgument $Flavor @("flavor", "backend")
 
 $binaryFlavor = Get-BinaryFlavor $Flavor
 $targetTriple = "x86_64-pc-windows-msvc"

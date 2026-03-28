@@ -1,12 +1,53 @@
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('cpu', 'cuda', 'rocm', 'vulkan')]
     [string]$Backend,
 
     [string]$RocmHipSdkFilename = 'AMD-Software-PRO-Edition-25.Q3-WinSvr2022-For-HIP.exe'
 )
 
 $ErrorActionPreference = 'Stop'
+
+function Normalize-RecipeArgument {
+    param(
+        [AllowEmptyString()]
+        [string]$Value,
+        [string[]]$KnownNames = @()
+    )
+
+    if ($null -eq $Value) {
+        return $Value
+    }
+
+    $normalized = $Value.Trim()
+    if (-not $normalized) {
+        return ""
+    }
+
+    if ($normalized -match '^(?<name>[A-Za-z_][A-Za-z0-9_-]*)=(?<value>.*)$') {
+        $matchedName = $Matches.name
+        $isKnownName = $KnownNames.Count -eq 0
+        foreach ($knownName in $KnownNames) {
+            if ($matchedName.Equals($knownName, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $isKnownName = $true
+                break
+            }
+        }
+
+        if ($isKnownName) {
+            $normalized = $Matches.value
+        }
+    }
+
+    if ($normalized.Length -ge 2) {
+        $first = $normalized[0]
+        $last = $normalized[$normalized.Length - 1]
+        if (($first -eq '"' -and $last -eq '"') -or ($first -eq "'" -and $last -eq "'")) {
+            $normalized = $normalized.Substring(1, $normalized.Length - 2)
+        }
+    }
+
+    return $normalized.Trim()
+}
 
 function Add-GitHubPath([string]$PathEntry) {
     if (-not $PathEntry) {
@@ -40,6 +81,9 @@ function Test-ExeHeader([string]$Path) {
     $header = Get-Content -Path $Path -AsByteStream -TotalCount 2
     return $header.Length -eq 2 -and $header[0] -eq 0x4D -and $header[1] -eq 0x5A
 }
+
+$Backend = Normalize-RecipeArgument $Backend @('backend')
+$RocmHipSdkFilename = Normalize-RecipeArgument $RocmHipSdkFilename @('rocm_hip_sdk_filename', 'rocmhipsdkfilename')
 
 switch ($Backend.ToLowerInvariant()) {
     'cpu' {
@@ -129,5 +173,8 @@ switch ($Backend.ToLowerInvariant()) {
         Add-GitHubPath "$($sdk.FullName)\Bin"
         Add-GitHubPath "$($sdk.FullName)\Bin32"
         Set-GitHubEnv 'VULKAN_SDK' $sdk.FullName
+    }
+    default {
+        throw "Unsupported Windows backend '$Backend'. Use one of: cpu, cuda, rocm, vulkan."
     }
 }

@@ -51,6 +51,48 @@ function Resolve-CommandPath {
     return $null
 }
 
+function Normalize-RecipeArgument {
+    param(
+        [AllowEmptyString()]
+        [string]$Value,
+        [string[]]$KnownNames = @()
+    )
+
+    if ($null -eq $Value) {
+        return $Value
+    }
+
+    $normalized = $Value.Trim()
+    if (-not $normalized) {
+        return ""
+    }
+
+    if ($normalized -match '^(?<name>[A-Za-z_][A-Za-z0-9_-]*)=(?<value>.*)$') {
+        $matchedName = $Matches.name
+        $isKnownName = $KnownNames.Count -eq 0
+        foreach ($knownName in $KnownNames) {
+            if ($matchedName.Equals($knownName, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $isKnownName = $true
+                break
+            }
+        }
+
+        if ($isKnownName) {
+            $normalized = $Matches.value
+        }
+    }
+
+    if ($normalized.Length -ge 2) {
+        $first = $normalized[0]
+        $last = $normalized[$normalized.Length - 1]
+        if (($first -eq '"' -and $last -eq '"') -or ($first -eq "'" -and $last -eq "'")) {
+            $normalized = $normalized.Substring(1, $normalized.Length - 2)
+        }
+    }
+
+    return $normalized.Trim()
+}
+
 function Resolve-RocmRoot {
     if ($env:ROCM_PATH -and (Test-Path $env:ROCM_PATH)) {
         return $env:ROCM_PATH
@@ -244,6 +286,10 @@ function Invoke-InRepo {
         Pop-Location
     }
 }
+
+$Backend = Normalize-RecipeArgument $Backend @("backend")
+$CudaArch = Normalize-RecipeArgument $CudaArch @("cuda_arch", "cudaarch")
+$RocmArch = Normalize-RecipeArgument $RocmArch @("rocm_arch", "rocmarch", "amd_arch", "amdarch")
 
 $backendName = Resolve-Backend $Backend
 Write-Host "Using Windows backend: $backendName"
