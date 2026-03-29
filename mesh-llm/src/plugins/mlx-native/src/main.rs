@@ -2234,6 +2234,31 @@ fn get_or_create_llama_prefill(
             ));
         }
 
+        if reused_prompt_tokens > 0 {
+            let trimmed_cache = entry
+                .prefill_cache
+                .iter()
+                .map(|entry| {
+                    entry
+                        .as_ref()
+                        .map(|cache| cache.trimmed_to(reused_prompt_tokens as i32))
+                        .transpose()
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let (prefill_logits, prefill_cache) = extend_llama_prefill_one_token_at_a_time(
+                model,
+                prompt_ids,
+                reused_prompt_tokens,
+                trimmed_cache,
+            )?;
+            *prompt_cache = Some(PromptCacheEntry {
+                prompt_ids: prompt_ids.to_vec(),
+                prefill_cache: prefill_cache.clone(),
+                prefill_logits: prefill_logits.clone(),
+            });
+            return Ok((prefill_logits, prefill_cache, reused_prompt_tokens));
+        }
+
         if reused_prompt_tokens == entry.prompt_ids.len() && reused_prompt_tokens < prompt_ids.len()
         {
             let (prefill_logits, prefill_cache) = extend_llama_prefill_one_token_at_a_time(
@@ -2317,6 +2342,31 @@ fn get_or_create_qwen3_prefill(
                 entry.prefill_cache.clone(),
                 entry.prompt_ids.len(),
             ));
+        }
+
+        if reused_prompt_tokens > 0 {
+            let trimmed_cache = entry
+                .prefill_cache
+                .iter()
+                .map(|entry| {
+                    entry
+                        .as_ref()
+                        .map(|cache| cache.trimmed_to(reused_prompt_tokens as i32))
+                        .transpose()
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let (prefill_logits, prefill_cache) = extend_qwen3_prefill_one_token_at_a_time(
+                model,
+                prompt_ids,
+                reused_prompt_tokens,
+                trimmed_cache,
+            )?;
+            *prompt_cache = Some(PromptCacheEntry {
+                prompt_ids: prompt_ids.to_vec(),
+                prefill_cache: prefill_cache.clone(),
+                prefill_logits: prefill_logits.clone(),
+            });
+            return Ok((prefill_logits, prefill_cache, reused_prompt_tokens));
         }
 
         if reused_prompt_tokens == entry.prompt_ids.len() && reused_prompt_tokens < prompt_ids.len()
@@ -3785,6 +3835,32 @@ mod tests {
         assert!(
             shared_prefix > 0,
             "benchmark-style chat prompts should share some token prefix"
+        );
+
+        let base_tokens =
+            build_prompt_array(&base_ids).expect("build llama chat base prompt array");
+        let (_, _, reused_base) = get_or_create_llama_prefill(
+            &mut engine.model,
+            &base_ids,
+            &base_tokens,
+            &mut engine.prompt_cache,
+        )
+        .expect("prefill llama chat base prompt");
+        assert_eq!(reused_base, 0, "first chat prompt should not reuse cached tokens");
+
+        let extended_tokens =
+            build_prompt_array(&extended_ids).expect("build llama chat extended prompt array");
+        let (_, _, reused_extended) = get_or_create_llama_prefill(
+            &mut engine.model,
+            &extended_ids,
+            &extended_tokens,
+            &mut engine.prompt_cache,
+        )
+        .expect("prefill llama chat extended prompt");
+        eprintln!("llama chat cache reuse: reused_extended={}", reused_extended);
+        assert!(
+            reused_extended >= shared_prefix,
+            "extended chat prompt should reuse the shared chat prefix"
         );
     }
 
