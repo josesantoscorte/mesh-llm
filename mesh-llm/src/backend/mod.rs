@@ -1,3 +1,5 @@
+mod llama;
+
 use crate::launch::{BinaryFlavor, InferenceServerProcess, ModelLaunchSpec};
 use anyhow::Result;
 use std::future::Future;
@@ -9,8 +11,17 @@ pub enum BackendKind {
     Llama,
 }
 
+impl BackendKind {
+    pub const ALL: [BackendKind; 1] = [BackendKind::Llama];
+
+    pub fn as_str(self) -> &'static str {
+        backend_ops(self).as_str()
+    }
+}
+
 pub type BackendLaunchFuture<'a> =
     Pin<Box<dyn Future<Output = Result<InferenceServerProcess>> + Send + 'a>>;
+pub type BackendControlFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
 pub trait BackendOps: Send + Sync {
     fn as_str(&self) -> &'static str;
@@ -24,44 +35,18 @@ pub trait BackendOps: Send + Sync {
         binary_flavor: Option<BinaryFlavor>,
         spec: ModelLaunchSpec<'a>,
     ) -> BackendLaunchFuture<'a>;
+    fn kill_server_processes<'a>(&'a self) -> BackendControlFuture<'a>;
 }
-
-impl BackendKind {
-    pub fn as_str(self) -> &'static str {
-        backend_ops(self).as_str()
-    }
-}
-
-struct LlamaBackend;
-
-impl BackendOps for LlamaBackend {
-    fn as_str(&self) -> &'static str {
-        "llama"
-    }
-
-    fn process_label(&self) -> &'static str {
-        "llama-server"
-    }
-
-    fn start_server<'a>(
-        &self,
-        bin_dir: &'a Path,
-        binary_flavor: Option<BinaryFlavor>,
-        spec: ModelLaunchSpec<'a>,
-    ) -> BackendLaunchFuture<'a> {
-        Box::pin(crate::launch::start_llama_server(
-            bin_dir,
-            binary_flavor,
-            spec,
-        ))
-    }
-}
-
-static LLAMA_BACKEND: LlamaBackend = LlamaBackend;
 
 pub fn backend_ops(kind: BackendKind) -> &'static dyn BackendOps {
     match kind {
-        BackendKind::Llama => &LLAMA_BACKEND,
+        BackendKind::Llama => &llama::LLAMA_BACKEND,
+    }
+}
+
+pub async fn kill_all_server_processes() {
+    for kind in BackendKind::ALL {
+        backend_ops(kind).kill_server_processes().await;
     }
 }
 

@@ -660,7 +660,7 @@ async fn main() -> Result<()> {
     // This intentionally happens after subcommand dispatch so control commands
     // targeting a live instance don't kill it before sending the request.
     if !cli.client {
-        launch::kill_llama_server().await;
+        backend::kill_all_server_processes().await;
         launch::kill_orphan_rpc_servers().await;
     }
 
@@ -2161,7 +2161,7 @@ async fn run_auto(
         node.set_serving(None).await;
     }
 
-    launch::kill_llama_server().await;
+    backend::kill_all_server_processes().await;
     launch::kill_orphan_rpc_servers().await;
     Ok(())
 }
