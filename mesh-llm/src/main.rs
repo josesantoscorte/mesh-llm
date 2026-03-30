@@ -3103,7 +3103,167 @@ fn build_serving_list(resolved_models: &[PathBuf], model_name: &str) -> Vec<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use std::collections::HashMap;
+    use std::net::SocketAddr;
     use std::path::PathBuf;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::{mpsc, oneshot, watch};
+
+    async fn spawn_api_proxy_test_harness(
+        targets: election::ModelTargets,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let node = mesh::Node::new_for_tests(mesh::NodeRole::Worker)
+            .await
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (_target_tx, target_rx) = watch::channel(targets);
+        let (drop_tx, _drop_rx) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(api_proxy(
+            node,
+            addr.port(),
+            target_rx,
+            drop_tx,
+            Some(listener),
+            false,
+            affinity::AffinityRouter::default(),
+        ));
+        (addr, handle)
+    }
+
+    async fn spawn_capturing_upstream(
+        response_body: &str,
+    ) -> (u16, oneshot::Receiver<Vec<u8>>, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let response = response_body.to_string();
+        let (request_tx, request_rx) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let raw = read_raw_http_request(&mut stream).await;
+            let _ = request_tx.send(raw);
+
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response.len(),
+                response
+            );
+            stream.write_all(resp.as_bytes()).await.unwrap();
+            let _ = stream.shutdown().await;
+        });
+        (port, request_rx, handle)
+    }
+
+    async fn read_raw_http_request(stream: &mut TcpStream) -> Vec<u8> {
+        let mut raw = Vec::new();
+        loop {
+            let mut chunk = [0u8; 8192];
+            let n = stream.read(&mut chunk).await.unwrap();
+            assert!(n > 0, "unexpected EOF while reading test request");
+            raw.extend_from_slice(&chunk[..n]);
+
+            let Some(header_end) = find_header_end(&raw) else {
+                continue;
+            };
+            let headers = std::str::from_utf8(&raw[..header_end]).unwrap();
+
+            if header_has_token(headers, "transfer-encoding", "chunked") {
+                if raw[header_end..]
+                    .windows(5)
+                    .any(|window| window == b"0\r\n\r\n")
+                {
+                    return raw;
+                }
+                continue;
+            }
+
+            if let Some(content_length) = content_length(headers) {
+                if raw.len() >= header_end + content_length {
+                    raw.truncate(header_end + content_length);
+                    return raw;
+                }
+                continue;
+            }
+
+            raw.truncate(header_end);
+            return raw;
+        }
+    }
+
+    fn find_header_end(buf: &[u8]) -> Option<usize> {
+        buf.windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|idx| idx + 4)
+    }
+
+    fn header_value<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
+        headers.lines().skip(1).find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            if key.trim().eq_ignore_ascii_case(name) {
+                Some(value.trim())
+            } else {
+                None
+            }
+        })
+    }
+
+    fn header_has_token(headers: &str, name: &str, token: &str) -> bool {
+        header_value(headers, name)
+            .map(|value| {
+                value
+                    .split(',')
+                    .any(|part| part.trim().eq_ignore_ascii_case(token))
+            })
+            .unwrap_or(false)
+    }
+
+    fn content_length(headers: &str) -> Option<usize> {
+        header_value(headers, "content-length")?.parse().ok()
+    }
+
+    fn local_targets(entries: &[(&str, u16)]) -> election::ModelTargets {
+        let mut targets = election::ModelTargets::default();
+        targets.targets = entries
+            .iter()
+            .map(|(model, port)| {
+                (
+                    (*model).to_string(),
+                    vec![election::InferenceTarget::Local(*port)],
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        targets
+    }
+
+    fn build_chunked_request(path: &str, body: &[u8], chunks: &[usize]) -> Vec<u8> {
+        let mut out = format!(
+            "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n"
+        )
+        .into_bytes();
+        let mut pos = 0usize;
+        for &chunk_len in chunks {
+            let end = pos + chunk_len;
+            out.extend_from_slice(format!("{chunk_len:x}\r\n").as_bytes());
+            out.extend_from_slice(&body[pos..end]);
+            out.extend_from_slice(b"\r\n");
+            pos = end;
+        }
+        out.extend_from_slice(b"0\r\n\r\n");
+        out
+    }
+
+    async fn send_request_and_read_response(addr: SocketAddr, parts: Vec<Vec<u8>>) -> String {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        for part in parts {
+            stream.write_all(&part).await.unwrap();
+        }
+        stream.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        String::from_utf8(response).unwrap()
+    }
 
     #[test]
     fn test_build_serving_list_auto_no_resolved() {
@@ -3158,5 +3318,161 @@ mod tests {
         let result = build_serving_list(&resolved, "MiniMax-M2.5-Q4_K_M-00001-of-00004");
         assert_eq!(result, vec!["MiniMax-M2.5-Q4_K_M"]);
         assert_eq!(result.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_api_proxy_integration_fragmented_post_body() {
+        let (upstream_port, upstream_rx, upstream_handle) =
+            spawn_capturing_upstream(r#"{"ok":true}"#).await;
+        let (proxy_addr, proxy_handle) =
+            spawn_api_proxy_test_harness(local_targets(&[("test", upstream_port)])).await;
+
+        let body = json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": "hello"}],
+        })
+        .to_string();
+        let headers = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+
+        let response = send_request_and_read_response(
+            proxy_addr,
+            vec![
+                headers.as_bytes()[..38].to_vec(),
+                headers.as_bytes()[38..].to_vec(),
+                body.as_bytes()[..12].to_vec(),
+                body.as_bytes()[12..].to_vec(),
+            ],
+        )
+        .await;
+        let raw = String::from_utf8(upstream_rx.await.unwrap()).unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(raw.contains(&body));
+        assert!(raw.contains("Connection: close"));
+
+        proxy_handle.abort();
+        let _ = upstream_handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_api_proxy_integration_chunked_body() {
+        let (upstream_port, upstream_rx, upstream_handle) =
+            spawn_capturing_upstream(r#"{"ok":true}"#).await;
+        let (proxy_addr, proxy_handle) =
+            spawn_api_proxy_test_harness(local_targets(&[("test", upstream_port)])).await;
+
+        let body = br#"{"model":"test","messages":[{"role":"user","content":"chunked"}]}"#;
+        let request = build_chunked_request("/v1/chat/completions", body, &[17, body.len() - 17]);
+
+        let response = send_request_and_read_response(proxy_addr, vec![request]).await;
+        let raw = String::from_utf8(upstream_rx.await.unwrap()).unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(raw.contains("Transfer-Encoding: chunked"));
+        assert!(raw.contains("\"model\":\"test\""));
+        assert!(raw.contains("0\r\n\r\n"));
+
+        proxy_handle.abort();
+        let _ = upstream_handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_api_proxy_integration_expect_continue() {
+        let (upstream_port, upstream_rx, upstream_handle) =
+            spawn_capturing_upstream(r#"{"ok":true}"#).await;
+        let (proxy_addr, proxy_handle) =
+            spawn_api_proxy_test_harness(local_targets(&[("test", upstream_port)])).await;
+
+        let body = br#"{"model":"test","messages":[{"role":"user","content":"expect"}]}"#;
+        let headers = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nExpect: 100-continue\r\n\r\n",
+            body.len()
+        );
+
+        let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
+        stream.write_all(headers.as_bytes()).await.unwrap();
+
+        let mut interim = [0u8; 64];
+        let n = stream.read(&mut interim).await.unwrap();
+        assert_eq!(
+            std::str::from_utf8(&interim[..n]).unwrap(),
+            "HTTP/1.1 100 Continue\r\n\r\n"
+        );
+
+        stream.write_all(body).await.unwrap();
+        stream.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let raw = String::from_utf8(upstream_rx.await.unwrap()).unwrap();
+
+        assert!(String::from_utf8(response)
+            .unwrap()
+            .starts_with("HTTP/1.1 200 OK"));
+        assert!(!raw.contains("Expect: 100-continue"));
+        assert!(raw.contains("Connection: close"));
+        assert!(raw.contains(std::str::from_utf8(body).unwrap()));
+
+        proxy_handle.abort();
+        let _ = upstream_handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_api_proxy_integration_pipeline_fallback_uses_direct_proxy() {
+        let strong_model = "Qwen2.5-Coder-32B-Instruct-Q4_K_M";
+        let planner_model = "Qwen2.5-3B-Instruct-Q4_K_M";
+        let body = json!({
+            "model": "auto",
+            "messages": [
+                {"role": "user", "content": "Review this codebase, design a system-level fix for the HTTP proxy, debug the fragmented request bug, implement the code changes, update the tests, and explain the trade-offs around buffering, chunked transfer encoding, and connection reuse."}
+            ],
+            "tools": [
+                {"type": "function", "function": {"name": "bash", "parameters": {"type": "object", "properties": {}}}}
+            ]
+        });
+        let classification = router::classify(&body);
+        assert!(pipeline::should_pipeline(&classification));
+        assert_eq!(
+            router::pick_model_classified(
+                &classification,
+                &[(strong_model, 10.0), (planner_model, 10.0)]
+            ),
+            Some(strong_model)
+        );
+
+        let (strong_port, strong_rx, strong_handle) =
+            spawn_capturing_upstream(r#"{"ok":true}"#).await;
+        let planner_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let planner_port = planner_listener.local_addr().unwrap().port();
+        drop(planner_listener);
+
+        let (proxy_addr, proxy_handle) = spawn_api_proxy_test_harness(local_targets(&[
+            (strong_model, strong_port),
+            (planner_model, planner_port),
+        ]))
+        .await;
+
+        let request_body = body.to_string();
+        let headers = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            request_body.len()
+        );
+
+        let response = send_request_and_read_response(
+            proxy_addr,
+            vec![format!("{headers}{request_body}").into_bytes()],
+        )
+        .await;
+        let raw = String::from_utf8(strong_rx.await.unwrap()).unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(raw.contains("\"model\":\"auto\""));
+        assert!(!raw.contains("[Task Plan from"));
+        assert!(raw.contains("\"Review this codebase, design a system-level fix for the HTTP proxy, debug the fragmented request bug, implement the code changes, update the tests, and explain the trade-offs around buffering, chunked transfer encoding, and connection reuse.\""));
+
+        proxy_handle.abort();
+        let _ = strong_handle.await;
     }
 }
