@@ -2,8 +2,8 @@
 # ci-split-test.sh — verify that split-mode routes chat requests to the Host, not the Worker.
 #
 # Starts three mesh-llm nodes on the same machine:
-#   Node A + B — GPU nodes with --split (one becomes Host, one becomes Worker)
-#   Node C    — Client (no GPU, routes via target map built from peer gossip)
+#   Node A + B — compute nodes (CPU) with --split (one becomes Host, one becomes Worker)
+#   Node C    — client-only node (routes via target map built from peer gossip)
 #
 # The bug: Node C's target map could pick the Worker as an HTTP target.
 # Workers only run rpc-server and return empty/broken responses to chat requests.
@@ -55,8 +55,8 @@ cleanup() {
     for PID in $C_PID $B_PID $A_PID; do
         [ -n "$PID" ] && kill -9 "$PID" 2>/dev/null || true
     done
-    pkill -9 -f "rpc-server.*314[123]" 2>/dev/null || true
-    pkill -9 -f "llama-server.*934[789]" 2>/dev/null || true
+    pkill -9 -f "rpc-server" 2>/dev/null || true
+    pkill -9 -f "llama-server" 2>/dev/null || true
     wait 2>/dev/null || true
     echo "Cleanup done."
 }
@@ -267,16 +267,14 @@ fi
 # ── Also verify Host directly ──
 echo ""
 echo "Testing Host directly (port $HOST_API)..."
-RESPONSE2=$(curl -s --max-time 60 "http://localhost:${HOST_API}/v1/chat/completions" \
+if ! RESPONSE2=$(curl -s --max-time 60 "http://localhost:${HOST_API}/v1/chat/completions" \
     -H "Content-Type: application/json" \
     -d "{
         \"model\": \"${MODEL_NAME}\",
         \"messages\": [{\"role\": \"user\", \"content\": \"Say hi.\"}],
         \"max_tokens\": 16,
         \"temperature\": 0
-    }" 2>&1)
-
-if [ $? -ne 0 ]; then
+    }" 2>&1); then
     echo "❌ Host direct inference failed"
     exit 1
 fi
