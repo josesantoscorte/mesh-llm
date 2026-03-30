@@ -27,7 +27,7 @@ use clap::{Parser, Subcommand};
 use mesh::NodeRole;
 use std::path::{Path, PathBuf};
 
-pub const VERSION: &str = "0.51.0";
+pub const VERSION: &str = "0.52.0";
 
 #[derive(Parser, Debug)]
 #[command(name = "mesh-llm", version = VERSION,
