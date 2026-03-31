@@ -17,9 +17,9 @@ message PeerAnnouncement {
   optional string hostname = 6;
   optional bool is_soc = 7;
   optional string gpu_vram = 8;
-  repeated string catalog_models = 9;                 // all models found on disk for mesh discovery
-  repeated string assigned_models = 10;               // election / model-group membership
-  repeated string desired_models = 11;                // operator intent for what the mesh should serve
+  repeated string available_models = 9;               // all models found on disk for mesh discovery
+  repeated string serving_models = 10;                // election / model-group membership
+  repeated string requested_models = 11;              // operator intent for what the mesh should serve
   repeated CompactModelMetadata available_model_metadata = 12;
   optional ExpertsSummary experts_summary = 13;
   optional uint32 rtt_ms = 14;

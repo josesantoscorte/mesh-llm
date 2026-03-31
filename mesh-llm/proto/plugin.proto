@@ -74,9 +74,9 @@ message MeshPeer {
   string role = 4;
   uint64 vram_bytes = 5;
   repeated string configured_models = 6;
-  repeated string assigned_models = 7;
-  repeated string catalog_models = 8;
-  repeated string desired_models = 9;
+  repeated string serving_models = 7;
+  repeated string available_models = 8;
+  repeated string requested_models = 9;
   optional uint32 rtt_ms = 10;
   string model_source = 11;
   repeated string hosted_models = 12;

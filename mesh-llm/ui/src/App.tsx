@@ -90,10 +90,10 @@ type Peer = {
   id: string;
   role: string;
   configured_models: string[];
-  catalog_models?: string[];
-  desired_models?: string[];
+  available_models?: string[];
+  requested_models?: string[];
   vram_gb: number;
-  assigned_models?: string[];
+  serving_models?: string[];
   hosted_models?: string[];
   hosted_models_known?: boolean;
   rtt_ms?: number | null;
@@ -112,7 +112,7 @@ type StatusPayload = {
   is_client: boolean;
   llama_ready: boolean;
   model_name: string;
-  assigned_models?: string[];
+  serving_models?: string[];
   hosted_models?: string[];
   api_port: number;
   my_vram_gb: number;
@@ -193,7 +193,7 @@ const CHAT_MAX_MESSAGES_PER_CONVERSATION = 240;
 const CHAT_MAX_TEXT_CHARS = 12000;
 
 function peerAssignedModels(peer: Peer): string[] {
-  return peer.assigned_models?.filter(Boolean) ?? [];
+  return peer.serving_models?.filter(Boolean) ?? [];
 }
 
 function peerRoutableModels(peer: Peer): string[] {
@@ -1012,8 +1012,8 @@ export function App() {
         serving: status.model_name || '',
         servingModels: (status.hosted_models && status.hosted_models.length > 0)
           ? status.hosted_models
-          : (status.assigned_models && status.assigned_models.length > 0)
-            ? status.assigned_models
+          : (status.serving_models && status.serving_models.length > 0)
+            ? status.serving_models
           : (status.model_name ? [status.model_name] : []),
         statusLabel: status.node_status || (status.is_client ? 'Client' : status.is_host ? 'Host' : 'Idle'),
         latencyMs: null,
