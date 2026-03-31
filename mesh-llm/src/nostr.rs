@@ -905,14 +905,14 @@ fn model_tiers() -> Vec<(&'static str, f64)> {
 /// to avoid download wait. Leaves ~15% VRAM headroom for KV cache.
 ///
 /// Packs by VRAM tier:
-///   <8GB:    Qwen3-4B (2.5G) — starter
-///   8-13GB:  Qwen3-8B (5G)
-///   13-24GB: Qwen3-8B (5G) + Coder-7B (4.4G)
-///   24-50GB: Qwen3.5-27B (17G) — vision + text
-///   50-63GB: Qwen3-32B (19.8G) + Qwen3-Coder-30B-A3B (18.6G)
-///   63-85GB: Qwen3-Coder-Next (48G) — frontier coder
+///   <8GB:     Qwen3-4B (2.5G) — starter
+///   8-13GB:   Qwen3-8B (5G)
+///   13-24GB:  Qwen3-8B (5G) + Coder-7B (4.4G)
+///   24-50GB:  Qwen3.5-27B (17G) — vision + text
+///   50-63GB:  Qwen3-32B (19.8G) + Qwen3-Coder-30B-A3B (18.6G)
+///   63-85GB:  Qwen3-Coder-Next (48G) — frontier coder
 ///   85-179GB: Qwen3-Coder-Next (48G) + Qwen3.5-27B (17G)
-///   179GB+:  MiniMax-M2.5 (138G)
+///   179GB+:   MiniMax-M2.5 (138G)
 pub fn auto_model_pack(vram_gb: f64) -> Vec<String> {
     let local_models = crate::mesh::scan_local_models();
     let tiers = model_tiers();
@@ -938,8 +938,8 @@ pub fn auto_model_pack(vram_gb: f64) -> Vec<String> {
         models: &'static [&'static str],
     }
     let packs: &[Pack] = &[
-        // Sizes (file): MiniMax=138G, Coder-Next=48G, 3.5-27B=17G, 3-32B=19.8G,
-        //               Coder-30B=18.6G, Qwen3-8B=5G, Coder-7B=4.4G, Qwen3-4B=2.5G
+        // Sizes (file): MiniMax=138G, Coder-Next=48G, 3-32B=19.8G, Coder-30B=18.6G,
+        //               GLM-Flash=18G, 3.5-27B=17G, Qwen3-8B=5G, Coder-7B=4.4G, Qwen3-4B=2.5G
         // min_vram = total_file_size * 1.1 / 0.85 (accounts for both multipliers).
         Pack {
             min_vram: 179.0,
@@ -1022,6 +1022,7 @@ pub fn demand_seed_models() -> Vec<String> {
     vec![
         "Qwen3-Coder-Next-Q4_K_M".into(),
         "Qwen3.5-27B-Q4_K_M".into(),
+        "GLM-4.7-Flash-Q4_K_M".into(),
         "Qwen3-8B-Q4_K_M".into(),
         "Qwen3-4B-Q4_K_M".into(),
         "Qwen3-0.6B-Q4_K_M".into(),
