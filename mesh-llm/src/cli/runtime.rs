@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Subcommand;
+use serde_json::Value;
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum RuntimeCommand {
@@ -36,30 +37,24 @@ pub(crate) async fn run_load(model_name: &str, port: u16) -> Result<()> {
     run_control_request("/mesh/load", model_name, port, "Loaded").await
 }
 
-pub(crate) async fn run_models(port: u16) -> Result<()> {
+pub(crate) async fn run_status(port: u16) -> Result<()> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()?;
-    let url = format!("http://127.0.0.1:{port}/api/runtime");
-    let body = client
-        .get(&url)
-        .send()
-        .await
-        .with_context(|| {
-            format!("Can't connect to mesh-llm console on port {port}. Is it running?")
-        })?
-        .error_for_status()?
-        .json::<serde_json::Value>()
-        .await?;
+    let runtime_body = fetch_runtime_payload(&client, port, "/api/runtime").await?;
+    let processes_body = fetch_runtime_payload(&client, port, "/api/runtime/processes").await?;
 
-    let models = body["models"]
+    let models = runtime_body["models"]
         .as_array()
         .ok_or_else(|| anyhow::anyhow!("Invalid runtime status payload"))?;
+    let processes = processes_body["processes"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("Invalid runtime process payload"))?;
 
     println!("⚙️  Runtime");
     println!();
 
-    let primary_model = body["primary_model"].as_str().unwrap_or("none");
+    let primary_model = runtime_body["primary_model"].as_str().unwrap_or("none");
     println!("🧠 Primary: {primary_model}");
 
     if models.is_empty() {
@@ -73,14 +68,17 @@ pub(crate) async fn run_models(port: u16) -> Result<()> {
     println!();
 
     println!(
-        "{:<42} {:<8} {:<8} {:<10} {:<6} {:<8}",
-        "Model", "Role", "Backend", "State", "Port", "Source"
+        "{:<42} {:<8} {:<8} {:<10} {:<8} {:<6} {:<8}",
+        "Model", "Role", "Backend", "State", "Pid", "Port", "Source"
     );
     for model in models {
         let name = model["name"].as_str().unwrap_or("unknown");
         let kind = display_runtime_role(model["kind"].as_str().unwrap_or("unknown"));
         let backend = display_backend_label(model["backend"].as_str().unwrap_or("unknown"));
         let status = display_runtime_state(model["status"].as_str().unwrap_or("unknown"));
+        let pid = find_pid(processes, model)
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "-".into());
         let port = model["port"]
             .as_u64()
             .map(|p| p.to_string())
@@ -91,71 +89,8 @@ pub(crate) async fn run_models(port: u16) -> Result<()> {
             "Runtime"
         };
         println!(
-            "{:<42} {:<8} {:<8} {:<10} {:<6} {:<8}",
-            name, kind, backend, status, port, source
-        );
-    }
-
-    Ok(())
-}
-
-pub(crate) async fn run_ps(port: u16) -> Result<()> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()?;
-    let url = format!("http://127.0.0.1:{port}/api/runtime/processes");
-    let body = client
-        .get(&url)
-        .send()
-        .await
-        .with_context(|| {
-            format!("Can't connect to mesh-llm console on port {port}. Is it running?")
-        })?
-        .error_for_status()?
-        .json::<serde_json::Value>()
-        .await?;
-
-    let processes = body["processes"]
-        .as_array()
-        .ok_or_else(|| anyhow::anyhow!("Invalid runtime process payload"))?;
-
-    println!("⚙️  Processes");
-    println!();
-
-    if processes.is_empty() {
-        println!("📦 Local processes: 0");
-        println!();
-        println!("No local inference processes are currently running.");
-        return Ok(());
-    }
-
-    println!("📦 Local processes: {}", processes.len());
-    println!();
-
-    println!(
-        "{:<42} {:<8} {:<8} {:<8} {:<6} {:<8}",
-        "Model", "Role", "Backend", "Pid", "Port", "Source"
-    );
-    for process in processes {
-        let name = process["name"].as_str().unwrap_or("unknown");
-        let kind = display_runtime_role(process["kind"].as_str().unwrap_or("unknown"));
-        let backend = display_backend_label(process["backend"].as_str().unwrap_or("unknown"));
-        let port = process["port"]
-            .as_u64()
-            .map(|p| p.to_string())
-            .unwrap_or_else(|| "-".into());
-        let pid = process["pid"]
-            .as_u64()
-            .map(|p| p.to_string())
-            .unwrap_or_else(|| "-".into());
-        let source = if process["startup_managed"].as_bool().unwrap_or(false) {
-            "Startup"
-        } else {
-            "Runtime"
-        };
-        println!(
-            "{:<42} {:<8} {:<8} {:<8} {:<6} {:<8}",
-            name, kind, backend, pid, port, source
+            "{:<42} {:<8} {:<8} {:<10} {:<8} {:<6} {:<8}",
+            name, kind, backend, status, pid, port, source
         );
     }
 
@@ -223,4 +158,30 @@ fn display_backend_label(value: &str) -> &'static str {
         "llama" => "Llama",
         _ => "Unknown",
     }
+}
+
+async fn fetch_runtime_payload(client: &reqwest::Client, port: u16, path: &str) -> Result<Value> {
+    let url = format!("http://127.0.0.1:{port}{path}");
+    client
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| {
+            format!("Can't connect to mesh-llm console on port {port}. Is it running?")
+        })?
+        .error_for_status()?
+        .json::<Value>()
+        .await
+        .map_err(Into::into)
+}
+
+fn find_pid(processes: &[Value], model: &Value) -> Option<u64> {
+    let name = model["name"].as_str()?;
+    let kind = model["kind"].as_str()?;
+    processes
+        .iter()
+        .find(|process| {
+            process["name"].as_str() == Some(name) && process["kind"].as_str() == Some(kind)
+        })
+        .and_then(|process| process["pid"].as_u64())
 }

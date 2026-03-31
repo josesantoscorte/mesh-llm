@@ -30,7 +30,7 @@ pub(crate) use autoupdate::{latest_release_version, version_newer};
 pub use plugins::blackboard;
 pub use plugins::blackboard::mcp as blackboard_mcp;
 
-use crate::cli::runtime::{run_drop, run_load, run_models, run_ps, RuntimeCommand};
+use crate::cli::runtime::{run_drop, run_load, run_status, RuntimeCommand};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use mesh::NodeRole;
@@ -196,12 +196,12 @@ enum Command {
         draft: bool,
     },
     /// Inspect and manage local runtime-served models.
+    #[command(hide = true)]
     Runtime {
         #[command(subcommand)]
         command: Option<RuntimeCommand>,
     },
     /// Load a local-only model into a running mesh-llm instance.
-    #[command(hide = true)]
     Load {
         /// Model name/path/url to load
         name: String,
@@ -210,7 +210,6 @@ enum Command {
         port: u16,
     },
     /// Drop a local runtime-loaded model from a running mesh-llm instance.
-    #[command(hide = true)]
     Drop {
         /// Model name to drop
         name: String,
@@ -218,15 +217,8 @@ enum Command {
         #[arg(long, default_value = "9337")]
         port: u16,
     },
-    /// Show locally served models on a running mesh-llm instance.
-    #[command(hide = true)]
-    Models {
-        /// Console/API port of the running mesh-llm instance (default: 3131)
-        #[arg(long, default_value = "3131")]
-        port: u16,
-    },
-    /// Show local inference processes on a running mesh-llm instance.
-    Ps {
+    /// Show local runtime status on a running mesh-llm instance.
+    Status {
         /// Console/API port of the running mesh-llm instance (default: 3131)
         #[arg(long, default_value = "3131")]
         port: u16,
@@ -603,7 +595,7 @@ async fn main() -> Result<()> {
             }
             Command::Runtime { command } => match command {
                 Some(RuntimeCommand::Status { port }) => {
-                    return run_models(*port).await;
+                    return run_status(*port).await;
                 }
                 Some(RuntimeCommand::Load { name, port }) => {
                     return run_load(name, *port).await;
@@ -612,7 +604,7 @@ async fn main() -> Result<()> {
                     return run_drop(name, *port).await;
                 }
                 None => {
-                    return run_models(3131).await;
+                    return run_status(3131).await;
                 }
             },
             Command::Load { name, port } => {
@@ -621,11 +613,8 @@ async fn main() -> Result<()> {
             Command::Drop { name, port } => {
                 return run_drop(name, *port).await;
             }
-            Command::Models { port } => {
-                return run_models(*port).await;
-            }
-            Command::Ps { port } => {
-                return run_ps(*port).await;
+            Command::Status { port } => {
+                return run_status(*port).await;
             }
             Command::Stop => {
                 return run_stop();
