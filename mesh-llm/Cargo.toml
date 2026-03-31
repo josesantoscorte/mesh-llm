@@ -32,5 +32,9 @@ prost = "0.14"
 toml = "0.9"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+mlx-rs = { version = "0.25", features = ["safetensors"] }
+tokenizers = "0.21"
+
 [dev-dependencies]
 serial_test = "3"
