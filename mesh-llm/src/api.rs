@@ -145,7 +145,7 @@ struct StatusPayload {
     is_client: bool,
     llama_ready: bool,
     model_name: String,
-    configured_models: Vec<String>,
+    models: Vec<String>,
     available_models: Vec<String>,
     requested_models: Vec<String>,
     serving_models: Vec<String>,
@@ -175,7 +175,7 @@ struct StatusPayload {
 struct PeerPayload {
     id: String,
     role: String,
-    configured_models: Vec<String>,
+    models: Vec<String>,
     available_models: Vec<String>,
     requested_models: Vec<String>,
     vram_gb: f64,
@@ -373,9 +373,9 @@ impl MeshApi {
         }; // inner lock dropped here
 
         let all_peers = node.peers().await;
-        let my_configured_models = node.configured_models().await;
-        let my_catalog_models = node.catalog_models().await;
-        let my_desired_models = node.desired_models().await;
+        let my_models = node.models().await;
+        let my_available_models = node.available_models().await;
+        let my_requested_models = node.requested_models().await;
         let peers: Vec<PeerPayload> = all_peers
             .iter()
             .map(|p| PeerPayload {
@@ -385,9 +385,9 @@ impl MeshApi {
                     mesh::NodeRole::Host { .. } => "Host".into(),
                     mesh::NodeRole::Client => "Client".into(),
                 },
-                configured_models: p.configured_models.clone(),
-                available_models: p.catalog_models.clone(),
-                requested_models: p.desired_models.clone(),
+                models: p.models.clone(),
+                available_models: p.available_models.clone(),
+                requested_models: p.requested_models.clone(),
                 vram_gb: p.vram_bytes as f64 / 1e9,
                 serving_models: p.serving_models.clone(),
                 hosted_models: p.hosted_models.clone(),
@@ -517,9 +517,9 @@ impl MeshApi {
             is_client,
             llama_ready,
             model_name,
-            configured_models: my_configured_models,
-            available_models: my_catalog_models,
-            requested_models: my_desired_models,
+            models: my_models,
+            available_models: my_available_models,
+            requested_models: my_requested_models,
             serving_models: my_serving_models,
             hosted_models: my_hosted_models,
             draft_name,

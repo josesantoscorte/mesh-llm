@@ -398,14 +398,14 @@ pub async fn publish_loop(
 
         // Available = all GGUFs on disk across mesh, minus what's already warm
         let mut available: Vec<String> = Vec::new();
-        let my_available = node.catalog_models().await;
+        let my_available = node.available_models().await;
         for m in &my_available {
             if !served_set.contains(m.as_str()) && !available.contains(m) {
                 available.push(m.clone());
             }
         }
         for p in &peers {
-            for m in &p.catalog_models {
+            for m in &p.available_models {
                 if !served_set.contains(m.as_str()) && !available.contains(m) {
                     available.push(m.clone());
                 }

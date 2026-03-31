@@ -64,10 +64,10 @@ fn peer_info_to_mesh_peer(peer: &PeerInfo) -> crate::plugin::proto::MeshPeer {
         capabilities: Vec::new(),
         role: node_role_label(&peer.role),
         vram_bytes: peer.vram_bytes,
-        models: peer.configured_models.clone(),
+        models: peer.models.clone(),
         serving_models: peer.serving_models.clone(),
-        available_models: peer.catalog_models.clone(),
-        requested_models: peer.desired_models.clone(),
+        available_models: peer.available_models.clone(),
+        requested_models: peer.requested_models.clone(),
         rtt_ms: peer.rtt_ms,
         model_source: peer.model_source.clone().unwrap_or_default(),
         hosted_models: peer.hosted_models.clone(),
@@ -78,15 +78,15 @@ fn peer_info_to_mesh_peer(peer: &PeerInfo) -> crate::plugin::proto::MeshPeer {
 fn peer_meaningfully_changed(old: &PeerInfo, new: &PeerInfo) -> bool {
     old.addr != new.addr
         || old.role != new.role
-        || old.configured_models != new.configured_models
+        || old.models != new.models
         || old.vram_bytes != new.vram_bytes
         || old.rtt_ms != new.rtt_ms
         || old.model_source != new.model_source
         || old.serving_models != new.serving_models
         || old.hosted_models_known != new.hosted_models_known
         || old.hosted_models != new.hosted_models
-        || old.catalog_models != new.catalog_models
-        || old.desired_models != new.desired_models
+        || old.available_models != new.available_models
+        || old.requested_models != new.requested_models
         || old.version != new.version
 }
 
@@ -139,13 +139,13 @@ impl PeerAnnouncementV0 {
         PeerAnnouncement {
             addr: self.addr,
             role: self.role,
-            configured_models: self.models,
+            models: self.models,
             vram_bytes: self.vram_bytes,
             model_source: self.model_source,
             serving_models,
             hosted_models: None,
-            catalog_models: self.available_models,
-            desired_models: self.requested_models,
+            available_models: self.available_models,
+            requested_models: self.requested_models,
             version: self.version,
             model_demand: self.model_demand,
             mesh_id: self.mesh_id,
@@ -166,13 +166,13 @@ impl From<&PeerAnnouncement> for PeerAnnouncementV0 {
         Self {
             addr: ann.addr.clone(),
             role: ann.role.clone(),
-            models: ann.configured_models.clone(),
+            models: ann.models.clone(),
             vram_bytes: ann.vram_bytes,
             model_source: ann.model_source.clone(),
             serving: ann.serving_models.first().cloned(),
             serving_models: ann.serving_models.clone(),
-            available_models: ann.catalog_models.clone(),
-            requested_models: ann.desired_models.clone(),
+            available_models: ann.available_models.clone(),
+            requested_models: ann.requested_models.clone(),
             version: ann.version.clone(),
             model_demand: ann.model_demand.clone(),
             mesh_id: ann.mesh_id.clone(),
@@ -223,9 +223,9 @@ fn apply_transitive_ann(
     if ann.gpu_bandwidth_gbps.is_some() {
         existing.gpu_bandwidth_gbps = ann.gpu_bandwidth_gbps.clone();
     }
-    existing.configured_models = ann.configured_models.clone();
-    existing.catalog_models = ann.catalog_models.clone();
-    existing.desired_models = ann.desired_models.clone();
+    existing.models = ann.models.clone();
+    existing.available_models = ann.available_models.clone();
+    existing.requested_models = ann.requested_models.clone();
     if ann.model_source.is_some() {
         existing.model_source = ann.model_source.clone();
     }
@@ -277,14 +277,13 @@ impl Default for NodeRole {
 pub(crate) struct PeerAnnouncement {
     pub(crate) addr: EndpointAddr,
     pub(crate) role: NodeRole,
-    /// Models explicitly configured for this node.
-    pub(crate) configured_models: Vec<String>,
+    pub(crate) models: Vec<String>,
     pub(crate) vram_bytes: u64,
     pub(crate) model_source: Option<String>,
     pub(crate) serving_models: Vec<String>,
     pub(crate) hosted_models: Option<Vec<String>>,
-    pub(crate) catalog_models: Vec<String>,
-    pub(crate) desired_models: Vec<String>,
+    pub(crate) available_models: Vec<String>,
+    pub(crate) requested_models: Vec<String>,
     pub(crate) version: Option<String>,
     pub(crate) model_demand: HashMap<String, ModelDemand>,
     pub(crate) mesh_id: Option<String>,
@@ -304,7 +303,7 @@ pub struct PeerInfo {
     pub addr: EndpointAddr,
     pub tunnel_port: Option<u16>,
     pub role: NodeRole,
-    pub configured_models: Vec<String>,
+    pub models: Vec<String>,
     pub vram_bytes: u64,
     pub rtt_ms: Option<u32>,
     pub model_source: Option<String>,
@@ -315,9 +314,9 @@ pub struct PeerInfo {
     /// True when this peer explicitly advertised `hosted_models`.
     pub hosted_models_known: bool,
     /// All GGUFs on disk
-    pub catalog_models: Vec<String>,
+    pub available_models: Vec<String>,
     /// Models this node has requested the mesh to serve
-    pub desired_models: Vec<String>,
+    pub requested_models: Vec<String>,
     /// Last time we directly communicated with this peer (gossip, heartbeat, tunnel).
     /// Peers not seen in PEER_STALE_SECS are pruned from gossip and eventually removed.
     pub last_seen: std::time::Instant,
@@ -342,15 +341,15 @@ impl PeerInfo {
             addr,
             tunnel_port: None,
             role: ann.role.clone(),
-            configured_models: ann.configured_models.clone(),
+            models: ann.models.clone(),
             vram_bytes: ann.vram_bytes,
             rtt_ms: None,
             model_source: ann.model_source.clone(),
             serving_models: ann.serving_models.clone(),
             hosted_models: ann.hosted_models.clone().unwrap_or_default(),
             hosted_models_known: ann.hosted_models.is_some(),
-            catalog_models: ann.catalog_models.clone(),
-            desired_models: ann.desired_models.clone(),
+            available_models: ann.available_models.clone(),
+            requested_models: ann.requested_models.clone(),
             last_seen: std::time::Instant::now(),
             version: ann.version.clone(),
             gpu_name: ann.gpu_name.clone(),
@@ -715,13 +714,13 @@ pub struct Node {
     public_addr: Option<std::net::SocketAddr>,
     state: Arc<Mutex<MeshState>>,
     role: Arc<Mutex<NodeRole>>,
-    configured_models: Arc<Mutex<Vec<String>>>,
+    models: Arc<Mutex<Vec<String>>>,
     model_source: Arc<Mutex<Option<String>>>,
     serving_models: Arc<Mutex<Vec<String>>>,
     hosted_models: Arc<Mutex<Vec<String>>>,
     llama_ready: Arc<Mutex<bool>>,
-    catalog_models: Arc<Mutex<Vec<String>>>,
-    desired_models: Arc<Mutex<Vec<String>>>,
+    available_models: Arc<Mutex<Vec<String>>>,
+    requested_models: Arc<Mutex<Vec<String>>>,
     /// Mesh-wide demand map — merged from gossip + local API requests.
     /// This is the single source of truth for "what does the mesh want?"
     model_demand: Arc<std::sync::Mutex<HashMap<String, ModelDemand>>>,
@@ -1038,13 +1037,13 @@ impl Node {
                 seen_plugin_message_order: VecDeque::new(),
             })),
             role: Arc::new(Mutex::new(role)),
-            configured_models: Arc::new(Mutex::new(Vec::new())),
+            models: Arc::new(Mutex::new(Vec::new())),
             model_source: Arc::new(Mutex::new(None)),
             serving_models: Arc::new(Mutex::new(Vec::new())),
             hosted_models: Arc::new(Mutex::new(Vec::new())),
             llama_ready: Arc::new(Mutex::new(false)),
-            catalog_models: Arc::new(Mutex::new(Vec::new())),
-            desired_models: Arc::new(Mutex::new(Vec::new())),
+            available_models: Arc::new(Mutex::new(Vec::new())),
+            requested_models: Arc::new(Mutex::new(Vec::new())),
             model_demand: Arc::new(std::sync::Mutex::new(HashMap::new())),
             mesh_id: Arc::new(Mutex::new(None)),
             accepting: Arc::new((
@@ -1122,13 +1121,13 @@ impl Node {
                 seen_plugin_message_order: VecDeque::new(),
             })),
             role: Arc::new(Mutex::new(role)),
-            configured_models: Arc::new(Mutex::new(Vec::new())),
+            models: Arc::new(Mutex::new(Vec::new())),
             model_source: Arc::new(Mutex::new(None)),
             serving_models: Arc::new(Mutex::new(Vec::new())),
             hosted_models: Arc::new(Mutex::new(Vec::new())),
             llama_ready: Arc::new(Mutex::new(false)),
-            catalog_models: Arc::new(Mutex::new(Vec::new())),
-            desired_models: Arc::new(Mutex::new(Vec::new())),
+            available_models: Arc::new(Mutex::new(Vec::new())),
+            requested_models: Arc::new(Mutex::new(Vec::new())),
             model_demand: Arc::new(std::sync::Mutex::new(HashMap::new())),
             mesh_id: Arc::new(Mutex::new(None)),
             accepting: Arc::new((
@@ -1256,12 +1255,12 @@ impl Node {
         *self.role.lock().await = role;
     }
 
-    pub async fn set_configured_models(&self, models: Vec<String>) {
-        *self.configured_models.lock().await = models;
+    pub async fn set_models(&self, models: Vec<String>) {
+        *self.models.lock().await = models;
     }
 
-    pub async fn configured_models(&self) -> Vec<String> {
-        self.configured_models.lock().await.clone()
+    pub async fn models(&self) -> Vec<String> {
+        self.models.lock().await.clone()
     }
 
     pub async fn set_model_source(&self, source: String) {
@@ -1482,12 +1481,12 @@ impl Node {
         .await;
     }
 
-    pub async fn set_catalog_models(&self, models: Vec<String>) {
-        *self.catalog_models.lock().await = models;
+    pub async fn set_available_models(&self, models: Vec<String>) {
+        *self.available_models.lock().await = models;
     }
 
-    pub async fn catalog_models(&self) -> Vec<String> {
-        self.catalog_models.lock().await.clone()
+    pub async fn available_models(&self) -> Vec<String> {
+        self.available_models.lock().await.clone()
     }
 
     /// Record a request for a model — updates the demand map.
@@ -1519,11 +1518,11 @@ impl Node {
     /// Call periodically to prevent unbounded map growth.
     pub async fn gc_demand(&self) {
         let now = now_secs();
-        let my_requested = self.desired_models.lock().await;
+        let my_requested = self.requested_models.lock().await;
         let peers = self.state.lock().await;
         let mut pinned: std::collections::HashSet<String> = my_requested.iter().cloned().collect();
         for p in peers.peers.values() {
-            for m in &p.desired_models {
+            for m in &p.requested_models {
                 pinned.insert(m.clone());
             }
         }
@@ -1541,11 +1540,11 @@ impl Node {
         let demand = self.model_demand.lock().unwrap().clone();
 
         // Check which models are pinned (declared via --model by self or a live peer)
-        let my_requested = self.desired_models.lock().await;
+        let my_requested = self.requested_models.lock().await;
         let peers = self.state.lock().await;
         let mut pinned: std::collections::HashSet<String> = my_requested.iter().cloned().collect();
         for p in peers.peers.values() {
-            for m in &p.desired_models {
+            for m in &p.requested_models {
                 pinned.insert(m.clone());
             }
         }
@@ -1558,7 +1557,7 @@ impl Node {
             .collect()
     }
 
-    pub async fn set_desired_models(&self, models: Vec<String>) {
+    pub async fn set_requested_models(&self, models: Vec<String>) {
         // Seed demand entries for --model declarations
         {
             let mut demand = self.model_demand.lock().unwrap();
@@ -1568,11 +1567,11 @@ impl Node {
                 entry.last_active = entry.last_active.max(now);
             }
         }
-        *self.desired_models.lock().await = models;
+        *self.requested_models.lock().await = models;
     }
 
-    pub async fn desired_models(&self) -> Vec<String> {
-        self.desired_models.lock().await.clone()
+    pub async fn requested_models(&self) -> Vec<String> {
+        self.requested_models.lock().await.clone()
     }
 
     /// Start a background task that periodically checks peer health.
@@ -2338,8 +2337,8 @@ impl Node {
     /// Returns deduplicated list of model names (file stems, no .gguf).
     pub async fn mesh_catalog(&self) -> Vec<String> {
         // Snapshot each lock independently to avoid holding multiple locks.
-        let my_available = self.catalog_models.lock().await.clone();
-        let my_requested = self.desired_models.lock().await.clone();
+        let my_available = self.available_models.lock().await.clone();
+        let my_requested = self.requested_models.lock().await.clone();
         let my_serving = self.serving_models.lock().await.clone();
         let peer_data: Vec<_> = {
             let state = self.state.lock().await;
@@ -2348,8 +2347,8 @@ impl Node {
                 .values()
                 .map(|p| {
                     (
-                        p.catalog_models.clone(),
-                        p.desired_models.clone(),
+                        p.available_models.clone(),
+                        p.requested_models.clone(),
                         p.serving_models.clone(),
                     )
                 })
@@ -3464,7 +3463,7 @@ impl Node {
             if !addr.addrs.is_empty() {
                 existing.addr = addr;
             }
-            existing.configured_models = ann.configured_models.clone();
+            existing.models = ann.models.clone();
             existing.vram_bytes = ann.vram_bytes;
             if ann.model_source.is_some() {
                 existing.model_source = ann.model_source.clone();
@@ -3472,8 +3471,8 @@ impl Node {
             existing.serving_models = ann.serving_models.clone();
             existing.hosted_models = ann_hosted_models;
             existing.hosted_models_known = ann.hosted_models.is_some();
-            existing.catalog_models = ann.catalog_models.clone();
-            existing.desired_models = ann.desired_models.clone();
+            existing.available_models = ann.available_models.clone();
+            existing.requested_models = ann.requested_models.clone();
             existing.last_seen = std::time::Instant::now();
             if ann.version.is_some() {
                 existing.version = ann.version.clone();
@@ -3530,7 +3529,7 @@ impl Node {
             ann.role,
             ann.vram_bytes as f64 / 1e9,
             ann.serving_models.first(),
-            ann.catalog_models,
+            ann.available_models,
             state.peers.len() + 1
         );
         let peer = PeerInfo::from_announcement(id, addr, ann);
@@ -3610,12 +3609,12 @@ impl Node {
     async fn collect_announcements(&self) -> Vec<PeerAnnouncement> {
         // Snapshot all locks independently — never hold multiple locks simultaneously.
         let my_role = self.role.lock().await.clone();
-        let my_models = self.configured_models.lock().await.clone();
+        let my_models = self.models.lock().await.clone();
         let my_source = self.model_source.lock().await.clone();
         let my_serving_models = self.serving_models.lock().await.clone();
         let my_hosted_models = self.hosted_models.lock().await.clone();
-        let my_available = self.catalog_models.lock().await.clone();
-        let my_requested = self.desired_models.lock().await.clone();
+        let my_available = self.available_models.lock().await.clone();
+        let my_requested = self.requested_models.lock().await.clone();
         let my_mesh_id = self.mesh_id.lock().await.clone();
         let my_demand = self.get_demand();
         let stale_cutoff =
@@ -3631,13 +3630,13 @@ impl Node {
                 .map(|p| PeerAnnouncement {
                     addr: p.addr.clone(),
                     role: p.role.clone(),
-                    configured_models: p.configured_models.clone(),
+                    models: p.models.clone(),
                     vram_bytes: p.vram_bytes,
                     model_source: p.model_source.clone(),
                     serving_models: p.serving_models.clone(),
                     hosted_models: p.hosted_models_known.then(|| p.hosted_models.clone()),
-                    catalog_models: p.catalog_models.clone(),
-                    desired_models: p.desired_models.clone(),
+                    available_models: p.available_models.clone(),
+                    requested_models: p.requested_models.clone(),
                     version: p.version.clone(),
                     model_demand: HashMap::new(),
                     mesh_id: None,
@@ -3655,13 +3654,13 @@ impl Node {
         announcements.push(PeerAnnouncement {
             addr: self.endpoint.addr(),
             role: my_role,
-            configured_models: my_models,
+            models: my_models,
             vram_bytes: self.vram_bytes,
             model_source: my_source,
             serving_models: my_serving_models,
             hosted_models: Some(my_hosted_models),
-            catalog_models: my_available,
-            desired_models: my_requested,
+            available_models: my_available,
+            requested_models: my_requested,
             version: Some(crate::VERSION.to_string()),
             model_demand: my_demand,
             mesh_id: my_mesh_id,
@@ -3732,13 +3731,13 @@ mod tests {
                 seen_plugin_message_order: VecDeque::new(),
             })),
             role: Arc::new(Mutex::new(role)),
-            configured_models: Arc::new(Mutex::new(Vec::new())),
+            models: Arc::new(Mutex::new(Vec::new())),
             model_source: Arc::new(Mutex::new(None)),
             serving_models: Arc::new(Mutex::new(Vec::new())),
             hosted_models: Arc::new(Mutex::new(Vec::new())),
             llama_ready: Arc::new(Mutex::new(false)),
-            catalog_models: Arc::new(Mutex::new(Vec::new())),
-            desired_models: Arc::new(Mutex::new(Vec::new())),
+            available_models: Arc::new(Mutex::new(Vec::new())),
+            requested_models: Arc::new(Mutex::new(Vec::new())),
             model_demand: Arc::new(std::sync::Mutex::new(HashMap::new())),
             mesh_id: Arc::new(Mutex::new(None)),
             accepting: Arc::new((
@@ -4514,15 +4513,15 @@ mod tests {
             },
             tunnel_port: None,
             role: super::NodeRole::Worker,
-            configured_models: vec![],
+            models: vec![],
             vram_bytes: 0,
             rtt_ms: None,
             model_source: None,
             serving_models: vec![],
             hosted_models: vec![],
             hosted_models_known: false,
-            catalog_models: vec![],
-            desired_models: vec![],
+            available_models: vec![],
+            requested_models: vec![],
             last_seen: std::time::Instant::now(),
             version: None,
             gpu_name: None,
@@ -4816,13 +4815,13 @@ mod tests {
                 addrs: Default::default(),
             },
             role: super::NodeRole::Host { http_port: 8080 },
-            configured_models: vec!["Qwen3-8B-Q4_K_M".to_string()],
+            models: vec!["Qwen3-8B-Q4_K_M".to_string()],
             vram_bytes: 128 * 1024 * 1024 * 1024,
             model_source: Some("bartowski/Qwen3-8B-GGUF".to_string()),
             serving_models: vec!["Qwen3-8B-Q4_K_M".to_string()],
             hosted_models: Some(vec!["Qwen3-8B-Q4_K_M".to_string()]),
-            catalog_models: vec!["Qwen3-8B-Q4_K_M".to_string()],
-            desired_models: vec![],
+            available_models: vec!["Qwen3-8B-Q4_K_M".to_string()],
+            requested_models: vec![],
             version: Some("0.42.0".to_string()),
             model_demand: HashMap::new(),
             mesh_id: Some("deadbeef12345678".to_string()),
@@ -4997,9 +4996,9 @@ mod tests {
 
         let peer_id = EndpointId::from(SecretKey::from_bytes(&[0x10; 32]).public());
         let mut existing = make_test_peer_info(peer_id);
-        existing.catalog_models = vec!["OldModel-Q4_K_M".to_string()];
-        existing.configured_models = vec!["OldModel-Q4_K_M".to_string()];
-        existing.desired_models = vec!["OldModel-Q4_K_M".to_string()];
+        existing.available_models = vec!["OldModel-Q4_K_M".to_string()];
+        existing.models = vec!["OldModel-Q4_K_M".to_string()];
+        existing.requested_models = vec!["OldModel-Q4_K_M".to_string()];
 
         let meta = CompactModelMetadata {
             model_key: "NewModel-Q4_K_M".to_string(),
@@ -5032,13 +5031,13 @@ mod tests {
         let ann = super::PeerAnnouncement {
             addr: addr.clone(),
             role: super::NodeRole::Worker,
-            configured_models: vec!["NewModel-Q4_K_M".to_string()],
+            models: vec!["NewModel-Q4_K_M".to_string()],
             vram_bytes: 8 * 1024 * 1024 * 1024,
             model_source: Some("new-source".to_string()),
             serving_models: vec!["NewModel-Q4_K_M".to_string()],
             hosted_models: Some(vec!["NewModel-Q4_K_M".to_string()]),
-            catalog_models: vec!["NewModel-Q4_K_M".to_string()],
-            desired_models: vec!["NewModel-Q4_K_M".to_string()],
+            available_models: vec!["NewModel-Q4_K_M".to_string()],
+            requested_models: vec!["NewModel-Q4_K_M".to_string()],
             version: None,
             model_demand: HashMap::new(),
             mesh_id: None,
@@ -5055,17 +5054,17 @@ mod tests {
         apply_transitive_ann(&mut existing, &addr, &ann);
 
         assert_eq!(
-            existing.catalog_models,
+            existing.available_models,
             vec!["NewModel-Q4_K_M".to_string()],
             "available_models must be refreshed from transitive gossip"
         );
         assert_eq!(
-            existing.configured_models,
+            existing.models,
             vec!["NewModel-Q4_K_M".to_string()],
             "models must be refreshed from transitive gossip"
         );
         assert_eq!(
-            existing.desired_models,
+            existing.requested_models,
             vec!["NewModel-Q4_K_M".to_string()],
             "requested_models must be refreshed from transitive gossip"
         );
@@ -5110,13 +5109,13 @@ mod tests {
         let ann = super::PeerAnnouncement {
             addr: weak_addr.clone(),
             role: super::NodeRole::Worker,
-            configured_models: vec!["SomeModel-Q4_K_M".to_string()],
+            models: vec!["SomeModel-Q4_K_M".to_string()],
             vram_bytes: 4 * 1024 * 1024 * 1024,
             model_source: None,
             serving_models: vec![],
             hosted_models: None,
-            catalog_models: vec!["SomeModel-Q4_K_M".to_string()],
-            desired_models: vec![],
+            available_models: vec!["SomeModel-Q4_K_M".to_string()],
+            requested_models: vec![],
             version: None,
             model_demand: HashMap::new(),
             mesh_id: None,
@@ -5138,7 +5137,7 @@ mod tests {
             "rich direct address (3 paths) must not be overwritten by weaker transitive addr (1 path)"
         );
         assert_eq!(
-            existing.catalog_models,
+            existing.available_models,
             vec!["SomeModel-Q4_K_M".to_string()],
             "available_models must still be updated even when addr is preserved"
         );
@@ -5155,13 +5154,13 @@ mod tests {
         let ann2 = super::PeerAnnouncement {
             addr: richer_addr.clone(),
             role: super::NodeRole::Worker,
-            configured_models: vec!["SomeModel-Q4_K_M".to_string()],
+            models: vec!["SomeModel-Q4_K_M".to_string()],
             vram_bytes: 4 * 1024 * 1024 * 1024,
             model_source: None,
             serving_models: vec![],
             hosted_models: None,
-            catalog_models: vec!["SomeModel-Q4_K_M".to_string()],
-            desired_models: vec![],
+            available_models: vec!["SomeModel-Q4_K_M".to_string()],
+            requested_models: vec![],
             version: None,
             model_demand: HashMap::new(),
             mesh_id: None,

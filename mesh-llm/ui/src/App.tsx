@@ -89,7 +89,7 @@ type MeshModel = {
 type Peer = {
   id: string;
   role: string;
-  configured_models: string[];
+  models: string[];
   available_models?: string[];
   requested_models?: string[];
   vram_gb: number;
