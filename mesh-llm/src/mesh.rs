@@ -29,6 +29,11 @@ pub struct ModelDemand {
 /// How long a demand entry stays relevant without being refreshed.
 pub const DEMAND_TTL_SECS: u64 = 86400; // 24 hours
 
+/// Maximum RTT (ms) for a peer to be included in split mode.
+/// Peers above this threshold are skipped during election.
+/// Used by both the election RTT gate and the RTT-improvement re-election trigger.
+pub const MAX_SPLIT_RTT_MS: u32 = 80;
+
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1252,8 +1257,8 @@ impl Node {
             // If RTT dropped from above the split threshold (80ms) to below it
             // (e.g. relay → direct), trigger a re-election so the peer can now
             // be included in split mode.
-            let was_above = old_rtt.map_or(false, |r| r > 80);
-            if was_above && rtt_ms <= 80 {
+            let was_above = old_rtt.map_or(false, |r| r > MAX_SPLIT_RTT_MS);
+            if was_above && rtt_ms <= MAX_SPLIT_RTT_MS {
                 eprintln!(
                     "📡 Peer {} RTT improved ({}ms → {}ms) — re-electing for split",
                     id.fmt_short(),
@@ -6424,14 +6429,16 @@ pub(crate) mod tests {
         // Update RTT to still-high value — should NOT trigger
         node.update_peer_rtt(peer_id, 500).await;
         assert!(
-            !rx.has_changed().unwrap_or(false),
+            !rx.has_changed()
+                .expect("peer_change_rx closed unexpectedly"),
             "RTT 2600→500 (both above threshold) should not trigger re-election"
         );
 
         // Update RTT to below threshold — SHOULD trigger
         node.update_peer_rtt(peer_id, 15).await;
         assert!(
-            rx.has_changed().unwrap_or(false),
+            rx.has_changed()
+                .expect("peer_change_rx closed unexpectedly"),
             "RTT 500→15 (crossing threshold) must trigger re-election"
         );
 
@@ -6457,7 +6464,8 @@ pub(crate) mod tests {
         // Update RTT to another low value — should NOT trigger
         node.update_peer_rtt(peer_id, 15).await;
         assert!(
-            !rx.has_changed().unwrap_or(false),
+            !rx.has_changed()
+                .expect("peer_change_rx closed unexpectedly"),
             "RTT 20→15 (both below threshold) should not trigger re-election"
         );
 
@@ -6476,7 +6484,8 @@ pub(crate) mod tests {
         // Update RTT for a peer that doesn't exist — should not panic or trigger
         node.update_peer_rtt(peer_id, 15).await;
         assert!(
-            !rx.has_changed().unwrap_or(false),
+            !rx.has_changed()
+                .expect("peer_change_rx closed unexpectedly"),
             "RTT update for unknown peer should not trigger re-election"
         );
 

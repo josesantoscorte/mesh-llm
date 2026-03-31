@@ -956,8 +956,6 @@ async fn start_llama(
     // Decide whether to split: only if model doesn't fit on host alone, or --split forced
     let need_split = force_split || my_vram < min_vram;
 
-    const MAX_RTT_MS: u32 = 80;
-
     // Only use workers from our model group, preferring lowest-latency peers.
     // Take just enough to cover the VRAM shortfall, sorted by RTT.
     let worker_ids: Vec<_> = if need_split {
@@ -968,12 +966,12 @@ async fn start_llama(
             })
             .filter(|p| !matches!(p.role, NodeRole::Client))
             .filter(|p| match p.rtt_ms {
-                Some(rtt) if rtt > MAX_RTT_MS => {
+                Some(rtt) if rtt > mesh::MAX_SPLIT_RTT_MS => {
                     eprintln!(
                         "  ⚠ Skipping {} — RTT {}ms exceeds {}ms limit",
                         p.id.fmt_short(),
                         rtt,
-                        MAX_RTT_MS
+                        mesh::MAX_SPLIT_RTT_MS
                     );
                     false
                 }
