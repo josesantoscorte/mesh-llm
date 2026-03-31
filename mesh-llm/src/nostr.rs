@@ -1585,17 +1585,20 @@ mod rotate_key_tests {
     // rotate_keys uses hardcoded paths (~/.mesh-llm/), so we test the logic
     // by verifying files are created/deleted in the real location.
     // This is safe because rotate_keys only deletes key and nostr.nsec.
+    //
+    // Both scenarios (keys present + keys missing) run in a single test to
+    // avoid a race — Rust runs tests in parallel and both would touch the
+    // same files.
 
     #[test]
-    fn rotate_creates_clean_state() {
-        // Ensure the directory exists
+    fn rotate_deletes_both_keys_and_handles_missing() {
         let dir = dirs::home_dir().unwrap().join(".mesh-llm");
         fs::create_dir_all(&dir).ok();
 
         let key_path = dir.join("key");
         let nsec_path = dir.join("nostr.nsec");
 
-        // Save originals
+        // Save originals so we can restore after the test.
         let orig_key = if key_path.exists() {
             Some(fs::read(&key_path).unwrap())
         } else {
@@ -1607,48 +1610,21 @@ mod rotate_key_tests {
             None
         };
 
-        // Write test keys
+        // --- Scenario 1: both keys exist → rotate deletes them ---
         fs::write(&key_path, b"test-node-key").unwrap();
         fs::write(&nsec_path, b"test-nostr-nsec").unwrap();
 
         let result = rotate_keys();
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "rotate should succeed when keys exist");
         assert!(!key_path.exists(), "node key should be deleted");
         assert!(!nsec_path.exists(), "nostr key should be deleted");
 
-        // Restore originals
-        if let Some(k) = orig_key {
-            fs::write(&key_path, k).ok();
-        }
-        if let Some(n) = orig_nsec {
-            fs::write(&nsec_path, n).ok();
-        }
-    }
-
-    #[test]
-    fn rotate_ok_when_no_keys() {
-        let dir = dirs::home_dir().unwrap().join(".mesh-llm");
-        let key_path = dir.join("key");
-        let nsec_path = dir.join("nostr.nsec");
-
-        // Save and remove
-        let orig_key = if key_path.exists() {
-            Some(fs::read(&key_path).unwrap())
-        } else {
-            None
-        };
-        let orig_nsec = if nsec_path.exists() {
-            Some(fs::read(&nsec_path).unwrap())
-        } else {
-            None
-        };
-        fs::remove_file(&key_path).ok();
-        fs::remove_file(&nsec_path).ok();
-
+        // --- Scenario 2: no keys on disk → rotate still succeeds ---
+        // (files were just deleted above, so the directory is clean)
         let result = rotate_keys();
         assert!(result.is_ok(), "rotate should succeed even with no keys");
 
-        // Restore
+        // Restore originals.
         if let Some(k) = orig_key {
             fs::write(&key_path, k).ok();
         }
