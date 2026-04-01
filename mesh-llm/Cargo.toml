@@ -1,11 +1,11 @@
 [package]
 name = "mesh-llm"
-version = "0.53.1"
+version = "0.54.0"
 edition = "2021"
 
 [dependencies]
 mesh-llm-plugin = { path = "plugin" }
-iroh = "0.96"
+iroh = "0.97"
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
@@ -26,11 +26,13 @@ httparse = "1"
 tokio-stream = "0.1"
 libc = "0.2.183"
 regex-lite = "0.1"
+sha2 = "0.10"
 rmcp = { version = "1.2", features = ["server", "transport-io"] }
 schemars = "1"
 prost = "0.14"
 toml = "0.9"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+hf-hub = { version = "0.5.0", default-features = false, features = ["ureq", "rustls-tls"] }
 
 [dev-dependencies]
 serial_test = "3"

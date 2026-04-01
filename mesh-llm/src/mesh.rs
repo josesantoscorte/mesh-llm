@@ -30,6 +30,11 @@ pub struct ModelDemand {
 /// How long a demand entry stays relevant without being refreshed.
 pub const DEMAND_TTL_SECS: u64 = 86400; // 24 hours
 
+/// Maximum RTT (ms) for a peer to be included in split mode.
+/// Peers above this threshold are skipped during election.
+/// Used by both the election RTT gate and the RTT-improvement re-election trigger.
+pub const MAX_SPLIT_RTT_MS: u32 = 80;
+
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -282,6 +287,7 @@ pub(crate) struct PeerAnnouncement {
     pub(crate) model_source: Option<String>,
     pub(crate) serving_models: Vec<String>,
     pub(crate) hosted_models: Option<Vec<String>>,
+    /// All GGUF filenames on disk in managed or legacy local storage (for mesh catalog)
     pub(crate) available_models: Vec<String>,
     pub(crate) requested_models: Vec<String>,
     pub(crate) version: Option<String>,
@@ -388,52 +394,10 @@ impl PeerInfo {
 /// and excluded from gossip propagation. After 2x this duration they're removed entirely.
 const PEER_STALE_SECS: u64 = 180; // 3 minutes
 
-/// Directories to scan for GGUF models.
-pub fn model_dirs() -> Vec<std::path::PathBuf> {
-    let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
-    let mut dirs = vec![home.join(".models")];
-    // Also scan goose's model directory (~/Library/Application Support/Block.goose/models/)
-    if let Some(data_dir) = dirs::data_dir() {
-        let goose_dir = data_dir.join("Block.goose").join("models");
-        if goose_dir.exists() {
-            dirs.push(goose_dir);
-        }
-    }
-    dirs
-}
-
-/// Scan model directories for GGUF files and return their stem names.
-pub fn scan_local_models() -> Vec<String> {
-    let mut names = Vec::new();
-    for models_dir in model_dirs() {
-        if let Ok(entries) = std::fs::read_dir(&models_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) == Some("gguf") {
-                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                        // Skip draft models (tiny) and partial downloads
-                        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                        if size > 500_000_000 {
-                            // > 500MB, skip draft models
-                            // For split GGUFs (name-00001-of-00006.gguf), use base name
-                            let name = split_gguf_base_name(stem).unwrap_or(stem).to_string();
-                            if !names.contains(&name) {
-                                names.push(name);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    names.sort();
-    names
-}
-
 /// Scan model directories for GGUF files and return a map of stem name to file size in bytes.
 pub fn scan_local_model_sizes() -> HashMap<String, u64> {
     let mut sizes: HashMap<String, u64> = HashMap::new();
-    for models_dir in model_dirs() {
+    for models_dir in crate::models::model_dirs() {
         if let Ok(entries) = std::fs::read_dir(&models_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -479,7 +443,7 @@ fn derive_quantization_type(stem: &str) -> String {
 
 pub fn scan_all_model_metadata() -> Vec<crate::proto::node::CompactModelMetadata> {
     let mut result = Vec::new();
-    for models_dir in model_dirs() {
+    for models_dir in crate::models::model_dirs() {
         let Ok(entries) = std::fs::read_dir(&models_dir) else {
             continue;
         };
@@ -553,36 +517,6 @@ fn split_gguf_base_name(stem: &str) -> Option<&str> {
         return None;
     }
     Some(&stem[..dash])
-}
-
-/// Find a GGUF model file by stem name, searching all model directories.
-/// Returns the first match found (prefers ~/.models/ over goose dir).
-/// For split GGUFs, finds the first part (name-00001-of-NNNNN.gguf).
-pub fn find_model_path(stem: &str) -> std::path::PathBuf {
-    let filename = format!("{}.gguf", stem);
-    for dir in model_dirs() {
-        // Try single-file first
-        let candidate = dir.join(&filename);
-        if candidate.exists() {
-            return candidate;
-        }
-        // Try split GGUF: stem-00001-of-*.gguf
-        let split_prefix = format!("{}-00001-of-", stem);
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                if let Some(name) = entry.file_name().to_str() {
-                    if name.starts_with(&split_prefix) && name.ends_with(".gguf") {
-                        return entry.path();
-                    }
-                }
-            }
-        }
-    }
-    // Fallback: return ~/.models/ path even if it doesn't exist
-    dirs::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".models")
-        .join(&filename)
 }
 
 /// Detect available VRAM. On Apple Silicon, uses ~75% of system RAM
@@ -934,7 +868,7 @@ impl Node {
         let transport_config = QuicTransportConfig::builder()
             .max_concurrent_bidi_streams(1024u32.into())
             .build();
-        let mut builder = Endpoint::builder()
+        let mut builder = Endpoint::empty_builder()
             .secret_key(secret_key)
             .alpns(vec![ALPN_V1.to_vec(), ALPN_V0.to_vec()])
             .transport_config(transport_config);
@@ -1091,7 +1025,7 @@ impl Node {
         let transport_config = QuicTransportConfig::builder()
             .max_concurrent_bidi_streams(1024u32.into())
             .build();
-        let endpoint = Endpoint::builder()
+        let endpoint = Endpoint::empty_builder()
             .secret_key(SecretKey::generate(&mut rand::rng()))
             .alpns(vec![ALPN.to_vec()])
             .relay_mode(iroh::endpoint::RelayMode::Disabled)
@@ -1384,17 +1318,41 @@ impl Node {
     }
 
     async fn update_peer_rtt(&self, id: EndpointId, rtt_ms: u32) {
-        let updated_peer = {
+        let (updated_peer, old_rtt) = {
             let mut state = self.state.lock().await;
             if let Some(peer) = state.peers.get_mut(&id) {
+                let prev = peer.rtt_ms;
+                // Only accept equal-or-lower RTT. Gossip round-trip timing
+                // can inflate the value when routed via relay, overwriting a
+                // good direct-path measurement. The RTT gate only cares about
+                // "fast enough for split", so keeping the best-seen value is
+                // correct — if the path truly degrades the peer will be
+                // unreachable and removed via the normal liveness path.
+                if prev.is_some_and(|p| rtt_ms > p) {
+                    return;
+                }
                 peer.rtt_ms = Some(rtt_ms);
-                Some(peer.clone())
+                (Some(peer.clone()), prev)
             } else {
-                None
+                (None, None)
             }
         };
         if let Some(peer) = updated_peer {
             tracing::info!("Peer {} RTT: {}ms", id.fmt_short(), rtt_ms);
+            // If RTT dropped from above the split threshold (80ms) to below it
+            // (e.g. relay → direct), trigger a re-election so the peer can now
+            // be included in split mode.
+            let was_above = old_rtt.map_or(false, |r| r > MAX_SPLIT_RTT_MS);
+            if was_above && rtt_ms <= MAX_SPLIT_RTT_MS {
+                eprintln!(
+                    "📡 Peer {} RTT improved ({}ms → {}ms) — re-electing for split",
+                    id.fmt_short(),
+                    old_rtt.unwrap_or(0),
+                    rtt_ms
+                );
+                let count = self.state.lock().await.peers.len();
+                let _ = self.peer_change_tx.send(count);
+            }
             self.emit_plugin_mesh_event(
                 crate::plugin::proto::mesh_event::Kind::PeerUpdated,
                 Some(&peer),
@@ -3212,7 +3170,46 @@ impl Node {
         });
 
         // Gossip exchange to learn peer's role/VRAM and announce ourselves
-        self.initiate_gossip(conn, peer_id).await?;
+        self.initiate_gossip(conn.clone(), peer_id).await?;
+
+        // Schedule a delayed RTT recheck: the first gossip often goes via relay
+        // (high RTT) because direct holepunch hasn't completed yet. After a few
+        // seconds the direct path is usually ready, so re-check path info to get
+        // the real RTT and potentially trigger a re-election for split mode.
+        let node_for_recheck = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            let conn = node_for_recheck
+                .state
+                .lock()
+                .await
+                .connections
+                .get(&peer_id)
+                .cloned();
+            if let Some(conn) = conn {
+                let mut paths = conn.paths();
+                let path_list = iroh::Watcher::get(&mut paths);
+                for path_info in path_list {
+                    if path_info.is_selected() {
+                        let rtt_ms = match path_info.rtt() {
+                            Some(rtt) => rtt.as_millis() as u32,
+                            None => continue,
+                        };
+                        let path_type = if path_info.is_ip() { "direct" } else { "relay" };
+                        if rtt_ms > 0 {
+                            eprintln!(
+                                "📡 Peer {} RTT recheck: {}ms ({})",
+                                peer_id.fmt_short(),
+                                rtt_ms,
+                                path_type
+                            );
+                            node_for_recheck.update_peer_rtt(peer_id, rtt_ms).await;
+                        }
+                        break;
+                    }
+                }
+            }
+        });
         Ok(())
     }
 
@@ -3257,6 +3254,35 @@ impl Node {
                 self.update_peer_rtt(remote, rtt_ms).await;
             } else {
                 self.update_transitive_peer(peer_id, addr, ann).await;
+            }
+        }
+
+        // Also check the connection's actual path info — the gossip round-trip
+        // time above may reflect relay latency even if a direct path is now active.
+        {
+            let conn = self.state.lock().await.connections.get(&remote).cloned();
+            if let Some(conn) = conn {
+                let mut paths = conn.paths();
+                let path_list = iroh::Watcher::get(&mut paths);
+                for path_info in path_list {
+                    if path_info.is_selected() {
+                        let path_rtt_ms = match path_info.rtt() {
+                            Some(rtt) => rtt.as_millis() as u32,
+                            None => continue,
+                        };
+                        let path_type = if path_info.is_ip() { "direct" } else { "relay" };
+                        if path_rtt_ms > 0 && path_rtt_ms < rtt_ms {
+                            eprintln!(
+                                "📡 Peer {} RTT: {}ms ({}) [path info]",
+                                remote.fmt_short(),
+                                path_rtt_ms,
+                                path_type
+                            );
+                            self.update_peer_rtt(remote, path_rtt_ms).await;
+                        }
+                        break;
+                    }
+                }
             }
         }
 
@@ -3338,8 +3364,10 @@ impl Node {
                 let path_list = iroh::Watcher::get(&mut paths);
                 for path_info in path_list {
                     if path_info.is_selected() {
-                        let rtt = path_info.rtt();
-                        let rtt_ms = rtt.as_millis() as u32;
+                        let rtt_ms = match path_info.rtt() {
+                            Some(rtt) => rtt.as_millis() as u32,
+                            None => continue,
+                        };
                         let path_type = if path_info.is_ip() { "direct" } else { "relay" };
                         if rtt_ms > 0 {
                             eprintln!(
@@ -3706,7 +3734,7 @@ mod tests {
         let transport_config = QuicTransportConfig::builder()
             .max_concurrent_bidi_streams(128u32.into())
             .build();
-        let endpoint = Endpoint::builder()
+        let endpoint = Endpoint::empty_builder()
             .secret_key(SecretKey::generate(&mut rand::rng()))
             .alpns(vec![ALPN_V1.to_vec(), ALPN_V0.to_vec()])
             .transport_config(transport_config)
@@ -3928,21 +3956,6 @@ mod tests {
         let parsed: TestStruct = serde_json::from_str("{}").unwrap();
         assert!(parsed.model_demand.is_empty());
         assert!(parsed.requested_models.is_empty());
-    }
-
-    #[test]
-    fn test_split_gguf_base_name() {
-        assert_eq!(
-            split_gguf_base_name("GLM-5-UD-IQ2_XXS-00001-of-00006"),
-            Some("GLM-5-UD-IQ2_XXS")
-        );
-        assert_eq!(
-            split_gguf_base_name("GLM-5-UD-IQ2_XXS-00006-of-00006"),
-            Some("GLM-5-UD-IQ2_XXS")
-        );
-        assert_eq!(split_gguf_base_name("Qwen3-8B-Q4_K_M"), None);
-        assert_eq!(split_gguf_base_name("model-001-of-003"), None); // wrong digit count
-        assert_eq!(split_gguf_base_name("model-00001-of-00003"), Some("model"));
     }
 
     #[test]
@@ -4220,7 +4233,7 @@ mod tests {
             .await;
         post_node.start_accepting();
 
-        let legacy_endpoint = Endpoint::builder()
+        let legacy_endpoint = Endpoint::empty_builder()
             .secret_key(SecretKey::generate(&mut rand::rng()))
             .alpns(vec![ALPN_V0.to_vec()])
             .transport_config(
@@ -6134,6 +6147,793 @@ mod tests {
             "peer must remain admitted when reconnect gossip succeeds"
         );
     }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn v0_peer_tunnel_map_exchange_over_legacy_connection() -> Result<()> {
+        use iroh::endpoint::QuicTransportConfig;
+
+        let post_node = make_test_node(super::NodeRole::Host { http_port: 9337 }).await?;
+        post_node
+            .set_serving_models(vec!["post-model".to_string()])
+            .await;
+        post_node
+            .set_mesh_id("tunnel-map-mesh-001".to_string())
+            .await;
+        post_node.start_accepting();
+
+        let legacy_endpoint = Endpoint::empty_builder()
+            .secret_key(SecretKey::generate(&mut rand::rng()))
+            .alpns(vec![ALPN_V0.to_vec()])
+            .transport_config(
+                QuicTransportConfig::builder()
+                    .max_concurrent_bidi_streams(128u32.into())
+                    .build(),
+            )
+            .bind_addr(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))?
+            .bind()
+            .await?;
+        let legacy_id = legacy_endpoint.id();
+        let legacy_addr = legacy_endpoint.addr();
+        let target_id = EndpointId::from(SecretKey::from_bytes(&[0x42; 32]).public());
+        let admitted = std::sync::Arc::new(tokio::sync::Notify::new());
+        let admitted_signal = admitted.clone();
+        let done = std::sync::Arc::new(tokio::sync::Notify::new());
+        let done_signal = done.clone();
+        let legacy_ann = super::PeerAnnouncementV0 {
+            addr: EndpointAddr {
+                id: legacy_id,
+                addrs: Default::default(),
+            },
+            role: super::NodeRole::Host { http_port: 9444 },
+            models: vec!["legacy-model".to_string()],
+            vram_bytes: 16 * 1024 * 1024 * 1024,
+            model_source: None,
+            serving: Some("legacy-model".to_string()),
+            serving_models: vec!["legacy-model".to_string()],
+            available_models: vec![],
+            requested_models: vec![],
+            version: Some("0.50.0".to_string()),
+            model_demand: HashMap::new(),
+            mesh_id: Some("tunnel-map-mesh-001".to_string()),
+            gpu_name: None,
+            hostname: None,
+            is_soc: None,
+            gpu_vram: None,
+            gpu_bandwidth_gbps: None,
+            available_model_metadata: vec![],
+            experts_summary: None,
+            available_model_sizes: HashMap::new(),
+        };
+
+        let server = tokio::spawn(async move {
+            let incoming =
+                tokio::time::timeout(std::time::Duration::from_secs(5), legacy_endpoint.accept())
+                    .await
+                    .expect("legacy endpoint should receive incoming connection")
+                    .expect("accept should return an incoming connection");
+            let mut accepting = incoming.accept().expect("legacy accept should succeed");
+            let alpn = accepting.alpn().await.expect("ALPN should be available");
+            assert_eq!(
+                alpn, ALPN_V0,
+                "v1 node must negotiate ALPN_V0 with legacy endpoint"
+            );
+            let conn = accepting
+                .await
+                .expect("legacy connection handshake should complete");
+
+            let (mut send_gossip, mut recv_gossip) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), conn.accept_bi())
+                    .await
+                    .expect("v1 node should open gossip stream")
+                    .expect("gossip stream accept should succeed");
+            let mut stream_type = [0u8; 1];
+            recv_gossip
+                .read_exact(&mut stream_type)
+                .await
+                .expect("must read gossip stream type byte");
+            assert_eq!(
+                stream_type[0], STREAM_GOSSIP,
+                "first stream must be STREAM_GOSSIP"
+            );
+            let _post_gossip_buf = read_len_prefixed(&mut recv_gossip)
+                .await
+                .expect("must read v1 gossip payload");
+            let legacy_gossip_body =
+                serde_json::to_vec(&vec![legacy_ann]).expect("legacy announcement must serialize");
+            write_len_prefixed(&mut send_gossip, &legacy_gossip_body)
+                .await
+                .expect("legacy must reply with JSON gossip");
+            send_gossip
+                .finish()
+                .expect("gossip reply must finish cleanly");
+            let _ = recv_gossip.read_to_end(0).await;
+
+            // Wait until the main task confirms the v1 node has admitted this peer
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                admitted_signal.notified(),
+            )
+            .await
+            .expect("main task should signal admission within 5s");
+
+            let (mut send_tmap, _recv_tmap) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), conn.open_bi())
+                    .await
+                    .expect("should open tunnel map stream")
+                    .expect("tunnel map stream open should succeed");
+            send_tmap
+                .write_all(&[STREAM_TUNNEL_MAP])
+                .await
+                .expect("must write tunnel map type byte");
+            let tmap_json = serde_json::to_vec(&HashMap::from([(
+                hex::encode(target_id.as_bytes()),
+                8080u16,
+            )]))
+            .expect("tunnel map JSON must serialize");
+            write_len_prefixed(&mut send_tmap, &tmap_json)
+                .await
+                .expect("must write tunnel map JSON payload");
+            send_tmap
+                .finish()
+                .expect("tunnel map send stream must finish");
+
+            // Keep the endpoint alive until the main task has verified data ingestion.
+            // Dropping legacy_endpoint sends CONNECTION_CLOSE, which would kill the
+            // client's dispatch_streams loop before it processes the tunnel-map stream.
+            tokio::time::timeout(std::time::Duration::from_secs(10), done_signal.notified())
+                .await
+                .expect("main task should signal done within 10s");
+        });
+
+        let invite_token = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&legacy_addr).expect("legacy address must serialize"));
+        post_node.join(&invite_token).await?;
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let peers = post_node.peers().await;
+                if peers.iter().any(|p| p.id == legacy_id) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("post node should admit the legacy peer after JSON gossip exchange");
+
+        admitted.notify_one();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let maps = post_node.all_remote_tunnel_maps().await;
+                if let Some(inner) = maps.get(&legacy_id) {
+                    if inner.contains_key(&target_id) {
+                        break;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("v1 node should receive and ingest the v0 JSON tunnel map within 5 seconds");
+
+        let maps = post_node.all_remote_tunnel_maps().await;
+        let inner = maps
+            .get(&legacy_id)
+            .expect("tunnel map for legacy peer must be present after ingest");
+        assert_eq!(
+            inner.get(&target_id).copied(),
+            Some(8080),
+            "tunnel map must record target_id → port 8080"
+        );
+
+        done.notify_one();
+        server
+            .await
+            .expect("legacy server task should complete without panic");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn v0_peer_leaving_over_legacy_connection() -> Result<()> {
+        use iroh::endpoint::QuicTransportConfig;
+
+        let post_node = make_test_node(super::NodeRole::Host { http_port: 9337 }).await?;
+        post_node
+            .set_serving_models(vec!["post-model".to_string()])
+            .await;
+        post_node
+            .set_mesh_id("peer-leaving-mesh-001".to_string())
+            .await;
+        post_node.start_accepting();
+
+        let legacy_endpoint = Endpoint::empty_builder()
+            .secret_key(SecretKey::generate(&mut rand::rng()))
+            .alpns(vec![ALPN_V0.to_vec()])
+            .transport_config(
+                QuicTransportConfig::builder()
+                    .max_concurrent_bidi_streams(128u32.into())
+                    .build(),
+            )
+            .bind_addr(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))?
+            .bind()
+            .await?;
+        let legacy_id = legacy_endpoint.id();
+        let legacy_addr = legacy_endpoint.addr();
+        let legacy_id_bytes = legacy_id.as_bytes().to_vec();
+        let admitted = std::sync::Arc::new(tokio::sync::Notify::new());
+        let admitted_signal = admitted.clone();
+        let done = std::sync::Arc::new(tokio::sync::Notify::new());
+        let done_signal = done.clone();
+        let legacy_ann = super::PeerAnnouncementV0 {
+            addr: EndpointAddr {
+                id: legacy_id,
+                addrs: Default::default(),
+            },
+            role: super::NodeRole::Host { http_port: 9444 },
+            models: vec!["legacy-model".to_string()],
+            vram_bytes: 16 * 1024 * 1024 * 1024,
+            model_source: None,
+            serving: Some("legacy-model".to_string()),
+            serving_models: vec!["legacy-model".to_string()],
+            available_models: vec![],
+            requested_models: vec![],
+            version: Some("0.50.0".to_string()),
+            model_demand: HashMap::new(),
+            mesh_id: Some("peer-leaving-mesh-001".to_string()),
+            gpu_name: None,
+            hostname: None,
+            is_soc: None,
+            gpu_vram: None,
+            gpu_bandwidth_gbps: None,
+            available_model_metadata: vec![],
+            experts_summary: None,
+            available_model_sizes: HashMap::new(),
+        };
+
+        let server = tokio::spawn(async move {
+            let incoming =
+                tokio::time::timeout(std::time::Duration::from_secs(5), legacy_endpoint.accept())
+                    .await
+                    .expect("legacy endpoint should receive incoming connection")
+                    .expect("accept should return an incoming connection");
+            let mut accepting = incoming.accept().expect("legacy accept should succeed");
+            let alpn = accepting.alpn().await.expect("ALPN should be available");
+            assert_eq!(
+                alpn, ALPN_V0,
+                "v1 node must negotiate ALPN_V0 with legacy endpoint"
+            );
+            let conn = accepting
+                .await
+                .expect("legacy connection handshake should complete");
+
+            let (mut send_gossip, mut recv_gossip) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), conn.accept_bi())
+                    .await
+                    .expect("v1 node should open gossip stream")
+                    .expect("gossip stream accept should succeed");
+            let mut stream_type = [0u8; 1];
+            recv_gossip
+                .read_exact(&mut stream_type)
+                .await
+                .expect("must read gossip stream type byte");
+            assert_eq!(
+                stream_type[0], STREAM_GOSSIP,
+                "first stream must be STREAM_GOSSIP"
+            );
+            let _post_gossip_buf = read_len_prefixed(&mut recv_gossip)
+                .await
+                .expect("must read v1 gossip payload");
+            let legacy_gossip_body =
+                serde_json::to_vec(&vec![legacy_ann]).expect("legacy announcement must serialize");
+            write_len_prefixed(&mut send_gossip, &legacy_gossip_body)
+                .await
+                .expect("legacy must reply with JSON gossip");
+            send_gossip
+                .finish()
+                .expect("gossip reply must finish cleanly");
+            let _ = recv_gossip.read_to_end(0).await;
+
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                admitted_signal.notified(),
+            )
+            .await
+            .expect("main task should signal admission within 5s");
+
+            let (mut send_leaving, _recv_leaving) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), conn.open_bi())
+                    .await
+                    .expect("should open peer-leaving stream")
+                    .expect("peer-leaving stream open should succeed");
+            send_leaving
+                .write_all(&[STREAM_PEER_LEAVING])
+                .await
+                .expect("must write peer-leaving type byte");
+            send_leaving
+                .write_all(&legacy_id_bytes)
+                .await
+                .expect("must write raw 32-byte legacy peer ID");
+            send_leaving
+                .finish()
+                .expect("peer-leaving send stream must finish");
+
+            // Keep endpoint alive until main task confirms peer removal.
+            // Dropping legacy_endpoint sends CONNECTION_CLOSE prematurely.
+            tokio::time::timeout(std::time::Duration::from_secs(10), done_signal.notified())
+                .await
+                .expect("main task should signal done within 10s");
+        });
+
+        let invite_token = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&legacy_addr).expect("legacy address must serialize"));
+        post_node.join(&invite_token).await?;
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let peers = post_node.peers().await;
+                if peers.iter().any(|p| p.id == legacy_id) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("post node should admit the legacy peer after JSON gossip exchange");
+
+        admitted.notify_one();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let peers = post_node.peers().await;
+                if !peers.iter().any(|p| p.id == legacy_id) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect(
+            "v1 node should remove legacy peer after receiving v0 peer-leaving frame within 5s",
+        );
+
+        let peers = post_node.peers().await;
+        assert!(
+            !peers.iter().any(|p| p.id == legacy_id),
+            "legacy peer must be absent from the peer list after its clean-shutdown announcement"
+        );
+
+        done.notify_one();
+        server
+            .await
+            .expect("legacy server task should complete without panic");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mixed_protocol_three_node_mesh_state_consistency() -> Result<()> {
+        use iroh::endpoint::QuicTransportConfig;
+
+        let node_a = make_test_node(super::NodeRole::Host { http_port: 9337 }).await?;
+        node_a
+            .set_serving_models(vec!["node-a-model".to_string()])
+            .await;
+        node_a.set_mesh_id("three-node-mesh-001".to_string()).await;
+        node_a.start_accepting();
+        let node_a_id = node_a.id();
+        let node_a_addr = node_a.endpoint.addr();
+
+        let node_b = make_test_node(super::NodeRole::Host { http_port: 9338 }).await?;
+        node_b
+            .set_serving_models(vec!["node-b-model".to_string()])
+            .await;
+        node_b.set_mesh_id("three-node-mesh-001".to_string()).await;
+        let node_b_id = node_b.id();
+
+        let legacy_endpoint = Endpoint::empty_builder()
+            .secret_key(SecretKey::generate(&mut rand::rng()))
+            .alpns(vec![ALPN_V0.to_vec()])
+            .transport_config(
+                QuicTransportConfig::builder()
+                    .max_concurrent_bidi_streams(128u32.into())
+                    .build(),
+            )
+            .bind_addr(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))?
+            .bind()
+            .await?;
+        let legacy_id = legacy_endpoint.id();
+
+        let invite_token_a = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&node_a_addr).expect("node_a addr must serialize"));
+        node_b.join(&invite_token_a).await?;
+
+        let connecting = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            legacy_endpoint.connect_with_opts(node_a_addr, ALPN_V0, ConnectOptions::new()),
+        )
+        .await
+        .expect("v0 connect_with_opts should not timeout")
+        .expect("v0 connect_with_opts should succeed");
+        let v0_conn = tokio::time::timeout(std::time::Duration::from_secs(5), connecting)
+            .await
+            .expect("v0→node_a handshake should not timeout")
+            .expect("v0→node_a handshake should succeed");
+        assert_eq!(
+            v0_conn.alpn(),
+            ALPN_V0,
+            "v0 endpoint must negotiate ALPN_V0 with the v1 node"
+        );
+
+        let (mut send_g, mut recv_g) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), v0_conn.open_bi())
+                .await
+                .expect("v0 should open gossip stream")
+                .expect("v0 gossip stream open should succeed");
+        send_g
+            .write_all(&[STREAM_GOSSIP])
+            .await
+            .expect("v0 must write gossip type byte");
+        let v0_ann = super::PeerAnnouncementV0 {
+            addr: EndpointAddr {
+                id: legacy_id,
+                addrs: Default::default(),
+            },
+            role: super::NodeRole::Host { http_port: 9555 },
+            models: vec!["v0-model".to_string()],
+            vram_bytes: 8 * 1024 * 1024 * 1024,
+            model_source: None,
+            serving: Some("v0-model".to_string()),
+            serving_models: vec!["v0-model".to_string()],
+            available_models: vec![],
+            requested_models: vec![],
+            version: Some("0.50.0".to_string()),
+            model_demand: HashMap::new(),
+            mesh_id: Some("three-node-mesh-001".to_string()),
+            gpu_name: None,
+            hostname: None,
+            is_soc: None,
+            gpu_vram: None,
+            gpu_bandwidth_gbps: None,
+            available_model_metadata: vec![],
+            experts_summary: None,
+            available_model_sizes: HashMap::new(),
+        };
+        let v0_gossip_json =
+            serde_json::to_vec(&vec![v0_ann]).expect("v0 gossip JSON must serialize");
+        write_len_prefixed(&mut send_g, &v0_gossip_json)
+            .await
+            .expect("v0 must write gossip JSON payload");
+        send_g.finish().expect("v0 gossip send stream must finish");
+        let _node_a_gossip_resp = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            read_len_prefixed(&mut recv_g),
+        )
+        .await
+        .expect("node_a must respond to v0 gossip within 5 seconds")
+        .expect("v0 must read node_a gossip response");
+        let _ = recv_g.read_to_end(0).await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let peers = node_a.peers().await;
+                let has_b = peers.iter().any(|p| p.id == node_b_id);
+                let has_v0 = peers.iter().any(|p| p.id == legacy_id);
+                if has_b && has_v0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("node_a must see both node_b and v0 peer within 10 seconds");
+
+        let node_a_peers = node_a.peers().await;
+        assert!(
+            node_a_peers.iter().any(|p| {
+                p.id == node_b_id
+                    && p.serving_models.first().map(String::as_str) == Some("node-b-model")
+            }),
+            "node_a must see node_b with its correct serving model"
+        );
+        assert!(
+            node_a_peers.iter().any(|p| {
+                p.id == legacy_id
+                    && p.serving_models.first().map(String::as_str) == Some("v0-model")
+            }),
+            "node_a must see the v0 peer with its correct serving model"
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let peers = node_b.peers().await;
+                if peers.iter().any(|p| p.id == node_a_id) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("node_b must see node_a after joining");
+
+        assert!(
+            node_b.peers().await.iter().any(|p| {
+                p.id == node_a_id
+                    && p.serving_models.first().map(String::as_str) == Some("node-a-model")
+            }),
+            "node_b must see node_a with its correct serving model"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn protocol_negotiation_edge_cases() -> Result<()> {
+        use iroh::endpoint::QuicTransportConfig;
+
+        assert_eq!(
+            protocol_from_alpn(b""),
+            ControlProtocol::ProtoV1,
+            "empty ALPN must default to ProtoV1"
+        );
+        assert_eq!(
+            protocol_from_alpn(b"unknown"),
+            ControlProtocol::ProtoV1,
+            "unrecognised ALPN must default to ProtoV1"
+        );
+        assert_eq!(
+            protocol_from_alpn(b"mesh-llm"),
+            ControlProtocol::ProtoV1,
+            "partial ALPN prefix without version number must default to ProtoV1"
+        );
+
+        // Sub-test A: v1 node connecting to a v0-only endpoint negotiates ALPN_V0
+        let v0_endpoint = Endpoint::empty_builder()
+            .secret_key(SecretKey::generate(&mut rand::rng()))
+            .alpns(vec![ALPN_V0.to_vec()])
+            .transport_config(
+                QuicTransportConfig::builder()
+                    .max_concurrent_bidi_streams(128u32.into())
+                    .build(),
+            )
+            .bind_addr(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))?
+            .bind()
+            .await?;
+        let v0_addr = v0_endpoint.addr();
+        let v0_accept_task = tokio::spawn(async move {
+            let incoming =
+                tokio::time::timeout(std::time::Duration::from_secs(5), v0_endpoint.accept())
+                    .await
+                    .expect("v0 endpoint should receive an incoming connection")
+                    .expect("v0 accept should yield an incoming connection");
+            let mut accepting = incoming.accept().expect("v0 accept should succeed");
+            let _alpn = accepting.alpn().await.expect("ALPN should be available");
+            let conn = accepting
+                .await
+                .expect("v0 connection handshake should complete");
+            assert_eq!(
+                conn.alpn(),
+                ALPN_V0,
+                "v0 endpoint must see ALPN_V0 on the accepted connection"
+            );
+            assert_eq!(
+                connection_protocol(&conn),
+                ControlProtocol::JsonV0,
+                "v0 endpoint must identify the connection as JsonV0"
+            );
+        });
+
+        let post_node = make_test_node(super::NodeRole::Worker).await?;
+        let conn_a = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            connect_mesh(&post_node.endpoint, v0_addr),
+        )
+        .await
+        .expect("v1→v0 connect should not timeout")
+        .expect("v1 node should connect successfully to v0-only endpoint");
+        assert_eq!(
+            conn_a.alpn(),
+            ALPN_V0,
+            "v1 node connecting to a v0-only endpoint must negotiate ALPN_V0"
+        );
+        assert_eq!(
+            connection_protocol(&conn_a),
+            ControlProtocol::JsonV0,
+            "connection from v1 to v0-only endpoint must use JsonV0 protocol"
+        );
+
+        v0_accept_task
+            .await
+            .expect("v0 accept task should complete without panic");
+
+        let node_b = make_test_node(super::NodeRole::Worker).await?;
+        node_b.start_accepting();
+        let node_b_addr = node_b.endpoint.addr();
+
+        let v0_ep2 = Endpoint::empty_builder()
+            .secret_key(SecretKey::generate(&mut rand::rng()))
+            .alpns(vec![ALPN_V0.to_vec()])
+            .transport_config(
+                QuicTransportConfig::builder()
+                    .max_concurrent_bidi_streams(128u32.into())
+                    .build(),
+            )
+            .bind_addr(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))?
+            .bind()
+            .await?;
+        let connecting = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            v0_ep2.connect_with_opts(node_b_addr, ALPN_V0, ConnectOptions::new()),
+        )
+        .await
+        .expect("v0→v1 connect_with_opts should not timeout")
+        .expect("v0 endpoint should connect to v1 node");
+        let conn_b = tokio::time::timeout(std::time::Duration::from_secs(5), connecting)
+            .await
+            .expect("v0→v1 handshake should not timeout")
+            .expect("v0→v1 connection handshake should succeed");
+        assert_eq!(
+            conn_b.alpn(),
+            ALPN_V0,
+            "v0 endpoint connecting to a v1 node must negotiate ALPN_V0"
+        );
+        assert_eq!(
+            connection_protocol(&conn_b),
+            ControlProtocol::JsonV0,
+            "v0 endpoint connecting to a v1 node must use JsonV0 protocol"
+        );
+
+        Ok(())
+    }
+
+    fn make_test_peer(id: EndpointId, rtt_ms: Option<u32>, vram_gb: u64) -> PeerInfo {
+        PeerInfo {
+            id,
+            addr: EndpointAddr {
+                id,
+                addrs: Default::default(),
+            },
+            role: super::NodeRole::Worker,
+            models: vec![],
+            vram_bytes: vram_gb * 1024 * 1024 * 1024,
+            rtt_ms,
+            model_source: None,
+            serving_models: vec![],
+            hosted_models: vec![],
+            hosted_models_known: false,
+            available_models: vec![],
+            requested_models: vec![],
+            last_seen: std::time::Instant::now(),
+            version: None,
+            gpu_name: None,
+            hostname: None,
+            is_soc: None,
+            gpu_vram: None,
+            gpu_bandwidth_gbps: None,
+            available_model_metadata: vec![],
+            experts_summary: None,
+            tunnel_port: None,
+            available_model_sizes: HashMap::new(),
+        }
+    }
+
+    /// RTT re-election: when a peer's RTT drops from above the 80ms split
+    /// threshold to below it (e.g. relay → direct), update_peer_rtt must
+    /// trigger a peer_change event so the election loop re-runs and can
+    /// now include the peer in split mode.
+    #[tokio::test]
+    async fn test_rtt_drop_triggers_reelection() -> Result<()> {
+        let node = make_test_node(super::NodeRole::Worker).await?;
+        let peer_key = SecretKey::generate(&mut rand::rng());
+        let peer_id = EndpointId::from(peer_key.public());
+
+        // Add a fake peer with high relay RTT
+        {
+            let mut state = node.state.lock().await;
+            state
+                .peers
+                .insert(peer_id, make_test_peer(peer_id, Some(2600), 16));
+        }
+
+        let rx = node.peer_change_rx.clone();
+
+        // Update RTT to still-high value — should NOT trigger
+        node.update_peer_rtt(peer_id, 500).await;
+        assert!(
+            !rx.has_changed()
+                .expect("peer_change_rx closed unexpectedly"),
+            "RTT 2600→500 (both above threshold) should not trigger re-election"
+        );
+
+        // Update RTT to below threshold — SHOULD trigger
+        node.update_peer_rtt(peer_id, 15).await;
+        assert!(
+            rx.has_changed()
+                .expect("peer_change_rx closed unexpectedly"),
+            "RTT 500→15 (crossing threshold) must trigger re-election"
+        );
+
+        Ok(())
+    }
+
+    /// RTT re-election should NOT trigger when RTT was already below threshold.
+    #[tokio::test]
+    async fn test_rtt_below_threshold_no_reelection() -> Result<()> {
+        let node = make_test_node(super::NodeRole::Worker).await?;
+        let peer_key = SecretKey::generate(&mut rand::rng());
+        let peer_id = EndpointId::from(peer_key.public());
+
+        {
+            let mut state = node.state.lock().await;
+            state
+                .peers
+                .insert(peer_id, make_test_peer(peer_id, Some(20), 16));
+        }
+
+        let rx = node.peer_change_rx.clone();
+
+        // Update RTT to another low value — should NOT trigger
+        node.update_peer_rtt(peer_id, 15).await;
+        assert!(
+            !rx.has_changed()
+                .expect("peer_change_rx closed unexpectedly"),
+            "RTT 20→15 (both below threshold) should not trigger re-election"
+        );
+
+        Ok(())
+    }
+
+    /// RTT re-election should NOT trigger for unknown peers.
+    #[tokio::test]
+    async fn test_rtt_update_unknown_peer_no_panic() -> Result<()> {
+        let node = make_test_node(super::NodeRole::Worker).await?;
+        let peer_key = SecretKey::generate(&mut rand::rng());
+        let peer_id = EndpointId::from(peer_key.public());
+
+        let rx = node.peer_change_rx.clone();
+
+        // Update RTT for a peer that doesn't exist — should not panic or trigger
+        node.update_peer_rtt(peer_id, 15).await;
+        assert!(
+            !rx.has_changed()
+                .expect("peer_change_rx closed unexpectedly"),
+            "RTT update for unknown peer should not trigger re-election"
+        );
+
+        Ok(())
+    }
+
+    /// RTT should never increase — relay gossip RTT must not overwrite
+    /// a known-good direct path measurement.
+    #[tokio::test]
+    async fn test_rtt_cannot_regress() -> Result<()> {
+        let node = make_test_node(super::NodeRole::Worker).await?;
+        let peer_key = SecretKey::generate(&mut rand::rng());
+        let peer_id = EndpointId::from(peer_key.public());
+
+        {
+            let mut state = node.state.lock().await;
+            state
+                .peers
+                .insert(peer_id, make_test_peer(peer_id, Some(20), 16));
+        }
+
+        // Try to raise RTT — should be rejected
+        node.update_peer_rtt(peer_id, 2600).await;
+        {
+            let state = node.state.lock().await;
+            let rtt = state.peers.get(&peer_id).unwrap().rtt_ms;
+            assert_eq!(rtt, Some(20), "RTT must not increase from 20 to 2600");
+        }
+
+        // Lower RTT — should be accepted
+        node.update_peer_rtt(peer_id, 10).await;
+        {
+            let state = node.state.lock().await;
+            let rtt = state.peers.get(&peer_id).unwrap().rtt_ms;
+            assert_eq!(rtt, Some(10), "RTT must decrease from 20 to 10");
+        }
+
+        Ok(())
+    }
 }
 
 /// Generate a mesh ID for a new mesh.
@@ -6203,6 +7003,60 @@ pub fn load_last_mesh_id() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+// ---------------------------------------------------------------------------
+// Public-to-private identity transition
+// ---------------------------------------------------------------------------
+
+fn was_public_path() -> std::path::PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".mesh-llm")
+        .join("was-public")
+}
+
+/// Record that this node was started in public mode (--auto / --publish / --mesh-name).
+/// Called at startup so we can detect a public→private transition next time.
+pub fn mark_was_public() {
+    let path = was_public_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, "1");
+}
+
+/// Returns true if the previous run was public (marker file exists).
+pub fn was_previously_public() -> bool {
+    was_public_path().exists()
+}
+
+/// Clear identity files (key, nostr.nsec, mesh-id, last-mesh, was-public) so the
+/// next start gets a completely fresh identity. Called when transitioning from
+/// public → private to avoid reusing a publicly-known identity in a private mesh.
+pub fn clear_public_identity() {
+    let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    let dir = home.join(".mesh-llm");
+    let mut ok = true;
+    for name in &["key", "nostr.nsec", "mesh-id", "last-mesh"] {
+        let p = dir.join(name);
+        if p.exists() {
+            if std::fs::remove_file(&p).is_ok() {
+                tracing::info!("Cleared {}", p.display());
+            } else {
+                tracing::warn!("Failed to clear {}", p.display());
+                ok = false;
+            }
+        }
+    }
+    // Only remove the marker after identity files are gone, so a failed
+    // cleanup is retried on the next private start.
+    let marker = dir.join("was-public");
+    if ok {
+        let _ = std::fs::remove_file(&marker);
+    } else {
+        tracing::warn!("Keeping was-public marker — will retry cleanup next start");
+    }
+}
+
 /// Load secret key from ~/.mesh-llm/key, or create a new one and save it.
 async fn load_or_create_key() -> Result<SecretKey> {
     let home =
@@ -6226,4 +7080,77 @@ async fn load_or_create_key() -> Result<SecretKey> {
     tokio::fs::write(&key_path, hex::encode(key.to_bytes())).await?;
     tracing::info!("Generated new key, saved to {}", key_path.display());
     Ok(key)
+}
+
+#[cfg(test)]
+mod public_identity_tests {
+    use super::*;
+    use std::fs;
+
+    /// Test that mark_was_public / was_previously_public / clear_public_identity
+    /// work correctly.  Uses the real ~/.mesh-llm/ directory (same approach as
+    /// the rotate_keys tests) and restores originals afterward.
+    #[test]
+    fn public_to_private_transition_clears_identity() {
+        let dir = dirs::home_dir().unwrap().join(".mesh-llm");
+        fs::create_dir_all(&dir).ok();
+
+        // Files we may touch:
+        let paths: Vec<std::path::PathBuf> =
+            ["key", "nostr.nsec", "mesh-id", "last-mesh", "was-public"]
+                .iter()
+                .map(|n| dir.join(n))
+                .collect();
+
+        // Save originals so we can restore after the test.
+        let originals: Vec<Option<Vec<u8>>> = paths
+            .iter()
+            .map(|p| {
+                if p.exists() {
+                    Some(fs::read(p).unwrap())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // --- Scenario 1: no marker → was_previously_public is false ---
+        let _ = fs::remove_file(dir.join("was-public"));
+        assert!(!was_previously_public(), "should be false when no marker");
+
+        // --- Scenario 2: mark as public → marker exists ---
+        mark_was_public();
+        assert!(was_previously_public(), "should be true after marking");
+
+        // Plant some identity files to verify clear removes them.
+        fs::write(dir.join("key"), b"test-key").unwrap();
+        fs::write(dir.join("nostr.nsec"), b"test-nsec").unwrap();
+        fs::write(dir.join("mesh-id"), b"test-mesh-id").unwrap();
+        fs::write(dir.join("last-mesh"), b"test-last-mesh").unwrap();
+
+        // --- Scenario 3: clear_public_identity removes everything ---
+        clear_public_identity();
+        for name in &["key", "nostr.nsec", "mesh-id", "last-mesh", "was-public"] {
+            assert!(
+                !dir.join(name).exists(),
+                "{name} should be deleted after clear"
+            );
+        }
+        assert!(
+            !was_previously_public(),
+            "marker should be gone after clear"
+        );
+
+        // --- Scenario 4: clear on already-clean directory is fine ---
+        clear_public_identity(); // should not panic
+
+        // Restore originals.
+        for (path, orig) in paths.iter().zip(originals.iter()) {
+            if let Some(data) = orig {
+                fs::write(path, data).ok();
+            } else {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
 }
