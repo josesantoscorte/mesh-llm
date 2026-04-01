@@ -18,6 +18,7 @@ import {
   type Edge,
   type Node,
   type NodeProps,
+  type NodeTypes,
   type ReactFlowInstance,
 } from "@xyflow/react";
 import {
@@ -201,9 +202,12 @@ type Peer = {
   id: string;
   role: string;
   models: string[];
+  available_models?: string[];
+  requested_models?: string[];
   vram_gb: number;
-  serving?: string | null;
   serving_models?: string[];
+  hosted_models?: string[];
+  hosted_models_known?: boolean;
   rtt_ms?: number | null;
   hostname?: string;
   is_soc?: boolean;
@@ -221,6 +225,7 @@ type StatusPayload = {
   llama_ready: boolean;
   model_name: string;
   serving_models?: string[];
+  hosted_models?: string[];
   api_port: number;
   my_vram_gb: number;
   model_size_gb: number;
@@ -298,6 +303,40 @@ const CHAT_SAVE_DEBOUNCE_MS = 500;
 const CHAT_MAX_CONVERSATIONS = 80;
 const CHAT_MAX_MESSAGES_PER_CONVERSATION = 240;
 const CHAT_MAX_TEXT_CHARS = 12000;
+
+function peerAssignedModels(peer: Peer): string[] {
+  return peer.serving_models?.filter(Boolean) ?? [];
+}
+
+function peerRoutableModels(peer: Peer): string[] {
+  const hosted = peer.hosted_models?.filter(Boolean) ?? [];
+  if (peer.hosted_models_known === false)
+    return hosted.length ? hosted : peerAssignedModels(peer);
+  return hosted;
+}
+
+function localRoutableModels(status: StatusPayload | null): string[] {
+  if (!status || status.is_client) return [];
+  const hosted = status.hosted_models?.filter(Boolean) ?? [];
+  if (hosted.length > 0) return hosted;
+  const serving = status.serving_models?.filter(Boolean) ?? [];
+  if (serving.length > 0) return serving;
+  return status.model_name ? [status.model_name] : [];
+}
+
+function peerPrimaryModel(peer: Peer): string {
+  return peerRoutableModels(peer)[0] ?? peerAssignedModels(peer)[0] ?? '';
+}
+
+function peerStatusLabel(peer: Peer): string {
+  if (peer.role === "Client") return "Client";
+  if (peerRoutableModels(peer).some((model) => model !== "(idle)"))
+    return "Serving";
+  if (peerAssignedModels(peer).some((model) => model !== "(idle)"))
+    return "Assigned";
+  if (peer.role === "Host") return "Host";
+  return "Idle";
+}
 
 function sectionFromPathname(pathname: string): TopSection | null {
   if (pathname === "/dashboard" || pathname === "/dashboard/")
@@ -419,13 +458,14 @@ function sanitizeMessages(raw: unknown): ChatMessage[] {
       typeof content !== "string"
     )
       return [];
+    const safeRole: ChatMessage["role"] = role;
     return [
       {
         id:
           typeof (item as { id?: unknown }).id === "string"
             ? (item as { id: string }).id
             : randomId(),
-        role,
+        role: safeRole,
         content: clampText(content, CHAT_MAX_TEXT_CHARS) ?? "",
         reasoning: clampText(
           typeof (item as { reasoning?: unknown }).reasoning === "string"
@@ -646,12 +686,14 @@ export function App() {
       stats[modelName].vramGb += Math.max(0, vramGb || 0);
     };
 
-    if (!status.is_client && status.model_name)
-      addServingNode(status.model_name, status.my_vram_gb);
+    for (const model of new Set(localRoutableModels(status))) {
+      if (model && model !== "(idle)") addServingNode(model, status.my_vram_gb);
+    }
     for (const peer of status.peers ?? []) {
-      if (peer.role === "Client" || !peer.serving || peer.serving === "(idle)")
-        continue;
-      addServingNode(peer.serving, peer.vram_gb);
+      if (peer.role === 'Client') continue;
+      for (const model of new Set(peerRoutableModels(peer))) {
+        if (model && model !== '(idle)') addServingNode(model, peer.vram_gb);
+      }
     }
 
     for (const model of status.mesh_models ?? []) {
@@ -1328,13 +1370,6 @@ export function App() {
     setInput("");
   }
 
-  const peerStatusLabel = (peer: Peer): string => {
-    if (peer.role === "Client") return "Client";
-    if (peer.serving && peer.serving !== "(idle)") return "Serving";
-    if (peer.role === "Host") return "Host";
-    return "Idle";
-  };
-
   const topologyNodes = useMemo<TopologyNode[]>(() => {
     if (!status) return [];
     const nodes: TopologyNode[] = [];
@@ -1345,16 +1380,13 @@ export function App() {
         self: true,
         host: status.is_host,
         client: status.is_client,
-        serving: status.model_name || "",
-        servingModels:
-          status.serving_models && status.serving_models.length > 0
+        serving: status.model_name || '',
+        servingModels: (status.hosted_models && status.hosted_models.length > 0)
+          ? status.hosted_models
+          : (status.serving_models && status.serving_models.length > 0)
             ? status.serving_models
-            : status.model_name
-              ? [status.model_name]
-              : [],
-        statusLabel:
-          status.node_status ||
-          (status.is_client ? "Client" : status.is_host ? "Host" : "Idle"),
+          : (status.model_name ? [status.model_name] : []),
+        statusLabel: status.node_status || (status.is_client ? 'Client' : status.is_host ? 'Host' : 'Idle'),
         latencyMs: null,
         hostname: status.my_hostname,
         isSoc: status.my_is_soc,
@@ -1362,19 +1394,14 @@ export function App() {
       });
     }
     for (const p of status.peers ?? []) {
-      const pModels =
-        p.serving_models && p.serving_models.length > 0
-          ? p.serving_models
-          : p.serving
-            ? [p.serving]
-            : [];
+      const pModels = peerRoutableModels(p).length > 0 ? peerRoutableModels(p) : peerAssignedModels(p);
       nodes.push({
         id: p.id,
         vram: overviewVramGb(p.role === "Client", p.vram_gb),
         self: false,
         host: /^Host/.test(p.role),
-        client: p.role === "Client",
-        serving: p.serving || "",
+        client: p.role === 'Client',
+        serving: peerPrimaryModel(p),
         servingModels: pModels,
         statusLabel: peerStatusLabel(p),
         latencyMs: p.rtt_ms ?? null,
@@ -1428,11 +1455,13 @@ export function App() {
           {section === "chat" ? (
             <div className="mx-auto flex min-h-0 min-w-0 w-full max-w-7xl flex-1 flex-col overflow-hidden p-2 md:p-4">
               <ChatPage
+                status={status}
                 inviteToken={status?.token ?? ""}
                 isPublicMesh={status?.nostr_discovery ?? false}
                 isFlyHosted={isFlyHosted}
                 inflightRequests={status?.inflight_requests ?? 0}
                 warmModels={warmModels}
+                meshModelByName={meshModelByName}
                 modelStatsByName={modelStatsByName}
                 selectedModel={selectedModel}
                 setSelectedModel={setSelectedModel}
@@ -2050,11 +2079,13 @@ function AppHeader({
 }
 
 function ChatPage(props: {
+  status: StatusPayload | null;
   inviteToken: string;
   isPublicMesh: boolean;
   isFlyHosted: boolean;
   inflightRequests: number;
   warmModels: string[];
+  meshModelByName: Record<string, MeshModel>;
   modelStatsByName: Record<string, ModelServingStat>;
   selectedModel: string;
   setSelectedModel: (v: string) => void;
@@ -2087,8 +2118,10 @@ function ChatPage(props: {
   onSubmit: () => void;
 }) {
   const {
+    status,
     inviteToken,
     warmModels,
+    meshModelByName,
     modelStatsByName,
     selectedModel,
     setSelectedModel,
@@ -2416,9 +2449,8 @@ function ChatPage(props: {
                     ? "✨ Auto (router picks best)"
                     : selectedModelValue
                       ? shortName(
-                          modelDisplayName(
-                            meshModelByName[selectedModelValue],
-                          ) || selectedModelValue,
+                          modelDisplayName(meshModelByName[selectedModelValue]) ||
+                            selectedModelValue,
                         )
                       : undefined}
                 </SelectValue>
@@ -2440,9 +2472,7 @@ function ChatPage(props: {
                 ) : null}
                 {warmModels.map((model) => {
                   const modelStats = modelStatsByName[model];
-                  const selectedMeshModel = (status?.mesh_models ?? []).find(
-                    (m) => m.name === model,
-                  );
+                  const selectedMeshModel = meshModelByName[model];
                   const displayName =
                     modelDisplayName(selectedMeshModel) || model;
                   const visionInfo = visionBadge(selectedMeshModel);
@@ -2976,18 +3006,11 @@ function DashboardPage({
   }, [status?.peers]);
   const peerRows = useMemo(() => {
     return sortedPeers.map((peer) => {
-      const statusLabel =
-        peer.role === "Client"
-          ? "Client"
-          : peer.serving && peer.serving !== "(idle)"
-            ? "Serving"
-            : peer.role === "Host"
-              ? "Host"
-              : "Idle";
-      const modelLabel =
-        peer.serving && peer.serving !== "(idle)"
-          ? shortName(peer.serving)
-          : "idle";
+      const statusLabel = peer.role === 'Client'
+        ? 'Client'
+        : peerStatusLabel(peer);
+      const primaryModel = peerPrimaryModel(peer);
+      const modelLabel = primaryModel && primaryModel !== '(idle)' ? shortName(primaryModel) : 'idle';
       const latencyLabel = formatLatency(peer.rtt_ms);
       const displayVramGb = overviewVramGb(
         peer.role === "Client",
@@ -3014,8 +3037,7 @@ function DashboardPage({
     const targetModel = selectedCatalogModel.name;
     const totalModelVram = selectedCatalogModel.mesh_vram_gb ?? 0;
     const rows: ActivePeerRow[] = [];
-    const localServing =
-      status.serving_models?.includes(targetModel) || status.model_name === targetModel;
+    const localServing = localRoutableModels(status).includes(targetModel);
     if (localServing && !status.is_client) {
       const localVram = overviewVramGb(status.is_client, status.my_vram_gb);
       rows.push({
@@ -3028,7 +3050,8 @@ function DashboardPage({
     }
     for (const peer of peerRows) {
       const servesTarget =
-        peer.serving_models?.includes(targetModel) || peer.serving === targetModel;
+        peerRoutableModels(peer).includes(targetModel) ||
+        peerAssignedModels(peer).includes(targetModel);
       if (!servesTarget || peer.role === "Client") continue;
       rows.push({
         id: peer.id,
@@ -3511,7 +3534,9 @@ type TopologyFlowNodeData = {
   sameModelAsCurrent: boolean;
 };
 
-function TopologyFlowNode({ data }: NodeProps<TopologyFlowNodeData>) {
+type TopologyFlowDiagramNode = Node<TopologyFlowNodeData, "topologyNode">;
+
+function TopologyFlowNode({ data }: NodeProps<TopologyFlowDiagramNode>) {
   const isCenter = data.node.bucket === "center";
   const dotClass = isCenter
     ? "bg-primary border-primary"
@@ -3538,7 +3563,6 @@ function TopologyFlowNode({ data }: NodeProps<TopologyFlowNodeData>) {
         <span className="break-all">{data.node.id}</span>
         {data.node.self ? (
           <Badge
-            variant="outline"
             className="h-4 rounded-full border-sky-500/45 bg-sky-500/10 px-1.5 text-[9px] font-medium text-sky-700 dark:border-sky-400/55 dark:bg-sky-400/15 dark:text-sky-200"
           >
             You
@@ -3681,7 +3705,7 @@ function TopologyFlowNode({ data }: NodeProps<TopologyFlowNodeData>) {
   );
 }
 
-const topologyNodeTypes = { topologyNode: TopologyFlowNode };
+const topologyNodeTypes = { topologyNode: TopologyFlowNode } as NodeTypes;
 
 function MeshTopologyDiagram({
   status,
@@ -3857,7 +3881,9 @@ function MeshTopologyFlow({
     [fullscreen, positioned],
   );
   const flowContainerRef = useRef<HTMLDivElement | null>(null);
-  const flowInstanceRef = useRef<ReactFlowInstance | null>(null);
+  const flowInstanceRef = useRef<
+    ReactFlowInstance<TopologyFlowDiagramNode, Edge> | null
+  >(null);
   const [containerReady, setContainerReady] = useState(false);
   const fitViewOptions = useMemo(() => ({ padding: 0.12, maxZoom: 1.45 }), []);
   const fitDuration = fullscreen ? 220 : 0;
@@ -3897,7 +3923,7 @@ function MeshTopologyFlow({
     return () => observer.disconnect();
   }, [fitViewOptions, flowLayoutKey, containerStyle, heightClass]);
 
-  const flowNodes = useMemo<Node<TopologyFlowNodeData>[]>(() => {
+  const flowNodes = useMemo<TopologyFlowDiagramNode[]>(() => {
     return positioned.map((p) => ({
       id: p.id,
       type: "topologyNode",
@@ -3972,7 +3998,7 @@ function MeshTopologyFlow({
       style={containerStyle}
     >
       {containerReady ? (
-        <ReactFlow
+        <ReactFlow<TopologyFlowDiagramNode, Edge>
           key={flowLayoutKey}
           className="h-full w-full"
           style={{ width: "100%", height: "100%" }}
@@ -4789,7 +4815,6 @@ function CapabilityBadge({
 }) {
   const badge = (
     <Badge
-      variant="outline"
       className="gap-1.5 rounded-full border-sky-300 bg-sky-50 px-3 py-1.5 text-xs font-medium text-foreground dark:border-sky-900 dark:bg-sky-950/30"
     >
       {icon}

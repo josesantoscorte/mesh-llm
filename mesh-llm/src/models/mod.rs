@@ -17,8 +17,8 @@ use std::path::{Path, PathBuf};
 
 pub use capabilities::{CapabilityLevel, ModelCapabilities};
 pub use cli::{
-    print_legacy_storage_warning, run_model_download, run_model_installed, run_model_recommended,
-    run_model_search, run_model_show, warn_about_legacy_model_usage,
+    run_model_download, run_model_installed, run_model_recommended, run_model_search,
+    run_model_show, warn_about_legacy_model_usage,
 };
 pub use inventory::{
     scan_all_model_metadata, scan_local_inventory_snapshot, scan_local_model_sizes,

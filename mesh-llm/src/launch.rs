@@ -1,11 +1,12 @@
 //! Process management for llama.cpp binaries.
 //!
-//! Starts rpc-server and optionally llama-server as child processes,
-//! wired up to the mesh tunnel ports.
+//! Starts rpc-server and llama-server wired up to the mesh tunnel ports.
 
 use anyhow::{Context, Result};
 use clap::ValueEnum;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::process::Command;
 
@@ -188,6 +189,43 @@ fn resolve_binary_path(
 
 fn temp_log_path(name: &str) -> PathBuf {
     std::env::temp_dir().join(name)
+}
+
+#[derive(Clone, Debug)]
+pub struct InferenceServerHandle {
+    pid: u32,
+    expected_exit: Arc<AtomicBool>,
+}
+
+impl InferenceServerHandle {
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    pub async fn shutdown(&self) {
+        self.expected_exit.store(true, Ordering::Relaxed);
+        terminate_process(self.pid).await;
+    }
+}
+
+#[derive(Debug)]
+pub struct InferenceServerProcess {
+    pub handle: InferenceServerHandle,
+    pub death_rx: tokio::sync::oneshot::Receiver<()>,
+}
+
+pub struct ModelLaunchSpec<'a> {
+    pub model: &'a Path,
+    pub http_port: u16,
+    pub tunnel_ports: &'a [u16],
+    pub tensor_split: Option<&'a str>,
+    pub draft: Option<&'a Path>,
+    pub draft_max: u16,
+    pub model_bytes: u64,
+    pub my_vram: u64,
+    pub mmproj: Option<&'a Path>,
+    pub ctx_size_override: Option<u32>,
+    pub total_group_vram: Option<u64>,
 }
 
 fn log_tail(path: &Path, max_lines: usize) -> String {
@@ -440,27 +478,92 @@ pub async fn kill_llama_server() {
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 }
 
+async fn terminate_process(pid: u32) {
+    let pid_str = pid.to_string();
+
+    #[cfg(not(windows))]
+    {
+        let _ = std::process::Command::new("kill")
+            .args(["-TERM", &pid_str])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            let alive = std::process::Command::new("kill")
+                .args(["-0", &pid_str])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !alive {
+                return;
+            }
+        }
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &pid_str])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+
+    #[cfg(windows)]
+    {
+        // Graceful termination via taskkill (sends WM_CLOSE to the process tree)
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid_str, "/T"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            let alive = std::process::Command::new("tasklist")
+                .args(["/FI", &format!("PID eq {pid_str}"), "/NH"])
+                .output()
+                .map(|o| {
+                    o.status.success() && String::from_utf8_lossy(&o.stdout).contains(&pid_str)
+                })
+                .unwrap_or(false);
+            if !alive {
+                return;
+            }
+        }
+        // Force-kill if still alive
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid_str, "/T", "/F"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
 /// Start llama-server with the given model, HTTP port, and RPC tunnel ports.
+/// Returns a oneshot receiver that fires when the process exits.
 /// `model_bytes` is the total GGUF file size, used to select KV cache quantization:
 ///   - < 5GB: FP16 (default) — small models, KV cache is tiny
-///   - 5-50GB: Q8_0 — no measurable quality loss, saves ~50% KV memory
-///   - > 50GB: Q4_0 — slight long-context degradation, but these models need every byte
-/// Start llama-server. Returns a oneshot receiver that fires when the process exits.
+///   - 5-50GB: Q8_0 K + Q4_0 V — keeps attention routing precise (K dominates
+///     quality via softmax), compresses values aggressively (~25% less KV memory
+///     than Q8_0/Q8_0 with minimal quality impact)
+///   - > 50GB: Q4_0 — maximum compression, these models need every byte
 pub async fn start_llama_server(
     bin_dir: &Path,
     binary_flavor: Option<BinaryFlavor>,
-    model: &Path,
-    http_port: u16,
-    tunnel_ports: &[u16],
-    tensor_split: Option<&str>,
-    draft: Option<&Path>,
-    draft_max: u16,
-    model_bytes: u64,
-    my_vram: u64,
-    mmproj: Option<&Path>,
-    ctx_size_override: Option<u32>,
-    total_group_vram: Option<u64>,
-) -> Result<tokio::sync::oneshot::Receiver<()>> {
+    spec: ModelLaunchSpec<'_>,
+) -> Result<InferenceServerProcess> {
+    let model = spec.model;
+    let http_port = spec.http_port;
+    let tunnel_ports = spec.tunnel_ports;
+    let tensor_split = spec.tensor_split;
+    let draft = spec.draft;
+    let draft_max = spec.draft_max;
+    let model_bytes = spec.model_bytes;
+    let my_vram = spec.my_vram;
+    let mmproj = spec.mmproj;
+    let ctx_size_override = spec.ctx_size_override;
+    let total_group_vram = spec.total_group_vram;
     let llama_server = resolve_binary_path(bin_dir, "llama-server", binary_flavor)?;
 
     anyhow::ensure!(model.exists(), "Model not found at {}", model.display());
@@ -566,10 +669,18 @@ pub async fn start_llama_server(
         "--reasoning-budget".to_string(),
         "0".to_string(),
     ]);
-    // KV cache quantization based on model size:
-    //   < 5GB: leave default (FP16) — small models, KV cache is negligible
-    //   5-50GB: Q8_0 — essentially lossless, halves KV memory
-    //   > 50GB: Q4_0 — slight long-context quality trade, but critical memory savings
+    // KV cache quantization — asymmetric K/V strategy.
+    //
+    // K precision dominates quality: K controls attention routing via softmax,
+    // where small errors get exponentially amplified. V errors scale linearly
+    // in the weighted sum and are far more tolerant of compression.
+    // (See TurboQuant ICLR 2026 / asymmetric K/V findings.)
+    //
+    //   < 5GB:  leave default (FP16) — small models, KV cache is negligible
+    //   5-50GB: K=Q8_0, V=Q4_0 — keeps attention routing precise, compresses
+    //           values aggressively. ~25% less KV memory than Q8_0/Q8_0 with
+    //           minimal quality impact (<0.5% PPL on most models).
+    //   > 50GB: Q4_0/Q4_0 — maximum compression, critical memory savings
     if model_bytes >= 50 * GB {
         args.extend_from_slice(&[
             "--cache-type-k".to_string(),
@@ -577,15 +688,15 @@ pub async fn start_llama_server(
             "--cache-type-v".to_string(),
             "q4_0".to_string(),
         ]);
-        tracing::info!("KV cache: Q4_0 (model > 50GB)");
+        tracing::info!("KV cache: Q4_0 K + Q4_0 V (model > 50GB)");
     } else if model_bytes >= 5 * GB {
         args.extend_from_slice(&[
             "--cache-type-k".to_string(),
             "q8_0".to_string(),
             "--cache-type-v".to_string(),
-            "q8_0".to_string(),
+            "q4_0".to_string(),
         ]);
-        tracing::info!("KV cache: Q8_0 (model 5-50GB)");
+        tracing::info!("KV cache: Q8_0 K + Q4_0 V (model 5-50GB)");
     }
     if let Some(ts) = tensor_split {
         args.push("--tensor-split".to_string());
@@ -666,13 +777,23 @@ pub async fn start_llama_server(
             );
         }
         if reqwest_health_check(&url).await {
+            let pid = child
+                .id()
+                .context("llama-server started but did not expose a PID")?;
+            let expected_exit = Arc::new(AtomicBool::new(false));
+            let handle = InferenceServerHandle {
+                pid,
+                expected_exit: expected_exit.clone(),
+            };
             let (death_tx, death_rx) = tokio::sync::oneshot::channel();
             tokio::spawn(async move {
                 let _ = child.wait().await;
-                eprintln!("⚠️  llama-server process exited unexpectedly");
+                if !expected_exit.load(Ordering::Relaxed) {
+                    eprintln!("⚠️  llama-server process exited unexpectedly");
+                }
                 let _ = death_tx.send(());
             });
-            return Ok(death_rx);
+            return Ok(InferenceServerProcess { handle, death_rx });
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
