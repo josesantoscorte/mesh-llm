@@ -181,6 +181,8 @@ struct MeshModelPayload {
     source_revision: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     source_file: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    active_nodes: Vec<String>,
     fit_label: String,
     fit_detail: String,
     download_command: String,
@@ -194,10 +196,28 @@ fn find_catalog_model<'a>(name: &str) -> Option<&'a crate::models::catalog::Cata
         .find(|m| m.name == name || m.file.strip_suffix(".gguf").unwrap_or(m.file.as_str()) == name)
 }
 
+fn is_huggingface_repository_like(repository: &str) -> bool {
+    let trimmed = repository.trim();
+    !trimmed.is_empty()
+        && !trimmed.starts_with('/')
+        && !trimmed.ends_with('/')
+        && !trimmed.contains('\\')
+        && trimmed.split('/').count() == 2
+}
+
+fn huggingface_repository_from_identity(identity: &mesh::ServedModelIdentity) -> Option<String> {
+    matches!(identity.source_kind, mesh::ModelSourceKind::HuggingFace)
+        .then(|| {
+            identity
+                .repository
+                .clone()
+                .filter(|repo| is_huggingface_repository_like(repo))
+        })
+        .flatten()
+}
+
 fn source_page_url_from_identity(identity: &mesh::ServedModelIdentity) -> Option<String> {
-    identity
-        .repository
-        .as_ref()
+    huggingface_repository_from_identity(identity)
         .map(|repository| format!("https://huggingface.co/{repository}"))
 }
 
@@ -454,6 +474,35 @@ impl MeshApi {
                 } else {
                     0
                 };
+                let active_nodes: Vec<String> = if is_warm {
+                    let mut nodes = Vec::new();
+                    if my_serving_models.iter().any(|s| s == name) || *name == model_name {
+                        nodes.push(
+                            node.hostname
+                                .clone()
+                                .filter(|hostname| !hostname.trim().is_empty())
+                                .unwrap_or_else(|| "This node".to_string()),
+                        );
+                    }
+                    nodes.extend(all_peers.iter().filter_map(|peer| {
+                        let is_serving = peer.serving_models.iter().any(|s| s == name)
+                            || peer.serving.as_deref() == Some(name.as_str());
+                        if !is_serving {
+                            return None;
+                        }
+                        Some(
+                            peer.hostname
+                                .clone()
+                                .filter(|hostname| !hostname.trim().is_empty())
+                                .unwrap_or_else(|| peer.id.fmt_short().to_string()),
+                        )
+                    }));
+                    nodes.sort();
+                    nodes.dedup();
+                    nodes
+                } else {
+                    Vec::new()
+                };
                 let mesh_vram_gb = if is_warm {
                     let peer_vram = all_peers
                         .iter()
@@ -584,7 +633,7 @@ impl MeshApi {
                             }
                         });
                 let source_ref = identity
-                    .and_then(|identity| identity.repository.clone())
+                    .and_then(huggingface_repository_from_identity)
                     .or_else(|| {
                         source_page_url
                             .as_deref()
@@ -648,6 +697,7 @@ impl MeshApi {
                     source_ref,
                     source_revision,
                     source_file,
+                    active_nodes,
                     fit_label,
                     fit_detail,
                     download_command: format!("mesh-llm models download {}", command_ref),

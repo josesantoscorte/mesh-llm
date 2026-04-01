@@ -40,7 +40,6 @@ import {
   Moon,
   Network,
   ExternalLink,
-  Download,
   Pencil,
   RotateCcw,
   Send,
@@ -159,6 +158,14 @@ type MeshModel = {
   last_active_secs_ago?: number;
   source_ref?: string;
   source_file?: string;
+  active_nodes?: string[];
+};
+
+type ActivePeerRow = {
+  id: string;
+  latencyLabel: string;
+  vramLabel: string;
+  shareLabel: string;
 };
 
 function modelDisplayName(model?: MeshModel | null) {
@@ -2951,7 +2958,6 @@ function DashboardPage({
   );
   const [isMeshOverviewFullscreen, setIsMeshOverviewFullscreen] = useState(false);
   const [selectedCatalogModel, setSelectedCatalogModel] = useState<MeshModel | null>(null);
-  const [copiedCommand, setCopiedCommand] = useState<string | null>(null);
   const filteredModels = useMemo(() => {
     const models = status?.mesh_models ?? [];
     return [...models]
@@ -3001,6 +3007,39 @@ function DashboardPage({
       };
     });
   }, [sortedPeers, totalMeshVramGb]);
+  const activePeerRows = useMemo(() => {
+    if (!selectedCatalogModel || selectedCatalogModel.status !== "warm" || !status) {
+      return [] as ActivePeerRow[];
+    }
+    const targetModel = selectedCatalogModel.name;
+    const totalModelVram = selectedCatalogModel.mesh_vram_gb ?? 0;
+    const rows: ActivePeerRow[] = [];
+    const localServing =
+      status.serving_models?.includes(targetModel) || status.model_name === targetModel;
+    if (localServing && !status.is_client) {
+      const localVram = overviewVramGb(status.is_client, status.my_vram_gb);
+      rows.push({
+        id: status.node_id,
+        latencyLabel: "local",
+        vramLabel: `${localVram.toFixed(1)} GB`,
+        shareLabel:
+          totalModelVram > 0 ? `${Math.round((localVram / totalModelVram) * 100)}%` : "n/a",
+      });
+    }
+    for (const peer of peerRows) {
+      const servesTarget =
+        peer.serving_models?.includes(targetModel) || peer.serving === targetModel;
+      if (!servesTarget || peer.role === "Client") continue;
+      rows.push({
+        id: peer.id,
+        latencyLabel: peer.latencyLabel,
+        vramLabel: `${peer.displayVramGb.toFixed(1)} GB`,
+        shareLabel:
+          totalModelVram > 0 ? `${Math.round((peer.displayVramGb / totalModelVram) * 100)}%` : "n/a",
+      });
+    }
+    return rows;
+  }, [peerRows, selectedCatalogModel, status]);
 
   useEffect(() => {
     const prevOverflow = document.body.style.overflow;
@@ -3024,19 +3063,6 @@ function DashboardPage({
   function toggleMeshOverviewFullscreen() {
     setIsMeshOverviewFullscreen((prev) => !prev);
   }
-
-  const copyModelCommand = useCallback(async (key: string, command?: string) => {
-    if (!command) return;
-    try {
-      await navigator.clipboard.writeText(command);
-      setCopiedCommand(key);
-      window.setTimeout(() => {
-        setCopiedCommand((current) => (current === key ? null : current));
-      }, 1500);
-    } catch {
-      setCopiedCommand(null);
-    }
-  }, []);
 
   return (
     <div className="space-y-4">
@@ -3340,12 +3366,11 @@ function DashboardPage({
         : null}
 
       <Sheet open={!!selectedCatalogModel} onOpenChange={(open) => !open && setSelectedCatalogModel(null)}>
-        <SheetContent side="right" className="w-full overflow-y-auto border-l bg-background/95 p-0 backdrop-blur sm:max-w-2xl">
+      <SheetContent side="right" className="w-full overflow-y-auto border-l bg-background/95 p-0 backdrop-blur sm:max-w-2xl">
           {selectedCatalogModel ? (
             <ModelSidebar
               model={selectedCatalogModel}
-              copiedCommand={copiedCommand}
-              onCopyCommand={copyModelCommand}
+              activePeers={activePeerRows}
             />
           ) : null}
         </SheetContent>
@@ -4521,13 +4546,24 @@ function DashboardPanelEmpty({
 
 function ModelSidebar({
   model,
-  copiedCommand,
-  onCopyCommand,
+  activePeers,
 }: {
   model: MeshModel;
-  copiedCommand: string | null;
-  onCopyCommand: (key: string, command?: string) => void;
+  activePeers: ActivePeerRow[];
 }) {
+  const [copiedRef, setCopiedRef] = useState(false);
+
+  const copySourceRef = useCallback(async () => {
+    if (!model.source_ref) return;
+    try {
+      await navigator.clipboard.writeText(model.source_ref);
+      setCopiedRef(true);
+      window.setTimeout(() => setCopiedRef(false), 1500);
+    } catch {
+      setCopiedRef(false);
+    }
+  }, [model.source_ref]);
+
   return (
     <div className="flex min-h-full flex-col">
       <div className="border-b bg-gradient-to-br from-sky-50 via-background to-background px-6 pb-3 pt-3 dark:from-sky-950/20">
@@ -4555,15 +4591,31 @@ function ModelSidebar({
                 />
               </div>
               {model.source_page_url ? (
-                <a
-                  href={model.source_page_url}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="mt-1 inline-flex items-center gap-1.5 text-xs text-muted-foreground underline-offset-4 hover:text-foreground hover:underline [overflow-wrap:anywhere]"
-                >
-                  {huggingFacePathFromUrl(model.source_page_url) ?? model.name}
-                  <ExternalLink className="h-3 w-3 shrink-0" />
-                </a>
+                <div className="mt-1 flex flex-wrap items-center gap-1.5 text-xs text-muted-foreground">
+                  <a
+                    href={model.source_page_url}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="inline-flex items-center gap-1.5 underline-offset-4 hover:text-foreground hover:underline [overflow-wrap:anywhere]"
+                  >
+                    <span aria-hidden="true">🤗</span>
+                    <span>{huggingFacePathFromUrl(model.source_page_url) ?? model.name}</span>
+                    <ExternalLink className="h-3 w-3 shrink-0" />
+                  </a>
+                  {model.source_ref ? (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="ghost"
+                      className="h-6 w-6 rounded-full p-0 text-muted-foreground hover:text-foreground"
+                      onClick={copySourceRef}
+                      aria-label={copiedRef ? 'Repository reference copied' : 'Copy repository reference'}
+                      title={copiedRef ? 'Copied' : 'Copy repository reference'}
+                    >
+                      {copiedRef ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3" />}
+                    </Button>
+                  ) : null}
+                </div>
               ) : (
                 <SheetDescription className="mt-1.5 text-sm text-muted-foreground [overflow-wrap:anywhere]">
                   {model.name}
@@ -4667,40 +4719,35 @@ function ModelSidebar({
           </Card>
         ) : null}
 
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-sm">Mesh LLM Commands</CardTitle>
-            <SheetDescription className="text-xs text-muted-foreground">
-              Copy a command and run it in your terminal.
-            </SheetDescription>
-          </CardHeader>
-          <CardContent className="space-y-3">
-            <CommandRow
-              label="Download"
-              description="Cache this model from Hugging Face for local use."
-              command={model.download_command}
-              copied={copiedCommand === 'download'}
-              onCopy={() => onCopyCommand('download', model.download_command)}
-              icon={<Download className="h-4 w-4" />}
-            />
-            <CommandRow
-              label="Run"
-              description="Serve this model directly with Mesh LLM."
-              command={model.run_command}
-              copied={copiedCommand === 'run'}
-              onCopy={() => onCopyCommand('run', model.run_command)}
-              icon={<Server className="h-4 w-4" />}
-            />
-            <CommandRow
-              label="Auto"
-              description="Start Mesh LLM in automatic routing mode with this model."
-              command={model.auto_command}
-              copied={copiedCommand === 'auto'}
-              onCopy={() => onCopyCommand('auto', model.auto_command)}
-              icon={<Sparkles className="h-4 w-4" />}
-            />
-          </CardContent>
-        </Card>
+        {activePeers.length > 0 ? (
+          <Card>
+            <CardHeader className="pb-2">
+              <CardTitle className="text-sm">Active Peers</CardTitle>
+            </CardHeader>
+            <CardContent className="pt-0">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>ID</TableHead>
+                    <TableHead className="text-right">Latency</TableHead>
+                    <TableHead className="text-right">VRAM</TableHead>
+                    <TableHead className="text-right">Share</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {activePeers.map((peer) => (
+                    <TableRow key={peer.id}>
+                      <TableCell className="font-mono text-xs">{peer.id}</TableCell>
+                      <TableCell className="text-right">{peer.latencyLabel}</TableCell>
+                      <TableCell className="text-right">{peer.vramLabel}</TableCell>
+                      <TableCell className="text-right">{peer.shareLabel}</TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </CardContent>
+          </Card>
+        ) : null}
 
         {model.request_count != null || model.last_active_secs_ago != null ? (
           <div className="px-1 text-xs text-muted-foreground">
@@ -4786,42 +4833,6 @@ function ModelMetaItem({ label, value }: { label: string; value: string }) {
     <div className="rounded-lg border bg-muted/25 px-3 py-2">
       <div className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">{label}</div>
       <div className="mt-1 text-sm font-medium [overflow-wrap:anywhere]">{value}</div>
-    </div>
-  );
-}
-
-function CommandRow({
-  label,
-  description,
-  command,
-  copied,
-  onCopy,
-  icon,
-}: {
-  label: string;
-  description: string;
-  command?: string;
-  copied: boolean;
-  onCopy: () => void;
-  icon: ReactNode;
-}) {
-  if (!command) return null;
-  return (
-    <div className="rounded-xl border bg-muted/15 p-3">
-      <div className="mb-2 flex items-start justify-between gap-3">
-        <div className="min-w-0">
-          <div className="flex items-center gap-2 text-sm font-semibold">
-            {icon}
-            {label}
-          </div>
-          <div className="mt-1 text-xs text-muted-foreground">{description}</div>
-        </div>
-        <Button type="button" size="sm" variant="outline" className="h-8 gap-1.5 rounded-lg px-3" onClick={onCopy}>
-          {copied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
-          {copied ? 'Copied' : 'Copy'}
-        </Button>
-      </div>
-      <code className="block overflow-x-auto rounded-lg border bg-background px-3 py-2.5 font-mono text-[13px] leading-6 text-foreground">{command}</code>
     </div>
   );
 }
@@ -4944,7 +4955,7 @@ function headerFitLabel(label?: string) {
 
 function fitLabelTone(label?: string): 'good' | 'info' | 'warn' | 'bad' | 'neutral' {
   if (label === 'Likely comfortable') return 'good';
-  if (label === 'Likely fits') return 'info';
+  if (label === 'Likely fits') return 'good';
   if (label === 'Possible with tradeoffs') return 'warn';
   if (label === 'Likely too large') return 'bad';
   return 'neutral';
@@ -4955,7 +4966,7 @@ function modelStatusTooltip(status?: string) {
     return 'Loaded and serving in the mesh.';
   }
   if (status === 'cold') {
-    return 'Known to the mesh, but not loaded in VRAM.';
+    return 'Downloaded locally, but not currently serving.';
   }
   return 'Current model availability in the mesh.';
 }
