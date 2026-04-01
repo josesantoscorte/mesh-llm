@@ -1364,13 +1364,22 @@ async fn run_auto(
             assignment
         };
         if let Some(model_name) = assignment {
-            eprintln!("Mesh assigned model: {model_name}");
+            eprintln!(
+                "Mesh assigned model: {}",
+                models::installed_model_display_with_ref(&model_name)
+            );
             let model_path = models::find_model_path(&model_name);
             if model_path.exists() {
                 model_path
             } else if let Some(cat) = catalog::find_model(&model_name) {
                 // Model not on disk but in catalog — download it
-                eprintln!("📥 Downloading {} for mesh...", model_name);
+                eprintln!(
+                    "📥 Downloading {} for mesh...",
+                    models::format_model_alias_with_ref(
+                        &model_name,
+                        models::installed_model_exact_ref(&model_name).as_deref()
+                    )
+                );
                 catalog::download_model(cat).await?
             } else {
                 model_path
@@ -1562,6 +1571,7 @@ async fn run_auto(
     let llama_flavor = cli.llama_flavor;
     let cb_console_port = console_port;
     let model_name_for_cb = model_name.clone();
+    let model_display_for_cb = models::installed_model_display_with_ref(&model_name);
     let model_name_for_election = model_name.clone();
     let node_for_cb = node.clone();
     let primary_target_tx = target_tx.clone();
@@ -1592,6 +1602,7 @@ async fn run_auto(
                 }
                 if is_host && llama_ready {
                     let url = format!("http://localhost:{api_port}");
+                    eprintln!("  Model:   {model_display_for_cb}");
                     eprintln!("  API:     {url}");
                     if let Some(cp) = cb_console_port {
                         eprintln!("  Console: http://localhost:{cp}");
@@ -1689,7 +1700,7 @@ async fn run_auto(
             let extra_node_for_advertise = node.clone();
             let primary_model_name_for_extra = model_name.clone();
             let managed_model_name = extra_name.clone();
-            eprintln!("  + {extra_name}");
+            eprintln!("  + {}", models::model_path_display_with_ref(extra_model));
             let (extra_stop_tx, extra_stop_rx) = tokio::sync::watch::channel(false);
             let extra_task = tokio::spawn(async move {
                 election::election_loop(
@@ -1709,7 +1720,12 @@ async fn run_auto(
                             }
                         });
                         if is_host && llama_ready {
-                            eprintln!("✅ [{extra_model_name_for_status}] ready (multi-model)");
+                            eprintln!(
+                                "✅ Ready (multi-model): {}",
+                                models::installed_model_display_with_ref(
+                                    &extra_model_name_for_status
+                                )
+                            );
                             eprintln!("  API: http://localhost:{api_port_extra} (model={extra_model_name_for_status})");
                         }
                     },
@@ -2079,7 +2095,10 @@ async fn run_passive(
                 }
                 // Check if there's an unserved or demand-imbalanced model we can handle
                 if let Some(model_name) = check_unserved_model(&watch_node, &local_models).await {
-                    eprintln!("🚀 Promoting from standby — serving {model_name}");
+                    eprintln!(
+                        "🚀 Promoting from standby — serving {}",
+                        models::installed_model_display_with_ref(&model_name)
+                    );
                     let _ = promote_tx.send(model_name).await;
                     break;
                 }
@@ -2098,7 +2117,10 @@ async fn run_passive(
                 tokio::spawn(proxy::handle_mesh_request(node, tcp_stream, true, affinity));
             }
             Some(model_name) = promote_rx.recv() => {
-                eprintln!("⬆️  Standby promoting to serve: {model_name}");
+                eprintln!(
+                    "⬆️  Standby promoting to serve: {}",
+                    models::installed_model_display_with_ref(&model_name)
+                );
                 return Ok(Some(model_name));
             }
             _ = tokio::signal::ctrl_c() => {
@@ -2676,7 +2698,10 @@ fn start_new_mesh(cli: &mut Cli, _models: &[String], my_vram_gb: f64) {
     let pack = nostr::auto_model_pack(my_vram_gb);
     let primary = pack.first().cloned().unwrap_or_default();
     eprintln!("🆕 Starting a new mesh");
-    eprintln!("   Serving: {primary}");
+    eprintln!(
+        "   Serving: {}",
+        models::installed_model_display_with_ref(&primary)
+    );
     eprintln!("   VRAM: {:.0}GB", my_vram_gb);
     if cli.model.is_empty() {
         cli.model.push(primary.into());

@@ -24,6 +24,34 @@ pub use local::{
     scan_local_models,
 };
 
+pub fn format_model_alias_with_ref(alias: &str, exact_ref: Option<&str>) -> String {
+    match exact_ref {
+        Some(exact_ref) if !exact_ref.is_empty() && exact_ref != alias => {
+            format!("{alias}  [{exact_ref}]")
+        }
+        _ => alias.to_string(),
+    }
+}
+
+pub fn installed_model_exact_ref(model_name: &str) -> Option<String> {
+    let path = find_model_path(model_name);
+    exact_ref_for_model_path(&path).or_else(|| exact_ref_for_catalog_name(model_name))
+}
+
+pub fn installed_model_display_with_ref(model_name: &str) -> String {
+    format_model_alias_with_ref(model_name, installed_model_exact_ref(model_name).as_deref())
+}
+
+pub fn model_path_display_with_ref(path: &Path) -> String {
+    let alias = path
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let alias = crate::router::strip_split_suffix_owned(&alias);
+    format_model_alias_with_ref(&alias, exact_ref_for_model_path(path).as_deref())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MigrationStatus {
     Rehydratable,
@@ -180,7 +208,7 @@ pub async fn show_exact_model(input: &str) -> Result<ModelDetails> {
     match parse_exact_model_ref(input)? {
         ExactModelRef::Catalog(model) => Ok(ModelDetails {
             display_name: model.name.to_string(),
-            exact_ref: model.name.to_string(),
+            exact_ref: exact_ref_for_catalog_model(model).unwrap_or_else(|| model.name.to_string()),
             source: "catalog",
             download_url: match (
                 model.source_repo(),
@@ -231,11 +259,7 @@ pub async fn show_exact_model(input: &str) -> Result<ModelDetails> {
                 }
             };
             Ok(ModelDetails {
-                display_name: Path::new(&file)
-                    .file_name()
-                    .and_then(|value| value.to_str())
-                    .unwrap_or(&file)
-                    .to_string(),
+                display_name: display_alias_from_file(&file),
                 exact_ref,
                 source: "huggingface",
                 download_url,
@@ -253,7 +277,7 @@ pub async fn show_exact_model(input: &str) -> Result<ModelDetails> {
                 None => remote_size_label(&url).await,
             };
             Ok(ModelDetails {
-                display_name: filename,
+                display_name: display_alias_from_file(&filename),
                 exact_ref: url.clone(),
                 source: "url",
                 download_url: url,
@@ -857,6 +881,49 @@ fn matching_catalog_model_by_basename(repo_file: &str) -> Option<&'static catalo
             || model.file.trim_end_matches(".gguf").to_lowercase()
                 == basename.trim_end_matches(".gguf")
     })
+}
+
+fn exact_ref_for_catalog_model(model: &'static catalog::CatalogModel) -> Option<String> {
+    Some(format_huggingface_exact_ref(
+        model.source_repo()?,
+        model.source_revision(),
+        model.source_file()?,
+    ))
+}
+
+fn exact_ref_for_catalog_name(model_name: &str) -> Option<String> {
+    find_catalog_model_exact(model_name).and_then(exact_ref_for_catalog_model)
+}
+
+fn exact_ref_for_model_path(path: &Path) -> Option<String> {
+    if let Some((_model, repo, revision, file)) = catalog_hf_match(path) {
+        return Some(format_huggingface_exact_ref(
+            &repo,
+            revision.as_deref(),
+            &file,
+        ));
+    }
+
+    let repo = cached_repo_for_path(path).ok().flatten()?;
+    let cache = huggingface_hub_cache();
+    let repo_handle =
+        Repo::with_revision(repo.repo_id.clone(), RepoType::Model, repo.ref_name.clone());
+    let root = cache.repo(repo_handle).pointer_path(&repo.local_revision);
+    let relative = path.strip_prefix(&root).ok()?;
+    let file = relative.to_string_lossy().replace('\\', "/");
+    Some(format_huggingface_exact_ref(
+        &repo.repo_id,
+        Some(repo.ref_name.as_str()),
+        &file,
+    ))
+}
+
+fn display_alias_from_file(file: &str) -> String {
+    let alias = Path::new(file)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or(file);
+    crate::router::strip_split_suffix_owned(alias)
 }
 
 fn parse_hf_resolve_url(url: &str) -> Option<(String, Option<String>, String)> {
@@ -1575,5 +1642,34 @@ mod tests {
     fn find_catalog_model_exact_matches_filename_stem() {
         let model = find_catalog_model_exact("Qwen3-8B-Q4_K_M").unwrap();
         assert_eq!(model.name, "Qwen3-8B-Q4_K_M");
+    }
+
+    #[test]
+    fn exact_ref_for_catalog_model_prefers_canonical_hf_ref() {
+        let model = find_catalog_model_exact("Qwen3-8B-Q4_K_M").unwrap();
+        assert_eq!(
+            exact_ref_for_catalog_model(model).as_deref(),
+            Some("unsloth/Qwen3-8B-GGUF@main/Qwen3-8B-Q4_K_M.gguf")
+        );
+    }
+
+    #[tokio::test]
+    async fn show_exact_model_uses_canonical_hf_ref_for_catalog_input() {
+        let details = show_exact_model("Qwen3-8B-Q4_K_M").await.unwrap();
+        assert_eq!(
+            details.exact_ref,
+            "unsloth/Qwen3-8B-GGUF@main/Qwen3-8B-Q4_K_M.gguf"
+        );
+    }
+
+    #[test]
+    fn format_model_alias_with_ref_uses_bracket_style() {
+        assert_eq!(
+            format_model_alias_with_ref(
+                "Qwen3-8B-Q4_K_M",
+                Some("unsloth/Qwen3-8B-GGUF@main/Qwen3-8B-Q4_K_M.gguf")
+            ),
+            "Qwen3-8B-Q4_K_M  [unsloth/Qwen3-8B-GGUF@main/Qwen3-8B-Q4_K_M.gguf]"
+        );
     }
 }

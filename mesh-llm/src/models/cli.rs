@@ -1,8 +1,8 @@
 use super::{
     capabilities, catalog, download_exact_ref, find_catalog_model_exact, huggingface_hub_cache_dir,
-    installed_model_capabilities, legacy_models_dir, legacy_models_present,
-    path_is_in_legacy_models_dir, scan_installed_models, search_catalog_models, search_huggingface,
-    show_exact_model,
+    installed_model_capabilities, installed_model_display_with_ref, legacy_models_dir,
+    legacy_models_present, path_is_in_legacy_models_dir, scan_installed_models,
+    search_catalog_models, search_huggingface, show_exact_model,
 };
 use crate::hardware;
 use anyhow::{anyhow, Result};
@@ -66,7 +66,16 @@ pub async fn run_model_search(query: &[String], catalog_only: bool, limit: usize
     }
     println!();
     for (index, result) in results.iter().enumerate() {
-        println!("{}. 📦 {}", index + 1, result.file);
+        let alias = std::path::Path::new(&result.file)
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .map(crate::router::strip_split_suffix_owned)
+            .unwrap_or_else(|| result.file.clone());
+        println!(
+            "{}. 📦 {}",
+            index + 1,
+            super::format_model_alias_with_ref(&alias, Some(&result.exact_ref))
+        );
         println!("   repo: {}", result.repo_id);
         let mut stats = Vec::new();
         if let Some(size) = &result.size_label {
@@ -111,7 +120,14 @@ pub fn run_model_recommended() {
     println!();
     for model in catalog::MODEL_CATALOG.iter() {
         let model_capabilities = capabilities::infer_catalog_capabilities(model);
-        println!("• {}  {}", model.name, model.size);
+        println!(
+            "• {}  {}",
+            super::format_model_alias_with_ref(
+                &model.name,
+                super::installed_model_exact_ref(&model.name).as_deref()
+            ),
+            model.size
+        );
         println!("  {}", model.description);
         if let Some(draft) = model.draft.as_deref() {
             println!("  🧠 Draft: {}", draft);
@@ -162,8 +178,12 @@ pub fn run_model_installed() {
         let model_capabilities = installed_model_capabilities(&name);
 
         match size {
-            Some(bytes) => println!("• {}  {}", name, format_installed_size(bytes)),
-            None => println!("• {}", name),
+            Some(bytes) => println!(
+                "• {}  {}",
+                installed_model_display_with_ref(&name),
+                format_installed_size(bytes)
+            ),
+            None => println!("• {}", installed_model_display_with_ref(&name)),
         }
         println!("  {}", source);
         println!("  {}", path.display());
@@ -188,12 +208,14 @@ pub fn run_model_installed() {
 
 pub async fn run_model_show(model_ref: &str) -> Result<()> {
     let details = show_exact_model(model_ref).await?;
-    println!("🔎 {}", details.display_name);
+    println!(
+        "🔎 {}",
+        super::format_model_alias_with_ref(&details.display_name, Some(&details.exact_ref))
+    );
     if let Some(summary) = local_capacity_summary() {
         println!("{}", summary);
     }
     println!();
-    println!("Ref: {}", details.exact_ref);
     println!("Source: {}", format_source_label(details.source));
     if let Some(size) = details.size_label {
         println!("Size: {size}");
@@ -235,7 +257,14 @@ pub async fn run_model_show(model_ref: &str) -> Result<()> {
 
 pub async fn run_model_download(model_ref: &str, include_draft: bool) -> Result<()> {
     let path = download_exact_ref(model_ref).await?;
+    let details = show_exact_model(model_ref).await.ok();
     println!("✅ Downloaded model");
+    if let Some(details) = details {
+        println!(
+            "   {}",
+            super::format_model_alias_with_ref(&details.display_name, Some(&details.exact_ref))
+        );
+    }
     println!("   {}", path.display());
 
     if !include_draft {
