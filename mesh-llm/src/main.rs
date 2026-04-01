@@ -38,7 +38,7 @@ use mesh::NodeRole;
 use models::catalog;
 use std::path::{Path, PathBuf};
 
-pub const VERSION: &str = "0.53.1";
+pub const VERSION: &str = "0.54.0";
 
 #[tokio::main]
 async fn main() -> Result<()> {
