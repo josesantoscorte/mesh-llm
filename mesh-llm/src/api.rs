@@ -230,7 +230,7 @@ fn source_file_from_identity(identity: &mesh::ServedModelIdentity) -> Option<Str
 
 fn likely_reasoning_model(name: &str, description: Option<&str>) -> bool {
     let haystack = format!("{} {}", name, description.unwrap_or_default()).to_ascii_lowercase();
-    ["reasoning", "thinking", "deepseek-r1", "r1"]
+    ["reasoning", "thinking", "deepseek-r1"]
         .iter()
         .any(|needle| haystack.contains(needle))
 }
