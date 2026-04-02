@@ -107,17 +107,51 @@ pub(super) struct MeshModelPayload {
     pub(super) display_name: String,
     pub(super) status: String,
     pub(super) node_count: usize,
+    pub(super) mesh_vram_gb: f64,
     pub(super) size_gb: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) architecture: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) context_length: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) quantization: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) description: Option<String>,
     pub(super) vision: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) vision_status: Option<&'static str>,
     pub(super) reasoning: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) reasoning_status: Option<&'static str>,
+    pub(super) tool_use: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) tool_use_status: Option<&'static str>,
+    pub(super) moe: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) expert_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) used_expert_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) draft_model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) request_count: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) last_active_secs_ago: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) source_page_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) source_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) source_revision: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) source_file: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub(super) active_nodes: Vec<String>,
+    pub(super) fit_label: String,
+    pub(super) fit_detail: String,
+    pub(super) download_command: String,
+    pub(super) run_command: String,
+    pub(super) auto_command: String,
 }
 
 pub(super) fn build_runtime_status_payload(

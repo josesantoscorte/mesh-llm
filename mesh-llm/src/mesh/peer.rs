@@ -1,3 +1,4 @@
+use super::ServedModelDescriptor;
 use iroh::{EndpointAddr, EndpointId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -72,6 +73,7 @@ pub(crate) fn peer_meaningfully_changed(old: &PeerInfo, new: &PeerInfo) -> bool 
         || old.hosted_models != new.hosted_models
         || old.available_models != new.available_models
         || old.requested_models != new.requested_models
+        || old.served_model_descriptors != new.served_model_descriptors
         || old.version != new.version
 }
 
@@ -112,6 +114,8 @@ pub(crate) struct PeerAnnouncementV0 {
     pub(crate) gpu_bandwidth_gbps: Option<String>,
     #[serde(default)]
     pub(crate) available_model_sizes: HashMap<String, u64>,
+    #[serde(skip_serializing, skip_deserializing, default)]
+    pub(crate) served_model_descriptors: Vec<ServedModelDescriptor>,
 }
 
 impl PeerAnnouncementV0 {
@@ -142,6 +146,7 @@ impl PeerAnnouncementV0 {
             available_model_metadata: vec![],
             experts_summary: None,
             available_model_sizes: self.available_model_sizes,
+            served_model_descriptors: self.served_model_descriptors,
         }
     }
 }
@@ -167,6 +172,7 @@ impl From<&PeerAnnouncement> for PeerAnnouncementV0 {
             gpu_vram: ann.gpu_vram.clone(),
             gpu_bandwidth_gbps: ann.gpu_bandwidth_gbps.clone(),
             available_model_sizes: ann.available_model_sizes.clone(),
+            served_model_descriptors: ann.served_model_descriptors.clone(),
         }
     }
 }
@@ -207,11 +213,12 @@ pub(crate) fn apply_transitive_ann(
         existing.gpu_bandwidth_gbps = ann.gpu_bandwidth_gbps.clone();
     }
     existing.models = ann.models.clone();
-    existing.available_models = ann.available_models.clone();
+    existing.available_models.clear();
     existing.requested_models = ann.requested_models.clone();
     if ann.model_source.is_some() {
         existing.model_source = ann.model_source.clone();
     }
+    existing.served_model_descriptors = ann.served_model_descriptors.clone();
     if !ann.available_model_metadata.is_empty() {
         existing.available_model_metadata = ann.available_model_metadata.clone();
     }
@@ -274,6 +281,7 @@ pub(crate) struct PeerAnnouncement {
     pub(crate) available_model_metadata: Vec<crate::proto::node::CompactModelMetadata>,
     pub(crate) experts_summary: Option<crate::proto::node::ExpertsSummary>,
     pub(crate) available_model_sizes: HashMap<String, u64>,
+    pub(crate) served_model_descriptors: Vec<ServedModelDescriptor>,
 }
 
 #[derive(Debug, Clone)]
@@ -301,6 +309,7 @@ pub struct PeerInfo {
     pub available_model_metadata: Vec<crate::proto::node::CompactModelMetadata>,
     pub experts_summary: Option<crate::proto::node::ExpertsSummary>,
     pub available_model_sizes: HashMap<String, u64>,
+    pub served_model_descriptors: Vec<ServedModelDescriptor>,
 }
 
 impl PeerInfo {
@@ -333,6 +342,7 @@ impl PeerInfo {
             available_model_metadata: ann.available_model_metadata.clone(),
             experts_summary: ann.experts_summary.clone(),
             available_model_sizes: ann.available_model_sizes.clone(),
+            served_model_descriptors: ann.served_model_descriptors.clone(),
         }
     }
 

@@ -65,10 +65,12 @@ struct HuggingFaceSibling {
     rfilename: String,
 }
 
-fn merge_capabilities(left: ModelCapabilities, right: ModelCapabilities) -> ModelCapabilities {
+pub(super) fn merge_capabilities(left: ModelCapabilities, right: ModelCapabilities) -> ModelCapabilities {
     ModelCapabilities {
         vision: left.vision.max(right.vision),
         reasoning: left.reasoning.max(right.reasoning),
+        tool_use: left.tool_use.max(right.tool_use),
+        moe: left.moe || right.moe,
     }
 }
 
@@ -412,7 +414,7 @@ pub(super) fn catalog_match(path: &Path) -> Option<&'static catalog::CatalogMode
     })
 }
 
-fn matching_catalog_model_for_huggingface(
+pub(super) fn matching_catalog_model_for_huggingface(
     repo: &str,
     revision: Option<&str>,
     file: &str,
@@ -562,7 +564,7 @@ async fn existing_download(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn file_preference_score(file: &str) -> usize {
+pub(super) fn file_preference_score(file: &str) -> usize {
     if file.contains("-00001-of-") {
         return 0;
     }
@@ -601,4 +603,14 @@ async fn remote_size_label(url: &str) -> Option<String> {
         .parse::<u64>()
         .ok()?;
     Some(format_size_bytes(size))
+}
+
+pub(super) async fn remote_hf_size_label_with_api(
+    _api: &hf_hub::api::tokio::Api,
+    repo: &str,
+    revision: Option<&str>,
+    file: &str,
+) -> Option<String> {
+    let url = huggingface_resolve_url(repo, revision, file);
+    remote_size_label(&url).await
 }

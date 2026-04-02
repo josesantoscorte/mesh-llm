@@ -15,6 +15,7 @@ pub(super) async fn handle(
 ) -> anyhow::Result<()> {
     match (method, path_only) {
         ("GET", "/api/status") => handle_status(stream, state).await,
+        ("GET", "/api/models") => handle_models(stream, state).await,
         ("GET", "/api/runtime") => handle_runtime_status(stream, state).await,
         ("GET", "/api/runtime/processes") => handle_runtime_processes(stream, state).await,
         ("POST", "/api/runtime/models") => handle_load_model(stream, state, body).await,
@@ -31,6 +32,16 @@ async fn handle_status(stream: &mut TcpStream, state: &MeshApi) -> anyhow::Resul
         Ok(status) => respond_json(stream, 200, &status).await,
         Err(_) => respond_error(stream, 503, "Status temporarily unavailable").await,
     }
+}
+
+async fn handle_models(stream: &mut TcpStream, state: &MeshApi) -> anyhow::Result<()> {
+    let mesh_models = state.mesh_models().await;
+    respond_json(
+        stream,
+        200,
+        &serde_json::json!({ "mesh_models": mesh_models }),
+    )
+    .await
 }
 
 async fn handle_runtime_status(stream: &mut TcpStream, state: &MeshApi) -> anyhow::Result<()> {

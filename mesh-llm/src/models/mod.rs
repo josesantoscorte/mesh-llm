@@ -1,24 +1,32 @@
 pub mod capabilities;
 pub mod catalog;
+pub mod gguf;
+pub mod inventory;
 pub mod local;
+pub mod search;
+pub mod topology;
 mod maintenance;
 mod resolve;
 mod warnings;
 
 use anyhow::{Context, Result};
 use hf_hub::api::sync::{Api, ApiBuilder};
+use hf_hub::api::tokio::{Api as TokioApi, ApiBuilder as TokioApiBuilder};
 
-pub use capabilities::ModelCapabilities;
+pub use capabilities::{CapabilityLevel, ModelCapabilities};
+pub use inventory::{scan_local_inventory_snapshot_with_progress, LocalModelInventorySnapshot};
 pub use local::{
-    find_model_path, huggingface_hub_cache, huggingface_hub_cache_dir, legacy_models_dir,
-    legacy_models_present, model_dirs, path_is_in_legacy_models_dir, scan_installed_models,
-    scan_local_models,
+    exact_model_source_for_path, find_model_path, huggingface_hub_cache, huggingface_hub_cache_dir,
+    huggingface_identity_for_path, legacy_models_dir, legacy_models_present, model_dirs,
+    path_is_in_legacy_models_dir, scan_installed_models, scan_local_models,
 };
 pub use maintenance::{run_migrate, run_update, warn_about_updates_for_paths};
 pub use resolve::{
     download_exact_ref, find_catalog_model_exact, installed_model_capabilities,
-    installed_model_display_name, search_catalog_models, search_huggingface, show_exact_model,
+    installed_model_display_name, show_exact_model,
 };
+pub use search::{search_catalog_models, search_huggingface, SearchProgress};
+pub use topology::{infer_local_model_topology, ModelMoeInfo, ModelTopology};
 pub use warnings::warn_about_legacy_model_usage;
 
 fn build_hf_api(progress: bool) -> Result<Api> {
@@ -31,6 +39,20 @@ fn build_hf_api(progress: bool) -> Result<Api> {
     }
     builder = builder.with_token(hf_token_override());
     builder.build().context("Build Hugging Face API client")
+}
+
+fn build_hf_tokio_api(progress: bool) -> Result<TokioApi> {
+    let mut builder = TokioApiBuilder::from_cache(huggingface_hub_cache()).with_progress(progress);
+    if let Ok(endpoint) = std::env::var("HF_ENDPOINT") {
+        let endpoint = endpoint.trim();
+        if !endpoint.is_empty() {
+            builder = builder.with_endpoint(endpoint.to_string());
+        }
+    }
+    builder = builder.with_token(hf_token_override());
+    builder
+        .build()
+        .context("Build Hugging Face async API client")
 }
 
 fn hf_token_override() -> Option<String> {

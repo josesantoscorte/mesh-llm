@@ -56,4 +56,7 @@ pub(super) struct ApiInner {
     pub(super) runtime_control: Option<tokio::sync::mpsc::UnboundedSender<RuntimeControlRequest>>,
     pub(super) local_processes: Vec<RuntimeProcessPayload>,
     pub(super) sse_clients: Vec<tokio::sync::mpsc::UnboundedSender<String>>,
+    pub(super) inventory_scan_running: bool,
+    pub(super) inventory_scan_waiters:
+        Vec<tokio::sync::oneshot::Sender<crate::models::LocalModelInventorySnapshot>>,
 }
