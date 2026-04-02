@@ -495,7 +495,7 @@ export function ConfigPage({
 
             <PlacementModeDialog
               open={!!pendingModeSwitch}
-              pendingNodeId={pendingModeSwitch?.nodeId}
+              pendingNodeId={pendingModeSwitch?.nodeId ?? ''}
               onConfirm={handleConfirmModeSwitch}
               onCancel={handleCancelModeSwitch}
             />

@@ -2,12 +2,9 @@ import * as DialogPrimitive from "@radix-ui/react-dialog";
 
 import { Button } from "../ui/button";
 
-export type PlacementModeDialogProps = {
-  open: boolean;
-  pendingNodeId: string | undefined;
-  onConfirm: () => void;
-  onCancel: () => void;
-};
+export type PlacementModeDialogProps =
+  | { open: true; pendingNodeId: string; onConfirm: () => void; onCancel: () => void }
+  | { open: false; pendingNodeId?: string; onConfirm: () => void; onCancel: () => void };
 
 export function PlacementModeDialog({
   open,

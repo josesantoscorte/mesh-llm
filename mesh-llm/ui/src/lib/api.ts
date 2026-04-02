@@ -20,10 +20,10 @@ export async function broadcastConfig(
     }
     const body = await resp.json();
     return {
-      ok: body.failed.length === 0,
+      ok: (body.failed ?? []).length === 0,
       saved: body.saved,
       total: body.total,
-      failed: body.failed,
+      failed: body.failed ?? [],
     };
   } catch (e) {
     return { ok: false, error: `Network error: ${(e as Error).message}` };
@@ -59,10 +59,10 @@ export async function broadcastScan(): Promise<{
     }
     const body = await resp.json();
     return {
-      ok: body.failed.length === 0,
+      ok: (body.failed ?? []).length === 0,
       refreshed: body.refreshed,
       total: body.total,
-      failed: body.failed,
+      failed: body.failed ?? [],
     };
   } catch {
     return { ok: false };

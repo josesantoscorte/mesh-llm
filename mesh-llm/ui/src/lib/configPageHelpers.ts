@@ -47,18 +47,6 @@ export function configDerivedStatus(
   return { label: "Serving", tone: "serving" };
 }
 
-export function vramBytesFromStatus(
-  vramGb: number,
-  gpus?: { name: string; vram_bytes: number }[],
-) {
-  const gpuBytes = (gpus ?? []).reduce(
-    (total, gpu) => total + Math.max(0, gpu.vram_bytes || 0),
-    0,
-  );
-  if (gpuBytes > 0) return gpuBytes;
-  return Math.round(Math.max(0, vramGb) * 1e9);
-}
-
 export function getCrossNodeSplitGroupIds(config: MeshConfig): Set<string> {
   const splitGroupNodeCount = new Map<string, Set<string>>();
 

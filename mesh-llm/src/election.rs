@@ -353,7 +353,7 @@ pub async fn election_loop(
             .collect();
 
         // Determine this node identity for authored-split overrides
-        let my_node_id = node.id().fmt_short().to_string();
+        let my_node_id = node.id().to_string();
         // Compute manual splits for this node for the current model, if configured
         let manual_splits_for_node: Vec<ModelSplit> = {
             if let Some(node_cfg) = authored_config
@@ -1262,7 +1262,7 @@ async fn start_llama(
     };
 
     // If an authored manual split exists, prefer it over the VRAM-derived split.
-    let my_node_id = node.id().fmt_short().to_string();
+    let my_node_id = node.id().to_string();
     let authored_cfg_ref = authored_config.as_ref();
     let authored_node_config = authored_cfg_ref
         .nodes
@@ -1286,37 +1286,22 @@ async fn start_llama(
         .map(|s| vec![s])
         .unwrap_or_default();
 
-    // Compute the final tensor_split to pass to llama-server (prefer authored splits)
-    let final_tensor_split: Option<String> = if have_manual_split {
-        let total_layers = manual_total_layers as f64;
-        let host_layers: u32 = manual_splits_for_node
-            .iter()
-            .map(|s| s.end.saturating_sub(s.start))
-            .sum();
-        let host_frac = if total_layers > 0.0 {
-            host_layers as f64 / total_layers
-        } else {
-            0.0
-        };
-        let remotes = rpc_ports.len();
-        let mut weights = Vec::new();
-        if remotes > 0 {
-            let per = (1.0 - host_frac) / remotes as f64;
-            for _ in 0..remotes {
-                weights.push(per);
-            }
-        }
-        weights.push(host_frac);
-        Some(
-            weights
-                .iter()
-                .map(|f| format!("{:.6}", f))
-                .collect::<Vec<_>>()
-                .join(","),
-        )
+    let manual_tensor_split: Option<String> = if have_manual_split {
+        manual_splits_for_node.first().and_then(|host_split| {
+            compute_authored_tensor_split(
+                &authored_config.nodes,
+                &model_name,
+                host_split,
+                manual_total_layers,
+                rpc_ports.len(),
+            )
+        })
     } else {
-        auto_tensor_split.clone()
+        None
     };
+
+    let final_tensor_split: Option<String> =
+        manual_tensor_split.or_else(|| auto_tensor_split.clone());
 
     // Launch on ephemeral port
     let llama_port = match find_free_port().await {
@@ -1378,6 +1363,65 @@ async fn find_free_port() -> anyhow::Result<u16> {
     let port = listener.local_addr()?.port();
     drop(listener);
     Ok(port)
+}
+
+pub(crate) fn compute_authored_tensor_split(
+    authored_nodes: &[crate::config::AuthoredNodeConfig],
+    model_name: &str,
+    host_split: &ModelSplit,
+    total_layers: u32,
+    num_rpc: usize,
+) -> Option<String> {
+    if total_layers == 0 {
+        return None;
+    }
+
+    let mut authored_ranges: Vec<ModelSplit> = authored_nodes
+        .iter()
+        .filter_map(|node| {
+            node.models
+                .iter()
+                .find(|m| m.name == model_name)
+                .and_then(|m| m.split.clone())
+        })
+        .collect();
+
+    if authored_ranges.len() != num_rpc + 1 {
+        return None;
+    }
+
+    authored_ranges.sort_by_key(|s| s.start);
+
+    let mut expected_start = 0u32;
+    for split in &authored_ranges {
+        if split.start != expected_start || split.end < split.start {
+            return None;
+        }
+        expected_start = split.end;
+    }
+    if expected_start != total_layers {
+        return None;
+    }
+
+    let host_pos = authored_ranges
+        .iter()
+        .position(|s| s.start == host_split.start && s.end == host_split.end)?;
+
+    let host_range = authored_ranges.remove(host_pos);
+    let total_layers_f = total_layers as f64;
+    let mut weights: Vec<f64> = authored_ranges
+        .iter()
+        .map(|s| s.end.saturating_sub(s.start) as f64 / total_layers_f)
+        .collect();
+    weights.push(host_range.end.saturating_sub(host_range.start) as f64 / total_layers_f);
+
+    Some(
+        weights
+            .iter()
+            .map(|f| format!("{:.6}", f))
+            .collect::<Vec<_>>()
+            .join(","),
+    )
 }
 
 #[cfg(test)]
@@ -1716,5 +1760,141 @@ mod tests {
         let first = targets.get("qwen");
         let second = targets.get("qwen");
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn authored_tensor_split_uses_per_node_ranges_not_uniform_distribution() {
+        use crate::config::{AuthoredModelAssignment, AuthoredNodeConfig, ModelSplit};
+
+        let host_split = ModelSplit {
+            start: 30,
+            end: 40,
+            total: 40,
+        };
+        let worker_a_split = ModelSplit {
+            start: 0,
+            end: 10,
+            total: 40,
+        };
+        let worker_b_split = ModelSplit {
+            start: 10,
+            end: 30,
+            total: 40,
+        };
+
+        let nodes = vec![
+            AuthoredNodeConfig {
+                node_id: "host".to_string(),
+                hostname: None,
+                placement_mode: Default::default(),
+                models: vec![AuthoredModelAssignment {
+                    name: "llama3".to_string(),
+                    split: Some(host_split.clone()),
+                    model_key: None,
+                    path: None,
+                    ctx_size: None,
+                    moe_experts: None,
+                    gpu_index: None,
+                }],
+            },
+            AuthoredNodeConfig {
+                node_id: "worker-a".to_string(),
+                hostname: None,
+                placement_mode: Default::default(),
+                models: vec![AuthoredModelAssignment {
+                    name: "llama3".to_string(),
+                    split: Some(worker_a_split),
+                    model_key: None,
+                    path: None,
+                    ctx_size: None,
+                    moe_experts: None,
+                    gpu_index: None,
+                }],
+            },
+            AuthoredNodeConfig {
+                node_id: "worker-b".to_string(),
+                hostname: None,
+                placement_mode: Default::default(),
+                models: vec![AuthoredModelAssignment {
+                    name: "llama3".to_string(),
+                    split: Some(worker_b_split),
+                    model_key: None,
+                    path: None,
+                    ctx_size: None,
+                    moe_experts: None,
+                    gpu_index: None,
+                }],
+            },
+        ];
+
+        let result = compute_authored_tensor_split(&nodes, "llama3", &host_split, 40, 2);
+        let split_str = result.expect("should produce a tensor split");
+        let fracs: Vec<f64> = split_str
+            .split(',')
+            .map(|s| s.parse::<f64>().unwrap())
+            .collect();
+
+        assert_eq!(fracs.len(), 3);
+
+        let worker_a_frac = fracs[0];
+        let worker_b_frac = fracs[1];
+        let host_frac = fracs[2];
+
+        assert!(
+            (worker_a_frac - 0.25).abs() < 1e-6,
+            "worker-a (10/40) should be 0.25, got {worker_a_frac}"
+        );
+        assert!(
+            (worker_b_frac - 0.50).abs() < 1e-6,
+            "worker-b (20/40) should be 0.50, got {worker_b_frac}"
+        );
+        assert!(
+            (host_frac - 0.25).abs() < 1e-6,
+            "host (10/40) should be 0.25, got {host_frac}"
+        );
+
+        assert!(
+            (worker_a_frac - worker_b_frac).abs() > 0.1,
+            "workers with different authored ranges must not receive equal fractions"
+        );
+    }
+
+    #[test]
+    fn authored_config_lookup_uses_full_node_id_not_fmt_short() {
+        use crate::config::{AuthoredMeshConfig, AuthoredNodeConfig};
+
+        let id = {
+            let b = [7u8; 32];
+            SecretKey::from_bytes(&b).public()
+        };
+
+        let full_id = id.to_string();
+        let short_id = id.fmt_short().to_string();
+
+        assert_eq!(full_id.len(), 64);
+        assert_eq!(short_id.len(), 10);
+        assert!(full_id.starts_with(&short_id));
+
+        let config = AuthoredMeshConfig {
+            version: 1,
+            nodes: vec![AuthoredNodeConfig {
+                node_id: full_id.clone(),
+                hostname: None,
+                placement_mode: Default::default(),
+                models: vec![],
+            }],
+        };
+
+        let found_by_short = config.nodes.iter().find(|n| n.node_id == short_id);
+        assert!(
+            found_by_short.is_none(),
+            "fmt_short ({short_id}) must not match a config entry stored with the full node ID"
+        );
+
+        let found_by_full = config.nodes.iter().find(|n| n.node_id == full_id);
+        assert!(
+            found_by_full.is_some(),
+            "to_string() lookup must find the config entry"
+        );
     }
 }

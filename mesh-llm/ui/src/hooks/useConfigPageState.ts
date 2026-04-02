@@ -14,8 +14,8 @@ import {
   formatGb,
   modelNamesFromSizes,
   trustedOwnerFingerprint,
-  vramBytesFromStatus,
 } from "../lib/configPageHelpers";
+import { hardwareVramBytes } from "../lib/hardware";
 import type { MeshConfig, ModelAssignment, ScannedModel, ScannedModelMetadata } from "../types/config";
 import type { VramAssignment } from "../components/config/VramContainer";
 import type { NodeAssignTarget } from "../components/config/CatalogContextMenu";
@@ -102,7 +102,7 @@ export function useConfigPageState({
           ownerAwareStatus.my_hostname,
           ownerAwareStatus.node_id,
         ),
-        vramBytes: vramBytesFromStatus(
+        vramBytes: hardwareVramBytes(
           ownerAwareStatus.my_vram_gb,
           ownerAwareStatus.gpus,
         ),
@@ -122,7 +122,7 @@ export function useConfigPageState({
       peers.push({
         id: peer.id,
         hostname: normalizeHostname(peer.hostname, peer.id),
-        vramBytes: vramBytesFromStatus(peer.vram_gb, peer.gpus),
+        vramBytes: hardwareVramBytes(peer.vram_gb, peer.gpus),
         models: normalizeModels([
           ...peer.models,
           ...modelNamesFromSizes(peer.model_sizes),

@@ -16,7 +16,8 @@ mod tests {
         let fp = owner_fingerprint_from_key_material([0xAB; 32]);
         assert_eq!(fp.len(), 64, "fingerprint must be 64 hex chars");
         assert!(
-            fp.chars().all(|c| c.is_ascii_hexdigit()),
+            fp.chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
             "fingerprint must be lowercase hex"
         );
     }
@@ -26,6 +27,15 @@ mod tests {
         let fp1 = owner_fingerprint_from_key_material([0x01; 32]);
         let fp2 = owner_fingerprint_from_key_material([0x01; 32]);
         assert_eq!(fp1, fp2, "same key material must produce same fingerprint");
+    }
+
+    #[test]
+    fn fingerprint_is_lowercase() {
+        let fp = owner_fingerprint_from_key_material([0xCD; 32]);
+        assert!(
+            !fp.chars().any(|c| c.is_uppercase()),
+            "fingerprint must not contain uppercase characters, got: {fp}"
+        );
     }
 
     #[test]

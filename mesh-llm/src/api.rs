@@ -3120,7 +3120,10 @@ mod tests {
     #[test]
     fn test_build_gpus_reserved_defaults_to_zero() {
         let result = build_gpus(Some("NVIDIA RTX 5090"), Some("34359738368"), None, None);
-        assert_eq!(result[0].reserved_bytes, 0, "reserved_bytes defaults to 0 when not provided");
+        assert_eq!(
+            result[0].reserved_bytes, 0,
+            "reserved_bytes defaults to 0 when not provided"
+        );
     }
 
     #[test]

@@ -9,14 +9,10 @@ import {
   type GpuTarget,
   type ReportedGpu,
 } from '../lib/hardware';
+import { trustedOwnerFingerprint } from '../lib/configPageHelpers';
 import { normalizeHostname, normalizeModels } from '../lib/peer-utils';
 
 export type NodeStatusTone = 'serving' | 'host' | 'worker' | 'client' | 'idle';
-
-type OwnerFingerprintFields = Pick<
-  StatusPayload,
-  'owner_fingerprint' | 'owner_fingerprint_verified' | 'owner_fingerprint_transitive'
->;
 
 export type OwnedNode = {
   id: string;
@@ -78,14 +74,6 @@ function peerStatus(peer: StatusPayload['peers'][number]): { label: string; tone
 
 function sortByHostname(a: OwnedNode, b: OwnedNode) {
   return a.hostname.localeCompare(b.hostname, undefined, { sensitivity: 'base', numeric: true }) || a.id.localeCompare(b.id);
-}
-
-function trustedOwnerFingerprint(owner: OwnerFingerprintFields | null | undefined) {
-  const fingerprint = owner?.owner_fingerprint?.trim();
-  if (!fingerprint) return null;
-  if (owner?.owner_fingerprint_verified !== true) return null;
-  if (owner?.owner_fingerprint_transitive === true) return null;
-  return fingerprint;
 }
 
 export function useOwnedNodes(status: StatusPayload | null) {
