@@ -523,5 +523,7 @@ async fn fetch_remote_json(repo: &str, revision: Option<&str>, file: &str) -> Op
         }
         None => Repo::new(repo.to_string(), RepoType::Model),
     };
-    api.repo(repo).read_json(file).await.ok()
+    let path = api.repo(repo).get(file).await.ok()?;
+    let text = tokio::fs::read_to_string(path).await.ok()?;
+    serde_json::from_str(&text).ok()
 }
