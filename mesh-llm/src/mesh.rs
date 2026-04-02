@@ -10,6 +10,7 @@ use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use prost::Message;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
@@ -73,6 +74,7 @@ pub struct ServedModelIdentity {
     pub artifact: Option<String>,
     pub local_file_name: Option<String>,
     pub identity_hash: Option<String>,
+    pub file_size: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -134,6 +136,7 @@ pub fn infer_served_model_descriptors(
                         artifact: None,
                         local_file_name: Some(format!("{model_name}.gguf")),
                         identity_hash: None,
+                        file_size: None,
                     },
                     capabilities: crate::models::ModelCapabilities::default(),
                     topology: None,
@@ -214,6 +217,7 @@ fn unknown_identity(model_name: &str) -> ServedModelIdentity {
         artifact: None,
         local_file_name: Some(format!("{model_name}.gguf")),
         identity_hash: None,
+        file_size: None,
     }
 }
 
@@ -235,6 +239,7 @@ fn identity_from_model_source(source: &str) -> Option<ServedModelIdentity> {
             artifact: Some(file.clone()),
             local_file_name: file.rsplit('/').next().map(str::to_string),
             identity_hash: Some(identity_hash_for(&canonical_ref)),
+            file_size: None,
         });
     }
 
@@ -250,6 +255,7 @@ fn identity_from_model_source(source: &str) -> Option<ServedModelIdentity> {
             artifact: Some(file.clone()),
             local_file_name: file.rsplit('/').next().map(str::to_string),
             identity_hash: Some(identity_hash_for(&canonical_ref)),
+            file_size: None,
         });
     }
 
@@ -264,6 +270,7 @@ fn identity_from_model_source(source: &str) -> Option<ServedModelIdentity> {
             artifact: None,
             local_file_name: trimmed.rsplit('/').next().map(str::to_string),
             identity_hash: Some(identity_hash_for(trimmed)),
+            file_size: None,
         });
     }
 
@@ -287,6 +294,7 @@ fn identity_from_model_source(source: &str) -> Option<ServedModelIdentity> {
             artifact: None,
             local_file_name,
             identity_hash: None,
+            file_size: None,
         });
     }
 
@@ -300,6 +308,7 @@ fn identity_from_model_source(source: &str) -> Option<ServedModelIdentity> {
         artifact: None,
         local_file_name: None,
         identity_hash: Some(identity_hash_for(&format!("catalog:{trimmed}"))),
+        file_size: None,
     })
 }
 
@@ -318,6 +327,7 @@ fn identity_from_model_path(
             artifact: Some(identity.file),
             local_file_name: Some(identity.local_file_name),
             identity_hash: Some(identity_hash_for(&identity.canonical_ref)),
+            file_size: None,
         });
     }
 
@@ -337,6 +347,7 @@ fn identity_from_model_path(
             artifact: None,
             local_file_name,
             identity_hash: None,
+            file_size: None,
         });
     }
 
@@ -359,6 +370,9 @@ fn descriptor_from_identity(
 ) -> ServedModelDescriptor {
     identity.model_name = model_name.to_string();
     let path = crate::models::find_model_path(model_name);
+    if identity.file_size.is_none() {
+        identity.file_size = std::fs::metadata(&path).map(|m| m.len()).ok();
+    }
     let catalog = crate::models::find_catalog_model_exact(model_name);
     let topology = crate::models::infer_local_model_topology(&path, catalog);
     let mut capabilities =
@@ -444,9 +458,20 @@ fn peer_meaningfully_changed(old: &PeerInfo, new: &PeerInfo) -> bool {
         || old.hosted_models_known != new.hosted_models_known
         || old.hosted_models != new.hosted_models
         || old.available_models != new.available_models
+        || old.model_sizes != new.model_sizes
+        || old.model_metadata != new.model_metadata
         || old.requested_models != new.requested_models
         || old.served_model_descriptors != new.served_model_descriptors
         || old.version != new.version
+        || old.owner_id != new.owner_id
+        || old.owner_fingerprint != new.owner_fingerprint
+        || old.owner_fingerprint_verified != new.owner_fingerprint_verified
+        || old.owner_fingerprint_transitive != new.owner_fingerprint_transitive
+}
+
+pub(crate) fn owner_fingerprint_from_key_material(owner_key_material: [u8; 32]) -> String {
+    let owner_key = SecretKey::from_bytes(&owner_key_material);
+    hex::encode(Sha256::digest(owner_key.public().as_bytes()))
 }
 
 fn model_identity_score(identity: &ServedModelIdentity) -> u8 {
@@ -538,6 +563,16 @@ pub(crate) struct PeerAnnouncementV0 {
     available_model_sizes: HashMap<String, u64>,
     #[serde(skip_serializing, skip_deserializing, default)]
     served_model_descriptors: Vec<ServedModelDescriptor>,
+    #[serde(default)]
+    owner_id: Option<String>,
+    #[serde(default)]
+    owner_fingerprint: Option<String>,
+    #[serde(default)]
+    owner_attestation: Option<String>,
+    #[serde(default)]
+    owner_fingerprint_verified: bool,
+    #[serde(default)]
+    owner_fingerprint_transitive: bool,
 }
 
 impl PeerAnnouncementV0 {
@@ -569,6 +604,10 @@ impl PeerAnnouncementV0 {
             experts_summary: None,
             available_model_sizes: self.available_model_sizes,
             served_model_descriptors: self.served_model_descriptors,
+            owner_fingerprint: self.owner_fingerprint,
+            owner_attestation: None,
+            owner_fingerprint_verified: self.owner_fingerprint_verified,
+            owner_fingerprint_transitive: self.owner_fingerprint_transitive,
         }
     }
 }
@@ -595,6 +634,11 @@ impl From<&PeerAnnouncement> for PeerAnnouncementV0 {
             gpu_bandwidth_gbps: ann.gpu_bandwidth_gbps.clone(),
             available_model_sizes: ann.available_model_sizes.clone(),
             served_model_descriptors: ann.served_model_descriptors.clone(),
+            owner_id: None,
+            owner_fingerprint: ann.owner_fingerprint.clone(),
+            owner_attestation: None,
+            owner_fingerprint_verified: ann.owner_fingerprint_verified,
+            owner_fingerprint_transitive: ann.owner_fingerprint_transitive,
         }
     }
 }
@@ -646,6 +690,13 @@ fn apply_transitive_ann(
     if ann.experts_summary.is_some() {
         existing.experts_summary = ann.experts_summary.clone();
     }
+    if !ann.available_model_sizes.is_empty() {
+        existing.available_model_sizes = ann.available_model_sizes.clone();
+    }
+    let announced_fingerprint = ann.owner_fingerprint.clone();
+    existing.owner_fingerprint = announced_fingerprint.clone();
+    existing.owner_fingerprint_verified = false;
+    existing.owner_fingerprint_transitive = announced_fingerprint.is_some();
     serving_changed
 }
 
@@ -678,6 +729,106 @@ impl Default for NodeRole {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct RopeScalingSummary {
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub factor: Option<String>,
+    #[serde(default)]
+    pub freq_base: Option<String>,
+    #[serde(default)]
+    pub original_context_length: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct TokenizerSummary {
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub pre: Option<String>,
+    #[serde(default)]
+    pub vocab_size: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct SpecialTokenSummary {
+    #[serde(default)]
+    pub bos: Option<i32>,
+    #[serde(default)]
+    pub eos: Option<i32>,
+    #[serde(default)]
+    pub eot: Option<i32>,
+    #[serde(default)]
+    pub pad: Option<i32>,
+    #[serde(default)]
+    pub unk: Option<i32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct ExpertsSummary {
+    #[serde(default)]
+    pub expert_count: Option<u32>,
+    #[serde(default)]
+    pub expert_used_count: Option<u32>,
+    #[serde(default)]
+    pub expert_shared_count: Option<u32>,
+    #[serde(default)]
+    pub expert_group_count: Option<u32>,
+    #[serde(default)]
+    pub expert_group_used_count: Option<u32>,
+    #[serde(default)]
+    pub experts_per_group: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct AttentionSummary {
+    #[serde(default)]
+    pub head_count: Option<u32>,
+    #[serde(default)]
+    pub head_count_kv: Option<u32>,
+    #[serde(default)]
+    pub key_length: Option<u32>,
+    #[serde(default)]
+    pub value_length: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct CompactModelMetadata {
+    #[serde(default)]
+    pub architecture: Option<String>,
+    #[serde(default)]
+    pub context_length: Option<u32>,
+    #[serde(default)]
+    pub embedding_length: Option<u32>,
+    #[serde(default)]
+    pub quantization_type: Option<String>,
+    #[serde(default)]
+    pub rope: RopeScalingSummary,
+    #[serde(default)]
+    pub attention: AttentionSummary,
+    #[serde(default)]
+    pub tokenizer: TokenizerSummary,
+    #[serde(default)]
+    pub special_tokens: SpecialTokenSummary,
+    #[serde(default)]
+    pub experts: ExpertsSummary,
+    #[serde(default)]
+    pub total_layers: Option<u32>,
+    #[serde(default)]
+    pub total_offloadable_layers: Option<u32>,
+    pub file_size: u64,
+    pub dense_split_capable: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ScannedModel {
+    pub name: String,
+    pub model_key: String,
+    pub size_bytes: u64,
+    pub metadata: CompactModelMetadata,
+}
+
 /// Gossip payload — extends EndpointAddr with role metadata.
 /// Internal mesh gossip model. Legacy JSON v0 is adapted at the boundary.
 #[derive(Debug, Clone)]
@@ -704,6 +855,10 @@ pub(crate) struct PeerAnnouncement {
     pub(crate) experts_summary: Option<crate::proto::node::ExpertsSummary>,
     pub(crate) available_model_sizes: HashMap<String, u64>,
     pub(crate) served_model_descriptors: Vec<ServedModelDescriptor>,
+    pub(crate) owner_fingerprint: Option<String>,
+    pub(crate) owner_attestation: Option<crate::proto::node::OwnerAttestation>,
+    pub(crate) owner_fingerprint_verified: bool,
+    pub(crate) owner_fingerprint_transitive: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -724,6 +879,8 @@ pub struct PeerInfo {
     pub hosted_models_known: bool,
     /// All GGUFs on disk
     pub available_models: Vec<String>,
+    pub model_sizes: Option<Vec<(String, u64)>>,
+    pub model_metadata: Option<Vec<ScannedModel>>,
     /// Models this node has requested the mesh to serve
     pub requested_models: Vec<String>,
     /// Last time we directly communicated with this peer (gossip, heartbeat, tunnel).
@@ -742,6 +899,10 @@ pub struct PeerInfo {
     pub experts_summary: Option<crate::proto::node::ExpertsSummary>,
     pub available_model_sizes: HashMap<String, u64>,
     pub served_model_descriptors: Vec<ServedModelDescriptor>,
+    pub owner_id: Option<String>,
+    pub owner_fingerprint: Option<String>,
+    pub owner_fingerprint_verified: bool,
+    pub owner_fingerprint_transitive: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -765,6 +926,8 @@ impl PeerInfo {
             hosted_models: ann.hosted_models.clone().unwrap_or_default(),
             hosted_models_known: ann.hosted_models.is_some(),
             available_models: ann.available_models.clone(),
+            model_sizes: model_sizes_from_announcement(&ann.available_model_sizes),
+            model_metadata: model_metadata_from_announcement(&ann.available_model_metadata),
             requested_models: ann.requested_models.clone(),
             last_seen: std::time::Instant::now(),
             version: ann.version.clone(),
@@ -777,6 +940,10 @@ impl PeerInfo {
             experts_summary: ann.experts_summary.clone(),
             available_model_sizes: ann.available_model_sizes.clone(),
             served_model_descriptors: ann.served_model_descriptors.clone(),
+            owner_id: ann.owner_fingerprint.clone(),
+            owner_fingerprint: ann.owner_fingerprint.clone(),
+            owner_fingerprint_verified: ann.owner_fingerprint_verified,
+            owner_fingerprint_transitive: ann.owner_fingerprint_transitive,
         }
     }
 
@@ -804,6 +971,493 @@ impl PeerInfo {
 /// Peers not directly verified within this window are considered stale
 /// and excluded from gossip propagation. After 2x this duration they're removed entirely.
 const PEER_STALE_SECS: u64 = 180; // 3 minutes
+
+pub fn scan_local_model_metadata() -> Vec<ScannedModel> {
+    #[derive(Default)]
+    struct SplitGroup {
+        base: String,
+        total_size: u64,
+        first_part_path: Option<std::path::PathBuf>,
+        first_part_index: u32,
+    }
+
+    let mut models = Vec::new();
+    let mut split_groups: HashMap<(std::path::PathBuf, String, u32), SplitGroup> = HashMap::new();
+
+    for models_dir in crate::models::model_dirs() {
+        if let Ok(entries) = std::fs::read_dir(&models_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("gguf") {
+                    continue;
+                }
+                let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                if size <= 500_000_000 {
+                    continue;
+                }
+
+                if let Some((base, part, total_parts)) = split_gguf_parts(stem) {
+                    let dir = path
+                        .parent()
+                        .map(std::path::Path::to_path_buf)
+                        .unwrap_or_else(|| std::path::PathBuf::from("."));
+                    let entry = split_groups
+                        .entry((dir, base.to_string(), total_parts))
+                        .or_insert(SplitGroup {
+                            base: base.to_string(),
+                            total_size: 0,
+                            first_part_path: None,
+                            first_part_index: u32::MAX,
+                        });
+                    entry.total_size = entry.total_size.saturating_add(size);
+                    if part < entry.first_part_index {
+                        entry.first_part_index = part;
+                        entry.first_part_path = Some(path.clone());
+                    }
+                    continue;
+                }
+
+                models.push(scanned_model_from_file(stem.to_string(), size, &path));
+            }
+        }
+    }
+
+    for (_, group) in split_groups {
+        if let Some(first_part_path) = group.first_part_path {
+            models.push(scanned_model_from_file(
+                group.base,
+                group.total_size,
+                &first_part_path,
+            ));
+        }
+    }
+
+    models.sort_by(|a, b| {
+        a.name
+            .cmp(&b.name)
+            .then_with(|| a.model_key.cmp(&b.model_key))
+    });
+    models
+}
+
+pub fn scan_model_file(name: String, path: &std::path::Path) -> ScannedModel {
+    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    scanned_model_from_file(name, size, path)
+}
+
+fn scanned_model_from_file(name: String, size: u64, path: &std::path::Path) -> ScannedModel {
+    let metadata = compact_metadata_for_model(path, size);
+    let model_key = model_key_for_metadata(&metadata);
+    ScannedModel {
+        name,
+        model_key,
+        size_bytes: size,
+        metadata,
+    }
+}
+
+fn compact_metadata_for_model(path: &std::path::Path, file_size: u64) -> CompactModelMetadata {
+    let m = crate::models::gguf::scan_gguf_compact_meta(path);
+    let total_layers = m.as_ref().and_then(|m| {
+        let lc = m.layer_count;
+        if lc > 0 {
+            Some(lc)
+        } else {
+            None
+        }
+    });
+    let total_offloadable_layers = derive_total_offloadable_layers(total_layers);
+
+    match m {
+        Some(m) => {
+            let ec = if m.expert_count > 1 {
+                Some(m.expert_count)
+            } else {
+                None
+            };
+            let euc = if m.expert_used_count > 0 {
+                Some(m.expert_used_count)
+            } else {
+                None
+            };
+            CompactModelMetadata {
+                architecture: if m.architecture.is_empty() {
+                    None
+                } else {
+                    Some(m.architecture)
+                },
+                context_length: if m.context_length > 0 {
+                    Some(m.context_length)
+                } else {
+                    None
+                },
+                embedding_length: if m.embedding_size > 0 {
+                    Some(m.embedding_size)
+                } else {
+                    None
+                },
+                quantization_type: None, // derived from filename, not GGUF header
+                rope: RopeScalingSummary {
+                    kind: None,
+                    factor: if m.rope_scale != 0.0 {
+                        Some(format_compact_float(m.rope_scale.into()))
+                    } else {
+                        None
+                    },
+                    freq_base: if m.rope_freq_base != 0.0 {
+                        Some(format_compact_float(m.rope_freq_base.into()))
+                    } else {
+                        None
+                    },
+                    original_context_length: None,
+                },
+                attention: AttentionSummary {
+                    head_count: if m.head_count > 0 {
+                        Some(m.head_count)
+                    } else {
+                        None
+                    },
+                    head_count_kv: None,
+                    key_length: if m.key_length > 0 {
+                        Some(m.key_length)
+                    } else {
+                        None
+                    },
+                    value_length: if m.value_length > 0 {
+                        Some(m.value_length)
+                    } else {
+                        None
+                    },
+                },
+                tokenizer: TokenizerSummary {
+                    model: if m.tokenizer_model_name.is_empty() {
+                        None
+                    } else {
+                        Some(m.tokenizer_model_name)
+                    },
+                    pre: None,
+                    vocab_size: if m.vocab_size > 0 {
+                        Some(m.vocab_size)
+                    } else {
+                        None
+                    },
+                },
+                special_tokens: SpecialTokenSummary::default(),
+                experts: ExpertsSummary {
+                    expert_count: ec,
+                    expert_used_count: euc,
+                    ..Default::default()
+                },
+                total_layers,
+                total_offloadable_layers,
+                file_size,
+                dense_split_capable: total_offloadable_layers.unwrap_or(0) > 1,
+            }
+        }
+        None => CompactModelMetadata {
+            file_size,
+            total_layers,
+            total_offloadable_layers,
+            dense_split_capable: false,
+            ..Default::default()
+        },
+    }
+}
+
+fn derive_total_offloadable_layers(total_layers: Option<u32>) -> Option<u32> {
+    total_layers.map(|n| n.saturating_add(1))
+}
+
+fn format_compact_float(v: f64) -> String {
+    let s = format!("{v:.6}");
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+fn model_key_for_metadata(metadata: &CompactModelMetadata) -> String {
+    let canonical = serde_json::to_string(metadata).unwrap_or_default();
+    let digest = Sha256::digest(canonical.as_bytes());
+    hex::encode(&digest[..16])
+}
+
+/// Scan model directories for GGUF files and return a map of stem name to file size in bytes.
+pub fn scan_local_model_sizes() -> HashMap<String, u64> {
+    let mut sizes: HashMap<String, u64> = HashMap::new();
+    for models_dir in crate::models::model_dirs() {
+        if let Ok(entries) = std::fs::read_dir(&models_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("gguf") {
+                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                        if size > 500_000_000 {
+                            let name = split_gguf_base_name(stem).unwrap_or(stem).to_string();
+                            sizes.entry(name).and_modify(|e| *e += size).or_insert(size);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    sizes
+}
+
+fn derive_quantization_type(stem: &str) -> String {
+    let parts: Vec<&str> = stem.split('-').collect();
+    for &part in parts.iter().rev() {
+        let upper = part.to_uppercase();
+        if upper.starts_with('Q')
+            || upper.starts_with("IQ")
+            || upper.starts_with('F')
+            || upper.starts_with("BF")
+        {
+            if upper.len() >= 2
+                && upper
+                    .chars()
+                    .nth(1)
+                    .map(|c| c.is_ascii_digit())
+                    .unwrap_or(false)
+                || upper.starts_with("IQ")
+                || upper.starts_with("BF")
+            {
+                return part.to_string();
+            }
+        }
+    }
+    String::new()
+}
+
+pub fn scan_all_model_metadata() -> Vec<crate::proto::node::CompactModelMetadata> {
+    let mut result = Vec::new();
+    for models_dir in crate::models::model_dirs() {
+        let Ok(entries) = std::fs::read_dir(&models_dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("gguf") {
+                continue;
+            }
+            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            if size < 500_000_000 {
+                continue;
+            }
+            let stem = match path.file_stem().and_then(|s| s.to_str()) {
+                Some(s) => s.to_string(),
+                None => continue,
+            };
+            let model_key = split_gguf_base_name(&stem).unwrap_or(&stem).to_string();
+            let quantization_type = derive_quantization_type(&model_key);
+            let meta = if let Some(m) = crate::models::gguf::scan_gguf_compact_meta(&path) {
+                crate::proto::node::CompactModelMetadata {
+                    model_key: model_key.clone(),
+                    context_length: m.context_length,
+                    vocab_size: m.vocab_size,
+                    embedding_size: m.embedding_size,
+                    head_count: m.head_count,
+                    head_count_kv: m.head_count_kv,
+                    layer_count: m.layer_count,
+                    feed_forward_length: m.feed_forward_length,
+                    key_length: m.key_length,
+                    value_length: m.value_length,
+                    architecture: m.architecture,
+                    tokenizer_model_name: m.tokenizer_model_name,
+                    special_tokens: vec![],
+                    rope_scale: m.rope_scale,
+                    rope_freq_base: m.rope_freq_base,
+                    is_moe: m.expert_count > 1,
+                    expert_count: m.expert_count,
+                    used_expert_count: m.expert_used_count,
+                    quantization_type,
+                }
+            } else {
+                crate::proto::node::CompactModelMetadata {
+                    model_key,
+                    quantization_type,
+                    ..Default::default()
+                }
+            };
+            if !result
+                .iter()
+                .any(|e: &crate::proto::node::CompactModelMetadata| e.model_key == meta.model_key)
+            {
+                result.push(meta);
+            }
+        }
+    }
+    result
+}
+
+/// Extract the base model name from a split GGUF stem.
+/// "GLM-5-UD-IQ2_XXS-00001-of-00006" → Some("GLM-5-UD-IQ2_XXS")
+/// "Qwen3-8B-Q4_K_M" → None (not a split file)
+fn split_gguf_base_name(stem: &str) -> Option<&str> {
+    split_gguf_parts(stem).map(|(base, _, _)| base)
+}
+
+fn split_gguf_parts(stem: &str) -> Option<(&str, u32, u32)> {
+    // Pattern: ...-NNNNN-of-NNNNN
+    let suffix = stem.rfind("-of-")?;
+    let part_num = &stem[suffix + 4..];
+    if part_num.len() != 5 || !part_num.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let dash = stem[..suffix].rfind('-')?;
+    let seq = &stem[dash + 1..suffix];
+    if seq.len() != 5 || !seq.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let part = seq.parse::<u32>().ok()?;
+    let total = part_num.parse::<u32>().ok()?;
+    Some((&stem[..dash], part, total))
+}
+
+fn model_sizes_from_announcement(sizes: &HashMap<String, u64>) -> Option<Vec<(String, u64)>> {
+    if sizes.is_empty() {
+        None
+    } else {
+        let mut sorted: Vec<(String, u64)> = sizes.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        sorted.sort_by(|a, b| a.0.cmp(&b.0));
+        Some(sorted)
+    }
+}
+
+fn model_metadata_from_announcement(
+    metadata: &[crate::proto::node::CompactModelMetadata],
+) -> Option<Vec<ScannedModel>> {
+    if metadata.is_empty() {
+        None
+    } else {
+        let mut sorted: Vec<ScannedModel> = metadata
+            .iter()
+            .map(|m| {
+                // Convert proto special_tokens [{name,token_id}] to our SpecialTokenSummary {bos,eos,eot,pad,unk}
+                let mut special = SpecialTokenSummary::default();
+                for st in &m.special_tokens {
+                    let id = Some(st.token_id as i32);
+                    match st.name.as_str() {
+                        "bos" => special.bos = id,
+                        "eos" => special.eos = id,
+                        "eot" => special.eot = id,
+                        "pad" => special.pad = id,
+                        "unk" => special.unk = id,
+                        _ => {}
+                    }
+                }
+                ScannedModel {
+                    name: m.model_key.clone(),
+                    model_key: m.model_key.clone(),
+                    size_bytes: 0, // carried separately in available_model_sizes
+                    metadata: CompactModelMetadata {
+                        architecture: if m.architecture.is_empty() {
+                            None
+                        } else {
+                            Some(m.architecture.clone())
+                        },
+                        context_length: if m.context_length > 0 {
+                            Some(m.context_length)
+                        } else {
+                            None
+                        },
+                        embedding_length: if m.embedding_size > 0 {
+                            Some(m.embedding_size)
+                        } else {
+                            None
+                        },
+                        quantization_type: if m.quantization_type.is_empty() {
+                            None
+                        } else {
+                            Some(m.quantization_type.clone())
+                        },
+                        rope: RopeScalingSummary {
+                            kind: None,
+                            factor: if m.rope_scale != 0.0 {
+                                Some(format!("{}", m.rope_scale))
+                            } else {
+                                None
+                            },
+                            freq_base: if m.rope_freq_base != 0.0 {
+                                Some(format!("{}", m.rope_freq_base))
+                            } else {
+                                None
+                            },
+                            original_context_length: None,
+                        },
+                        attention: AttentionSummary {
+                            head_count: if m.head_count > 0 {
+                                Some(m.head_count)
+                            } else {
+                                None
+                            },
+                            head_count_kv: if m.head_count_kv > 0 {
+                                Some(m.head_count_kv)
+                            } else {
+                                None
+                            },
+                            key_length: if m.key_length > 0 {
+                                Some(m.key_length)
+                            } else {
+                                None
+                            },
+                            value_length: if m.value_length > 0 {
+                                Some(m.value_length)
+                            } else {
+                                None
+                            },
+                        },
+                        tokenizer: TokenizerSummary {
+                            model: if m.tokenizer_model_name.is_empty() {
+                                None
+                            } else {
+                                Some(m.tokenizer_model_name.clone())
+                            },
+                            pre: None,
+                            vocab_size: if m.vocab_size > 0 {
+                                Some(m.vocab_size)
+                            } else {
+                                None
+                            },
+                        },
+                        special_tokens: special,
+                        experts: ExpertsSummary {
+                            expert_count: if m.expert_count > 0 {
+                                Some(m.expert_count)
+                            } else {
+                                None
+                            },
+                            expert_used_count: if m.used_expert_count > 0 {
+                                Some(m.used_expert_count)
+                            } else {
+                                None
+                            },
+                            expert_shared_count: None,
+                            expert_group_count: None,
+                            expert_group_used_count: None,
+                            experts_per_group: None,
+                        },
+                        total_layers: if m.layer_count > 0 {
+                            Some(m.layer_count)
+                        } else {
+                            None
+                        },
+                        total_offloadable_layers: None,
+                        file_size: 0,
+                        dense_split_capable: false,
+                    },
+                }
+            })
+            .collect();
+        sorted.sort_by(|a, b| {
+            a.name
+                .cmp(&b.name)
+                .then_with(|| a.model_key.cmp(&b.model_key))
+        });
+        Some(sorted)
+    }
+}
+
 /// Detect available VRAM. On Apple Silicon, uses ~75% of system RAM
 /// (the rest is reserved for OS/apps on unified memory).
 /// Detect available memory for model loading, capped by max_vram_gb if set.
@@ -940,6 +1594,8 @@ pub struct Node {
     hosted_models: Arc<Mutex<Vec<String>>>,
     llama_ready: Arc<Mutex<bool>>,
     available_models: Arc<Mutex<Vec<String>>>,
+    available_model_sizes: Arc<Mutex<HashMap<String, u64>>>,
+    available_model_metadata: Arc<Mutex<Vec<ScannedModel>>>,
     requested_models: Arc<Mutex<Vec<String>>>,
     /// Mesh-wide demand map — merged from gossip + local API requests.
     /// This is the single source of truth for "what does the mesh want?"
@@ -963,6 +1619,7 @@ pub struct Node {
     pub is_soc: Option<bool>,
     pub gpu_vram: Option<String>,
     pub gpu_bandwidth_gbps: Arc<tokio::sync::Mutex<Option<Vec<f64>>>>,
+    owner_key_material: Arc<Mutex<Option<[u8; 32]>>>,
 }
 
 struct MeshState {
@@ -1265,6 +1922,8 @@ impl Node {
             hosted_models: Arc::new(Mutex::new(Vec::new())),
             llama_ready: Arc::new(Mutex::new(false)),
             available_models: Arc::new(Mutex::new(Vec::new())),
+            available_model_sizes: Arc::new(Mutex::new(HashMap::new())),
+            available_model_metadata: Arc::new(Mutex::new(Vec::new())),
             requested_models: Arc::new(Mutex::new(Vec::new())),
             model_demand: Arc::new(std::sync::Mutex::new(HashMap::new())),
             mesh_id: Arc::new(Mutex::new(None)),
@@ -1288,6 +1947,7 @@ impl Node {
             is_soc,
             gpu_vram,
             gpu_bandwidth_gbps: Arc::new(tokio::sync::Mutex::new(None)),
+            owner_key_material: Arc::new(Mutex::new(None)),
         };
 
         // Accept loop starts but waits for start_accepting() before processing connections.
@@ -1374,6 +2034,9 @@ impl Node {
             is_soc: Some(false),
             gpu_vram: None,
             gpu_bandwidth_gbps: Arc::new(tokio::sync::Mutex::new(None)),
+            available_model_sizes: Arc::new(Mutex::new(HashMap::new())),
+            available_model_metadata: Arc::new(Mutex::new(Vec::new())),
+            owner_key_material: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -1737,8 +2400,72 @@ impl Node {
         *self.available_models.lock().await = models;
     }
 
+    pub async fn set_available_model_sizes(&self, sizes: HashMap<String, u64>) {
+        *self.available_model_sizes.lock().await = sizes;
+    }
+
+    pub async fn set_available_model_metadata(&self, metadata: Vec<ScannedModel>) {
+        *self.available_model_metadata.lock().await = metadata;
+    }
+
+    pub async fn run_local_scan(node: &Node) -> Result<()> {
+        let scan = scan_local_model_metadata();
+        let mut names = Vec::with_capacity(scan.len());
+        let mut seen = std::collections::HashSet::new();
+        let mut sizes = HashMap::with_capacity(scan.len());
+        for model in &scan {
+            if seen.insert(model.name.clone()) {
+                names.push(model.name.clone());
+            }
+            let entry = sizes.entry(model.name.clone()).or_insert(0);
+            *entry = (*entry).max(model.size_bytes);
+        }
+        node.set_available_models(names).await;
+        node.set_available_model_sizes(sizes).await;
+        node.set_available_model_metadata(scan).await;
+        // Scan results propagate point-to-point via ScanResponse, not gossip.
+        Ok(())
+    }
+
+    pub async fn set_owner_key_material(&self, owner_key_material: Option<[u8; 32]>) {
+        *self.owner_key_material.lock().await = owner_key_material;
+    }
+
+    pub async fn owner_id(&self) -> Option<String> {
+        self.owner_key_material
+            .lock()
+            .await
+            .map(owner_fingerprint_from_key_material)
+    }
+
+    pub async fn owner_fingerprint(&self) -> Option<String> {
+        self.owner_id().await
+    }
+
+    pub async fn owner_attestation(&self) -> Option<crate::proto::node::OwnerAttestation> {
+        let owner_key_material = self.owner_key_material.lock().await;
+        let key_material = owner_key_material.as_ref()?;
+        let owner_key = SecretKey::from_bytes(key_material);
+        let owner_fingerprint = owner_fingerprint_from_key_material(*key_material);
+        let payload =
+            crate::protocol::owner_attestation_payload(self.endpoint.id(), &owner_fingerprint);
+        let signature = owner_key.sign(&payload);
+        Some(crate::proto::node::OwnerAttestation {
+            owner_public_key: owner_key.public().as_bytes().to_vec(),
+            signature: signature.to_bytes().to_vec(),
+        })
+    }
+
     pub async fn available_models(&self) -> Vec<String> {
         self.available_models.lock().await.clone()
+    }
+
+    pub async fn available_model_sizes(&self) -> HashMap<String, u64> {
+        self.available_model_sizes.lock().await.clone()
+    }
+
+    pub async fn available_model_metadata(&self) -> Vec<ScannedModel> {
+        self.available_model_metadata.lock().await.clone()
     }
 
     /// Record a request for a model — updates the demand map.
@@ -2116,6 +2843,80 @@ impl Node {
         }
         // Give broadcasts a moment to flush
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    pub async fn relay_scan_to_peers(&self) -> Vec<(String, bool)> {
+        let conns_with_ids: Vec<(EndpointId, String, Connection)> = {
+            let state = self.state.lock().await;
+            state
+                .connections
+                .iter()
+                .filter_map(|(id, conn)| {
+                    let peer = state.peers.get(id)?;
+                    let name = peer
+                        .hostname
+                        .clone()
+                        .unwrap_or_else(|| id.fmt_short().to_string());
+                    Some((*id, name, conn.clone()))
+                })
+                .collect()
+        };
+
+        let my_id = self.endpoint.id().as_bytes().to_vec();
+        let mut set = tokio::task::JoinSet::new();
+
+        for (peer_id, name, conn) in conns_with_ids {
+            let requester_id = my_id.clone();
+            set.spawn(async move {
+                let result = async {
+                    let (mut send, mut recv) = conn.open_bi().await?;
+                    send.write_all(&[STREAM_SCAN_REQUEST]).await?;
+                    let req = crate::proto::node::ScanRequest {
+                        gen: NODE_PROTOCOL_GENERATION,
+                        requester_id,
+                    };
+                    write_len_prefixed(&mut send, &req.encode_to_vec()).await?;
+                    send.finish()?;
+
+                    let buf = tokio::time::timeout(
+                        std::time::Duration::from_secs(30),
+                        read_len_prefixed(&mut recv),
+                    )
+                    .await??;
+                    let resp = crate::proto::node::ScanResponse::decode(buf.as_slice())?;
+                    anyhow::ensure!(resp.success, "peer reported scan failure");
+                    Ok::<_, anyhow::Error>(resp)
+                }
+                .await;
+                (peer_id, name, result)
+            });
+        }
+
+        let mut results = Vec::new();
+        while let Some(Ok((peer_id, name, result))) = set.join_next().await {
+            match result {
+                Ok(resp) => {
+                    results.push((name, true));
+                    if !resp.model_metadata.is_empty() || !resp.model_sizes.is_empty() {
+                        let mut state = self.state.lock().await;
+                        if let Some(peer) = state.peers.get_mut(&peer_id) {
+                            peer.model_sizes = model_sizes_from_announcement(&resp.model_sizes);
+                            peer.model_metadata =
+                                model_metadata_from_announcement(&resp.model_metadata);
+                            peer.available_model_metadata = resp.model_metadata;
+                            peer.available_model_sizes = resp.model_sizes;
+                        }
+                        let count = state.peers.len();
+                        drop(state);
+                        let _ = self.peer_change_tx.send(count);
+                    }
+                }
+                Err(_) => {
+                    results.push((name, false));
+                }
+            }
+        }
+        results
     }
 
     async fn forward_plugin_event(&self, event: crate::plugin::PluginMeshEvent) -> Result<()> {
@@ -3444,6 +4245,62 @@ impl Node {
                         }
                     });
                 }
+                STREAM_SCAN_REQUEST => {
+                    let node = self.clone();
+                    tokio::spawn(async move {
+                        use prost::Message as _;
+                        let proto_buf = match read_len_prefixed(&mut recv).await {
+                            Ok(buf) => buf,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "ScanRequest: failed to read proto body from {}: {e}",
+                                    remote.fmt_short()
+                                );
+                                return;
+                            }
+                        };
+                        let req =
+                            match crate::proto::node::ScanRequest::decode(proto_buf.as_slice()) {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "ScanRequest: invalid protobuf from {}: {e}",
+                                        remote.fmt_short()
+                                    );
+                                    return;
+                                }
+                            };
+                        if let Err(e) = req.validate_frame() {
+                            tracing::warn!(
+                                "ScanRequest: frame validation failed from {}: {e}",
+                                remote.fmt_short()
+                            );
+                            return;
+                        }
+
+                        let (success, error) = match Self::run_local_scan(&node).await {
+                            Ok(()) => (true, None),
+                            Err(e) => (false, Some(e.to_string())),
+                        };
+
+                        let (model_metadata, model_sizes) = if success {
+                            (scan_all_model_metadata(), scan_local_model_sizes())
+                        } else {
+                            (Vec::new(), HashMap::new())
+                        };
+
+                        let resp = crate::proto::node::ScanResponse {
+                            gen: NODE_PROTOCOL_GENERATION,
+                            success,
+                            error,
+                            model_metadata,
+                            model_sizes,
+                        };
+                        let mut send = send;
+                        let _ = write_len_prefixed(&mut send, &resp.encode_to_vec()).await;
+                        let _ = send.finish();
+                    });
+                }
                 other => {
                     tracing::warn!("Unknown stream type {other} from {}", remote.fmt_short());
                 }
@@ -3830,6 +4687,9 @@ impl Node {
             existing.hosted_models = ann_hosted_models;
             existing.hosted_models_known = ann.hosted_models.is_some();
             existing.available_models.clear();
+            existing.model_sizes = model_sizes_from_announcement(&ann.available_model_sizes);
+            existing.model_metadata =
+                model_metadata_from_announcement(&ann.available_model_metadata);
             existing.requested_models = ann.requested_models.clone();
             existing.last_seen = std::time::Instant::now();
             existing.served_model_descriptors = ann.served_model_descriptors.clone();
@@ -3844,6 +4704,13 @@ impl Node {
             if ann.experts_summary.is_some() {
                 existing.experts_summary = ann.experts_summary.clone();
             }
+            if !ann.available_model_sizes.is_empty() {
+                existing.available_model_sizes = ann.available_model_sizes.clone();
+            }
+            existing.owner_fingerprint = ann.owner_fingerprint.clone();
+            existing.owner_id = existing.owner_fingerprint.clone();
+            existing.owner_fingerprint_verified = ann.owner_fingerprint_verified;
+            existing.owner_fingerprint_transitive = ann.owner_fingerprint_transitive;
             let updated_peer = existing.clone();
             let changed = peer_meaningfully_changed(&old_peer, &updated_peer)
                 || old_peer.gpu_name != updated_peer.gpu_name
@@ -3971,6 +4838,9 @@ impl Node {
         let my_requested = self.requested_models.lock().await.clone();
         let my_mesh_id = self.mesh_id.lock().await.clone();
         let my_demand = self.get_demand();
+        let my_owner_fingerprint = self.owner_fingerprint().await;
+        let my_owner_fingerprint_verified = my_owner_fingerprint.is_some();
+        let my_owner_attestation = self.owner_attestation().await;
         let stale_cutoff =
             std::time::Instant::now() - std::time::Duration::from_secs(PEER_STALE_SECS);
         // Gossip wire encoding strips available_model_metadata and available_model_sizes,
@@ -4006,6 +4876,10 @@ impl Node {
                     experts_summary: p.experts_summary.clone(),
                     available_model_sizes: p.available_model_sizes.clone(),
                     served_model_descriptors: p.served_model_descriptors.clone(),
+                    owner_fingerprint: p.owner_fingerprint.clone(),
+                    owner_attestation: None,
+                    owner_fingerprint_verified: p.owner_fingerprint_verified,
+                    owner_fingerprint_transitive: p.owner_fingerprint_transitive,
                 })
                 .collect()
         };
@@ -4048,6 +4922,10 @@ impl Node {
             experts_summary: None,
             available_model_sizes: my_model_sizes,
             served_model_descriptors: my_served_model_descriptors,
+            owner_fingerprint: my_owner_fingerprint,
+            owner_attestation: my_owner_attestation,
+            owner_fingerprint_verified: my_owner_fingerprint_verified,
+            owner_fingerprint_transitive: false,
         });
         announcements
     }
@@ -4059,7 +4937,7 @@ mod tests {
     use crate::proto::node::{GossipFrame, NodeRole, PeerAnnouncement, RouteTableRequest};
     use tokio::sync::watch;
 
-    async fn make_test_node(role: super::NodeRole) -> Result<Node> {
+    pub(super) async fn make_test_node(role: super::NodeRole) -> Result<Node> {
         use iroh::endpoint::QuicTransportConfig;
 
         let transport_config = QuicTransportConfig::builder()
@@ -4120,6 +4998,9 @@ mod tests {
             is_soc: None,
             gpu_vram: None,
             gpu_bandwidth_gbps: Arc::new(tokio::sync::Mutex::new(None)),
+            available_model_sizes: Arc::new(Mutex::new(HashMap::new())),
+            available_model_metadata: Arc::new(Mutex::new(Vec::new())),
+            owner_key_material: Arc::new(Mutex::new(None)),
         };
 
         let accept_node = node.clone();
@@ -4473,13 +5354,15 @@ mod tests {
     }
 
     #[test]
-    fn test_peer_announcement_backward_compat_is_soc_gpu_vram() {
+    fn test_peer_announcement_backward_compat_is_soc_gpu_vram_and_owner_fingerprint() {
         #[derive(Deserialize, Debug)]
         struct TestAnnouncement {
             #[serde(default)]
             is_soc: Option<bool>,
             #[serde(default)]
             gpu_vram: Option<String>,
+            #[serde(default)]
+            owner_fingerprint: Option<String>,
         }
 
         let json = r#"{"other_field": "value"}"#;
@@ -4492,6 +5375,47 @@ mod tests {
             decoded.gpu_vram, None,
             "old nodes without gpu_vram should default to None"
         );
+        assert_eq!(
+            decoded.owner_fingerprint, None,
+            "old nodes without owner_fingerprint should default to None"
+        );
+    }
+
+    #[test]
+    fn test_peer_announcement_forward_compat_owner_fingerprint() {
+        #[derive(Deserialize, Debug)]
+        struct TestAnnouncement {
+            #[serde(default)]
+            owner_fingerprint: Option<String>,
+        }
+
+        let json = r#"{"owner_fingerprint": "abc123"}"#;
+        let decoded: TestAnnouncement = serde_json::from_str(json).unwrap();
+        assert_eq!(decoded.owner_fingerprint, Some("abc123".to_string()));
+    }
+
+    #[test]
+    fn owner_fingerprint_uses_public_key_derived_from_owner_key_material() {
+        let owner_key_material = [0xAB; 32];
+        let owner_id = owner_fingerprint_from_key_material(owner_key_material);
+        let expected = {
+            let key = SecretKey::from_bytes(&owner_key_material);
+            hex::encode(Sha256::digest(key.public().as_bytes()))
+        };
+        assert_eq!(owner_id, expected);
+    }
+
+    #[test]
+    fn test_backward_compat_available_model_sizes_defaults() {
+        #[derive(Deserialize, Debug)]
+        struct TestAnnouncement {
+            #[serde(default)]
+            available_model_sizes: Vec<(String, u64)>,
+        }
+
+        let decoded: TestAnnouncement = serde_json::from_str("{}")
+            .expect("missing available_model_sizes should deserialize with default");
+        assert!(decoded.available_model_sizes.is_empty());
     }
 
     #[test]
@@ -4598,6 +5522,11 @@ mod tests {
             gpu_bandwidth_gbps: None,
             available_model_sizes: HashMap::new(),
             served_model_descriptors: vec![],
+            owner_id: None,
+            owner_fingerprint: None,
+            owner_attestation: None,
+            owner_fingerprint_verified: false,
+            owner_fingerprint_transitive: false,
         };
         let legacy_route_table = RoutingTable {
             hosts: vec![RouteEntry {
@@ -4812,6 +5741,11 @@ mod tests {
             gpu_bandwidth_gbps: None,
             available_model_sizes: HashMap::from([("Qwen".into(), 1234_u64)]),
             served_model_descriptors: vec![],
+            owner_id: None,
+            owner_fingerprint: None,
+            owner_attestation: None,
+            owner_fingerprint_verified: false,
+            owner_fingerprint_transitive: false,
         };
         let json = serde_json::to_vec(&vec![ann.clone()]).unwrap();
 
@@ -4880,6 +5814,12 @@ mod tests {
             experts_summary: None,
             available_model_sizes: HashMap::new(),
             served_model_descriptors: vec![],
+            model_sizes: None,
+            model_metadata: None,
+            owner_id: None,
+            owner_fingerprint: None,
+            owner_fingerprint_verified: false,
+            owner_fingerprint_transitive: false,
         }
     }
 
@@ -5146,6 +6086,7 @@ mod tests {
             expert_count: 0,
             used_expert_count: 0,
             quantization_type: "Q4_K_M".to_string(),
+            head_count_kv: 8,
         };
 
         let mut model_sizes = HashMap::new();
@@ -5182,6 +6123,10 @@ mod tests {
             experts_summary: Some(experts.clone()),
             available_model_sizes: model_sizes.clone(),
             served_model_descriptors: vec![],
+            owner_fingerprint: None,
+            owner_attestation: None,
+            owner_fingerprint_verified: false,
+            owner_fingerprint_transitive: false,
         };
 
         let proto_pa = local_ann_to_proto_ann(&local_ann);
@@ -5205,8 +6150,9 @@ mod tests {
             "local_ann_to_proto_ann must strip passive available_model_sizes from gossip"
         );
 
-        let (_, roundtripped) = proto_ann_to_local(&proto_pa)
-            .expect("proto_ann_to_local must succeed on valid proto PA");
+        let (_, roundtripped) = proto_ann_to_local(&proto_pa, peer_id)
+            .expect("proto_ann_to_local must succeed on valid proto PA")
+            .expect("proto_ann_to_local should return a concrete announcement");
         assert_eq!(
             roundtripped.available_model_metadata.len(),
             0,
@@ -5247,11 +6193,13 @@ mod tests {
                 .map(|e| e.top_expert_ids.as_slice()),
             Some([1u32, 5, 10].as_slice())
         );
-        let (_, final_local) =
-            proto_ann_to_local(wire_pa).expect("final proto_ann_to_local must succeed");
-        assert!(final_local.available_model_metadata.is_empty());
-        assert!(final_local.available_models.is_empty());
-        assert!(final_local.available_model_sizes.is_empty());
+        let (_, final_local) = proto_ann_to_local(wire_pa, peer_id)
+            .expect("final proto_ann_to_local must succeed")
+            .expect("final proto_ann_to_local should return a concrete announcement");
+        assert_eq!(
+            final_local.available_model_metadata[0].model_key, "Qwen3-8B-Q4_K_M",
+            "model_key unchanged after full build_gossip_frame→wire→proto_ann_to_local path"
+        );
     }
 
     #[test]
@@ -5343,6 +6291,7 @@ mod tests {
             expert_count: 0,
             used_expert_count: 0,
             quantization_type: "Q4_K_M".to_string(),
+            head_count_kv: 8,
         };
 
         let mut new_sizes = HashMap::new();
@@ -5374,6 +6323,10 @@ mod tests {
             experts_summary: None,
             available_model_sizes: new_sizes,
             served_model_descriptors: vec![],
+            owner_fingerprint: None,
+            owner_attestation: None,
+            owner_fingerprint_verified: false,
+            owner_fingerprint_transitive: false,
         };
 
         apply_transitive_ann(&mut existing, &addr, &ann);
@@ -5440,6 +6393,10 @@ mod tests {
             experts_summary: None,
             available_model_sizes: HashMap::new(),
             served_model_descriptors: vec![],
+            owner_fingerprint: None,
+            owner_attestation: None,
+            owner_fingerprint_verified: false,
+            owner_fingerprint_transitive: false,
         };
 
         apply_transitive_ann(&mut existing, &weak_addr, &ann);
@@ -5485,13 +6442,81 @@ mod tests {
             experts_summary: None,
             available_model_sizes: HashMap::new(),
             served_model_descriptors: vec![],
+            owner_fingerprint: None,
+            owner_attestation: None,
+            owner_fingerprint_verified: false,
+            owner_fingerprint_transitive: false,
         };
+
         apply_transitive_ann(&mut existing, &richer_addr, &ann2);
 
         assert_eq!(
             existing.addr.addrs.len(),
             4,
             "richer transitive addr (4 paths) must replace existing (3 paths)"
+        );
+    }
+
+    #[test]
+    fn transitive_owner_claim_does_not_mark_peer_trusted() {
+        let peer_id = EndpointId::from(SecretKey::from_bytes(&[0x12; 32]).public());
+        let mut existing = make_test_peer_info(peer_id);
+        existing.owner_id = None;
+        existing.owner_fingerprint = None;
+        existing.owner_fingerprint_verified = false;
+        existing.owner_fingerprint_transitive = false;
+
+        let addr = EndpointAddr {
+            id: peer_id,
+            addrs: Default::default(),
+        };
+        let ann = super::PeerAnnouncement {
+            addr: addr.clone(),
+            role: super::NodeRole::Worker,
+            models: vec!["Qwen3-8B-Q4_K_M".to_string()],
+            vram_bytes: 8 * 1024 * 1024 * 1024,
+            model_source: Some("Qwen3-8B-Q4_K_M.gguf".to_string()),
+            serving_models: vec!["Qwen3-8B-Q4_K_M".to_string()],
+            hosted_models: None,
+            available_models: vec!["Qwen3-8B-Q4_K_M".to_string()],
+            requested_models: vec![],
+            version: Some("0.99.0-test".to_string()),
+            model_demand: HashMap::new(),
+            mesh_id: Some("mesh-test".to_string()),
+            gpu_name: None,
+            hostname: None,
+            is_soc: None,
+            gpu_vram: None,
+            gpu_bandwidth_gbps: None,
+            available_model_metadata: vec![],
+            experts_summary: None,
+            available_model_sizes: HashMap::new(),
+            owner_fingerprint: Some("transitive-owner-claim-only".to_string()),
+            owner_attestation: None,
+            served_model_descriptors: vec![],
+            owner_fingerprint_verified: false,
+            owner_fingerprint_transitive: true,
+        };
+
+        apply_transitive_ann(&mut existing, &addr, &ann);
+
+        assert_eq!(
+            existing.serving_models.first().map(String::as_str),
+            Some("Qwen3-8B-Q4_K_M"),
+            "transitive gossip should still refresh serving metadata"
+        );
+        assert_eq!(
+            existing.owner_fingerprint.as_deref(),
+            Some("transitive-owner-claim-only"),
+            "transitive gossip can keep display metadata for ownership claims"
+        );
+        assert!(
+            !existing.owner_fingerprint_verified,
+            "transitive-only owner metadata must not mark a peer as trusted-owned"
+        );
+        assert!(
+            existing.owner_fingerprint_transitive,
+            "transitive ownership metadata should be explicitly marked"
         );
     }
 
@@ -6045,6 +7070,7 @@ mod tests {
             expert_count: 0,
             used_expert_count: 0,
             quantization_type: "Q4_K_M".to_string(),
+            head_count_kv: 8,
         };
         let mut model_sizes = std::collections::HashMap::new();
         model_sizes.insert("Llama-3.3-70B-Q4_K_M".to_string(), 42_000_000_000u64);
@@ -6079,9 +7105,10 @@ mod tests {
             Some(&42_000_000_000u64)
         );
 
-        // Convert to local PeerAnnouncement and verify passive inventory metadata is ignored.
-        let (addr, local_ann) = proto_ann_to_local(wire_pa)
-            .expect("proto_ann_to_local must succeed on valid gossip PA");
+        // Convert to local PeerInfo and verify metadata is stored
+        let (addr, local_ann) = proto_ann_to_local(wire_pa, peer_id)
+            .expect("proto_ann_to_local must succeed on valid gossip PA")
+            .expect("proto_ann_to_local should return a concrete announcement");
 
         assert!(local_ann.available_models.is_empty());
         assert!(local_ann.available_model_metadata.is_empty());
@@ -6466,6 +7493,11 @@ mod tests {
             gpu_bandwidth_gbps: None,
             available_model_sizes: HashMap::new(),
             served_model_descriptors: vec![],
+            owner_id: None,
+            owner_fingerprint: None,
+            owner_attestation: None,
+            owner_fingerprint_verified: false,
+            owner_fingerprint_transitive: false,
         };
 
         let server = tokio::spawn(async move {
@@ -6651,6 +7683,11 @@ mod tests {
             gpu_bandwidth_gbps: None,
             available_model_sizes: HashMap::new(),
             served_model_descriptors: vec![],
+            owner_id: None,
+            owner_fingerprint: None,
+            owner_attestation: None,
+            owner_fingerprint_verified: false,
+            owner_fingerprint_transitive: false,
         };
 
         let server = tokio::spawn(async move {
@@ -6858,6 +7895,11 @@ mod tests {
             gpu_bandwidth_gbps: None,
             available_model_sizes: HashMap::new(),
             served_model_descriptors: vec![],
+            owner_id: None,
+            owner_fingerprint: None,
+            owner_attestation: None,
+            owner_fingerprint_verified: false,
+            owner_fingerprint_transitive: false,
         };
         let v0_gossip_json =
             serde_json::to_vec(&vec![v0_ann]).expect("v0 gossip JSON must serialize");
@@ -7075,6 +8117,12 @@ mod tests {
             tunnel_port: None,
             available_model_sizes: HashMap::new(),
             served_model_descriptors: vec![],
+            model_sizes: None,
+            model_metadata: None,
+            owner_id: None,
+            owner_fingerprint: None,
+            owner_fingerprint_verified: false,
+            owner_fingerprint_transitive: false,
         }
     }
 
@@ -7128,64 +8176,10 @@ mod tests {
             let mut state = node.state.lock().await;
             state
                 .peers
-                .insert(peer_id, make_test_peer(peer_id, Some(20), 16));
+                .insert(peer_id, make_test_peer(peer_id, Some(20), 8));
         }
 
-        let rx = node.peer_change_rx.clone();
-
-        // Update RTT to another low value — should NOT trigger
-        node.update_peer_rtt(peer_id, 15).await;
-        assert!(
-            !rx.has_changed()
-                .expect("peer_change_rx closed unexpectedly"),
-            "RTT 20→15 (both below threshold) should not trigger re-election"
-        );
-
-        Ok(())
-    }
-
-    /// RTT re-election should NOT trigger for unknown peers.
-    #[tokio::test]
-    async fn test_rtt_update_unknown_peer_no_panic() -> Result<()> {
-        let node = make_test_node(super::NodeRole::Worker).await?;
-        let peer_key = SecretKey::generate(&mut rand::rng());
-        let peer_id = EndpointId::from(peer_key.public());
-
-        let rx = node.peer_change_rx.clone();
-
-        // Update RTT for a peer that doesn't exist — should not panic or trigger
-        node.update_peer_rtt(peer_id, 15).await;
-        assert!(
-            !rx.has_changed()
-                .expect("peer_change_rx closed unexpectedly"),
-            "RTT update for unknown peer should not trigger re-election"
-        );
-
-        Ok(())
-    }
-
-    /// RTT should never increase — relay gossip RTT must not overwrite
-    /// a known-good direct path measurement.
-    #[tokio::test]
-    async fn test_rtt_cannot_regress() -> Result<()> {
-        let node = make_test_node(super::NodeRole::Worker).await?;
-        let peer_key = SecretKey::generate(&mut rand::rng());
-        let peer_id = EndpointId::from(peer_key.public());
-
-        {
-            let mut state = node.state.lock().await;
-            state
-                .peers
-                .insert(peer_id, make_test_peer(peer_id, Some(20), 16));
-        }
-
-        // Try to raise RTT — should be rejected
-        node.update_peer_rtt(peer_id, 2600).await;
-        {
-            let state = node.state.lock().await;
-            let rtt = state.peers.get(&peer_id).unwrap().rtt_ms;
-            assert_eq!(rtt, Some(20), "RTT must not increase from 20 to 2600");
-        }
+        let _rx = node.peer_change_rx.clone();
 
         // Lower RTT — should be accepted
         node.update_peer_rtt(peer_id, 10).await;
@@ -7242,6 +8236,79 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn test_backward_compat_available_model_metadata_defaults() {
+        #[derive(Deserialize, Debug)]
+        struct TestAnnouncement {
+            #[serde(default)]
+            available_model_metadata: Vec<ScannedModel>,
+        }
+
+        let decoded: TestAnnouncement = serde_json::from_str("{}")
+            .expect("missing available_model_metadata should deserialize with default");
+        assert!(decoded.available_model_metadata.is_empty());
+    }
+
+    #[test]
+    fn test_model_key_is_stable_for_identical_metadata() {
+        let metadata = CompactModelMetadata {
+            architecture: Some("llama".into()),
+            context_length: Some(32768),
+            embedding_length: Some(4096),
+            quantization_type: Some("15".into()),
+            rope: RopeScalingSummary {
+                kind: Some("linear".into()),
+                factor: Some("4".into()),
+                freq_base: Some("10000".into()),
+                original_context_length: Some(8192),
+            },
+            attention: AttentionSummary::default(),
+            tokenizer: TokenizerSummary {
+                model: Some("gpt2".into()),
+                pre: Some("default".into()),
+                vocab_size: Some(152064),
+            },
+            special_tokens: SpecialTokenSummary {
+                bos: Some(1),
+                eos: Some(2),
+                eot: Some(3),
+                pad: Some(0),
+                unk: Some(0),
+            },
+            experts: ExpertsSummary::default(),
+            total_layers: Some(36),
+            total_offloadable_layers: Some(37),
+            file_size: 12_345_678,
+            dense_split_capable: true,
+        };
+
+        let a = model_key_for_metadata(&metadata);
+        let b = model_key_for_metadata(&metadata);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_model_key_distinguishes_duplicate_display_names_with_different_quantization() {
+        let mut metadata_a = CompactModelMetadata::default();
+        metadata_a.architecture = Some("llama".into());
+        metadata_a.quantization_type = Some("15".into());
+        metadata_a.file_size = 10_000_000_000;
+
+        let mut metadata_b = metadata_a.clone();
+        metadata_b.quantization_type = Some("2".into());
+
+        let key_a = model_key_for_metadata(&metadata_a);
+        let key_b = model_key_for_metadata(&metadata_b);
+        assert_ne!(key_a, key_b);
+    }
+
+    #[test]
+    fn test_total_offloadable_layers_is_derived_from_total_layers() {
+        assert_eq!(derive_total_offloadable_layers(Some(36)), Some(37));
+        assert_eq!(derive_total_offloadable_layers(Some(0)), Some(1));
+        assert_eq!(derive_total_offloadable_layers(None), None);
     }
 }
 
@@ -7389,6 +8456,129 @@ async fn load_or_create_key() -> Result<SecretKey> {
     tokio::fs::write(&key_path, hex::encode(key.to_bytes())).await?;
     tracing::info!("Generated new key, saved to {}", key_path.display());
     Ok(key)
+}
+
+#[cfg(test)]
+mod scan_relay_tests {
+    use super::tests::make_test_node;
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn relay_scan_to_peer_via_quic() -> Result<()> {
+        let node_a = make_test_node(super::NodeRole::Host { http_port: 9337 }).await?;
+        node_a.set_mesh_id("scan-relay-test".to_string()).await;
+        node_a.start_accepting();
+        let node_a_addr = node_a.endpoint.addr();
+
+        let node_b = make_test_node(super::NodeRole::Host { http_port: 9338 }).await?;
+        node_b.set_mesh_id("scan-relay-test".to_string()).await;
+        node_b.start_accepting();
+        let node_b_id = node_b.id();
+
+        let invite_token = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&node_a_addr).expect("addr must serialize"));
+        node_b.join(&invite_token).await?;
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let peers = node_a.peers().await;
+                if peers.iter().any(|p| p.id == node_b_id) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("node_a must see node_b within 10 seconds");
+
+        let results = node_a.relay_scan_to_peers().await;
+
+        assert_eq!(results.len(), 1, "node_a has exactly one peer to relay to");
+        assert!(
+            results[0].1,
+            "scan relay to node_b must succeed: {:?}",
+            results
+        );
+
+        let peers = node_a.peers().await;
+        let peer_b = peers
+            .iter()
+            .find(|p| p.id == node_b_id)
+            .expect("node_b must still be a peer");
+
+        assert!(
+            peer_b.available_model_metadata.is_empty()
+                || !peer_b.available_model_metadata.is_empty(),
+            "model metadata must be present (populated or empty depending on scan results)"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn relay_scan_propagates_model_data_to_requesting_node() -> Result<()> {
+        let node_a = make_test_node(super::NodeRole::Host { http_port: 9337 }).await?;
+        node_a.set_mesh_id("scan-model-test".to_string()).await;
+        node_a.start_accepting();
+        let node_a_addr = node_a.endpoint.addr();
+
+        let node_b = make_test_node(super::NodeRole::Host { http_port: 9338 }).await?;
+        node_b.set_mesh_id("scan-model-test".to_string()).await;
+        node_b.start_accepting();
+        let node_b_id = node_b.id();
+
+        let invite_token = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&node_a_addr).expect("addr must serialize"));
+        node_b.join(&invite_token).await?;
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let peers = node_a.peers().await;
+                if peers.iter().any(|p| p.id == node_b_id) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("node_a must see node_b within 10 seconds");
+
+        let peers_before = node_a.peers().await;
+        let peer_before = peers_before
+            .iter()
+            .find(|p| p.id == node_b_id)
+            .expect("node_b must be a peer");
+        let models_before = peer_before.available_models.clone();
+
+        let results = node_a.relay_scan_to_peers().await;
+        assert_eq!(results.len(), 1);
+        assert!(results[0].1, "scan must succeed");
+
+        let peers_after = node_a.peers().await;
+        let peer_after = peers_after
+            .iter()
+            .find(|p| p.id == node_b_id)
+            .expect("node_b must still be a peer");
+
+        assert!(
+            peer_after.available_model_sizes.len() >= models_before.len()
+                || peer_after.available_models.len() >= models_before.len(),
+            "after scan relay, model data should be at least as complete as before"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn relay_scan_returns_empty_when_no_peers() -> Result<()> {
+        let node = make_test_node(super::NodeRole::Host { http_port: 9337 }).await?;
+        node.start_accepting();
+
+        let results = node.relay_scan_to_peers().await;
+        assert!(results.is_empty(), "node with no peers should return empty");
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]

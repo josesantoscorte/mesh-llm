@@ -249,6 +249,29 @@ curl localhost:3131/api/discover # Nostr meshes (current mesh marked by mesh_id)
 - Verify the proxy closes the routed connection after the first response.
 - Verify the upstream-observed request includes `Connection: close`.
 
+### 25. Owner-key bootstrap and trusted ownership
+
+```bash
+cargo test -p mesh-llm tests::owner_key_bootstrap_replaces_legacy_owner_secret -- --exact
+cargo test -p mesh-llm mesh::tests::transitive_owner_claim_does_not_mark_peer_trusted -- --exact
+```
+
+- Ownership identity must come from owner key material (`~/.mesh-llm/owner-key` or `--owner-key`).
+- Trusted same-owner behavior must require direct owner-attestation verification.
+- Transitive ownership metadata must remain display-only.
+
+### 26. Signed config authorization matrix
+
+```bash
+cargo test -p mesh-llm api::tests::config_requires_valid_owner_signature -- --exact
+cargo test -p mesh-llm api::tests::stale_prev_config_hash_returns_conflict -- --exact
+cargo test -p mesh-llm api::tests::config_broadcast_requires_loopback_origin -- --exact
+```
+
+- `POST /api/config` must reject missing/invalid/wrong-owner/stale signatures.
+- `POST /api/config` must reject stale lineage (`prev_config_hash` mismatch).
+- `POST /api/config/broadcast` must reject non-loopback callers.
+
 ## Resilience
 
 ### 11. Dead peer cleanup
@@ -360,3 +383,55 @@ pkill -f mesh-llm; pkill -f rpc-server; pkill -f llama-server
 ```
 
 Always kill all three — child processes can orphan.
+
+## GPU Placement
+
+### Unit tests
+
+Run the placement-specific UI unit tests:
+
+```bash
+cd mesh-llm/ui && npm test -- \
+  src/lib/__tests__/config.test.ts \
+  src/lib/__tests__/vram.test.ts \
+  src/hooks/__tests__/useOwnedNodes.test.ts \
+  src/components/config/__tests__/ConfigPage.test.tsx \
+  src/components/config/__tests__/ConfigNodeSection.test.tsx \
+  src/components/config/__tests__/VramContainer.test.tsx \
+  src/components/config/__tests__/ModelCatalog.drag.test.tsx \
+  src/components/config/__tests__/SaveConfig.test.tsx
+```
+
+**Known pre-existing failure**: `vram.test.ts` has one failing test (`estimateAssignmentBreakdownBytes > falls back to the legacy estimate when metadata is unavailable`) that predates this feature. It is not caused by GPU placement changes and can be ignored.
+
+### E2E smoke test
+
+```bash
+cd mesh-llm/ui && npm run test:e2e -- smoke.spec.ts
+```
+
+### Rust placement tests
+
+```bash
+cargo test --release authored_config gpu_placement placement_validation launch_device
+```
+
+This runs tests covering:
+- `authored_config` — schema v3 round-trip, v2 migration defaults
+- `gpu_placement` — pooled vs separate mode serialization
+- `placement_validation` — out-of-range `gpu_index` error paths
+- `launch_device` — `resolve_gpu_ordinal` ordinal-to-device mapping
+
+### Full build
+
+```bash
+just build
+```
+
+### What to verify
+
+- Pooled mode config (`placement_mode = "pooled"`) loads and launches without `gpu_index`
+- Separate mode config (`placement_mode = "separate"`, `gpu_index = 0`) launches on the correct device
+- A v2 config (no `placement_mode` field) loads and defaults to pooled mode
+- An out-of-range `gpu_index` produces an explicit error, not a silent fallback
+- Mixed-GPU nodes show a warning in the UI when using separate mode

@@ -14,9 +14,17 @@
 //! The dashboard is mostly read-only — shows status, topology, and models.
 //! Local model load/unload is exposed for operator control.
 
+use crate::config::{
+    mesh_config_path, node_config_path, AuthoredMeshConfig, NodeConfig, PlacementMode,
+    AUTHORED_CONFIG_VERSION,
+};
 use crate::{affinity, election, mesh, nostr, plugin, proxy};
+use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
 use include_dir::{include_dir, Dir};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
@@ -24,6 +32,12 @@ use tokio::sync::{watch, Mutex};
 
 static CONSOLE_DIST: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/ui/dist");
 const MESH_LLM_VERSION: &str = crate::VERSION;
+const CONFIG_TIMESTAMP_MAX_AGE_SECS: i64 = 60 * 60 * 24 * 365;
+const CONFIG_TIMESTAMP_MAX_FUTURE_SKEW_SECS: i64 = 60 * 15;
+const CONFIG_SIGNATURE_HEADER: &str = "X-Mesh-Config-Signature";
+const CONFIG_OWNER_FINGERPRINT_HEADER: &str = "X-Mesh-Owner-Fingerprint";
+const CONFIG_TIMESTAMP_HEADER: &str = "X-Mesh-Config-Timestamp";
+const CONFIG_PREV_HASH_HEADER: &str = "X-Mesh-Prev-Config-Hash";
 
 // ── Shared state ──
 
@@ -164,8 +178,14 @@ struct StatusPayload {
     nostr_discovery: bool,
     my_hostname: Option<String>,
     my_is_soc: Option<bool>,
+    owner_id: Option<String>,
+    owner_fingerprint: Option<String>,
+    owner_fingerprint_verified: bool,
+    owner_fingerprint_transitive: bool,
     gpus: Vec<GpuEntry>,
     routing_affinity: affinity::AffinityStatsSnapshot,
+    model_sizes: Vec<(String, u64)>,
+    model_scans: Vec<mesh::ScannedModel>,
 }
 
 #[derive(Serialize)]
@@ -187,7 +207,55 @@ struct PeerPayload {
     rtt_ms: Option<u32>,
     hostname: Option<String>,
     is_soc: Option<bool>,
+    owner_id: Option<String>,
+    owner_fingerprint: Option<String>,
+    owner_fingerprint_verified: bool,
+    owner_fingerprint_transitive: bool,
     gpus: Vec<GpuEntry>,
+    model_sizes: Option<Vec<(String, u64)>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_scans: Option<Vec<mesh::ScannedModel>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct ConfigValidationError {
+    code: String,
+    path: String,
+    message: String,
+}
+
+#[derive(Serialize)]
+struct ConfigValidationErrorResponse {
+    error: String,
+    errors: Vec<ConfigValidationError>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SplitValidationCatalog {
+    totals_by_model_key: HashMap<String, u32>,
+    gpu_counts_by_node_id: HashMap<String, u32>,
+}
+
+#[derive(Debug, Clone)]
+struct SplitSegmentRef {
+    path: String,
+    start: u32,
+    end: u32,
+}
+
+fn model_sizes_to_map(sizes: &[(String, u64)]) -> HashMap<String, u64> {
+    let mut map = HashMap::new();
+    for (name, size) in sizes {
+        let entry = map.entry(name.clone()).or_insert(0);
+        *entry = (*entry).max(*size);
+    }
+    map
+}
+
+fn model_sizes_sorted_vec_from_map(map: HashMap<String, u64>) -> Vec<(String, u64)> {
+    let mut sizes: Vec<(String, u64)> = map.into_iter().collect();
+    sizes.sort_by(|a, b| a.0.cmp(&b.0));
+    sizes
 }
 
 #[derive(Serialize)]
@@ -876,6 +944,11 @@ impl MeshApi {
         let my_models = node.models().await;
         let my_available_models = node.available_models().await;
         let my_requested_models = node.requested_models().await;
+        let owner_fingerprint = node.owner_fingerprint().await;
+        let owner_id = owner_fingerprint.clone();
+        let owner_fingerprint_verified = owner_fingerprint.is_some();
+        let my_model_sizes = model_sizes_sorted_vec_from_map(node.available_model_sizes().await);
+        let my_model_scans = node.available_model_metadata().await;
         let peers: Vec<PeerPayload> = all_peers
             .iter()
             .map(|p| PeerPayload {
@@ -895,11 +968,32 @@ impl MeshApi {
                 rtt_ms: p.rtt_ms,
                 hostname: p.hostname.clone(),
                 is_soc: p.is_soc,
+                owner_id: p.owner_id.clone(),
+                owner_fingerprint: p.owner_fingerprint.clone(),
+                owner_fingerprint_verified: p.owner_fingerprint_verified,
+                owner_fingerprint_transitive: p.owner_fingerprint_transitive,
                 gpus: build_gpus(
                     p.gpu_name.as_deref(),
                     p.gpu_vram.as_deref(),
                     p.gpu_bandwidth_gbps.as_deref(),
                 ),
+                model_sizes: p.model_sizes.clone().or_else(|| {
+                    let sizes: Vec<(String, u64)> = p
+                        .served_model_descriptors
+                        .iter()
+                        .filter_map(|d| {
+                            d.identity
+                                .file_size
+                                .map(|s| (d.identity.model_name.clone(), s))
+                        })
+                        .collect();
+                    if sizes.is_empty() {
+                        None
+                    } else {
+                        Some(sizes)
+                    }
+                }),
+                model_scans: p.model_metadata.clone(),
             })
             .collect();
 
@@ -979,6 +1073,10 @@ impl MeshApi {
             nostr_discovery,
             my_hostname: node.hostname.clone(),
             my_is_soc: node.is_soc,
+            owner_id,
+            owner_fingerprint,
+            owner_fingerprint_verified,
+            owner_fingerprint_transitive: false,
             gpus: {
                 let bw = node.gpu_bandwidth_gbps.lock().await;
                 let bw_str = bw.as_ref().map(|v| {
@@ -994,6 +1092,8 @@ impl MeshApi {
                 )
             },
             routing_affinity,
+            model_sizes: my_model_sizes,
+            model_scans: my_model_scans,
         }
     }
 
@@ -1102,12 +1202,12 @@ pub async fn start(
     tracing::info!("Management API on http://localhost:{port}");
 
     loop {
-        let Ok((stream, _)) = listener.accept().await else {
+        let Ok((stream, remote_addr)) = listener.accept().await else {
             continue;
         };
         let state = state.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_request(stream, &state).await {
+            if let Err(e) = handle_request(stream, remote_addr.ip(), &state).await {
                 tracing::debug!("API connection error: {e}");
             }
         });
@@ -1116,7 +1216,11 @@ pub async fn start(
 
 // ── Request dispatch ──
 
-async fn handle_request(mut stream: TcpStream, state: &MeshApi) -> anyhow::Result<()> {
+async fn handle_request(
+    mut stream: TcpStream,
+    remote_ip: std::net::IpAddr,
+    state: &MeshApi,
+) -> anyhow::Result<()> {
     let request = match tokio::time::timeout(
         std::time::Duration::from_secs(5),
         proxy::read_http_request(&mut stream),
@@ -1135,19 +1239,7 @@ async fn handle_request(mut stream: TcpStream, state: &MeshApi) -> anyhow::Resul
 
     match (method, path_only) {
         // ── Dashboard UI ──
-        ("GET", "/") => {
-            if !respond_console_index(&mut stream).await? {
-                respond_error(&mut stream, 500, "Dashboard bundle missing").await?;
-            }
-        }
-
-        ("GET", "/dashboard") | ("GET", "/chat") | ("GET", "/dashboard/") | ("GET", "/chat/") => {
-            if !respond_console_index(&mut stream).await? {
-                respond_error(&mut stream, 500, "Dashboard bundle missing").await?;
-            }
-        }
-
-        ("GET", p) if p.starts_with("/chat/") => {
+        ("GET", p) if is_console_index_path(p) => {
             if !respond_console_index(&mut stream).await? {
                 respond_error(&mut stream, 500, "Dashboard bundle missing").await?;
             }
@@ -1308,6 +1400,246 @@ async fn handle_request(mut stream: TcpStream, state: &MeshApi) -> anyhow::Resul
                     respond_error(&mut stream, 503, "Runtime control unavailable").await?;
                 }
             }
+        }
+        ("GET", "/api/config") => match read_mesh_config_toml(&mesh_config_path()) {
+            Ok(raw) => {
+                respond_bytes_cached(
+                    &mut stream,
+                    200,
+                    "OK",
+                    "application/toml",
+                    "no-store",
+                    raw.as_bytes(),
+                )
+                .await?;
+            }
+            Err(e) => {
+                respond_error(&mut stream, 500, &format!("Failed to read config: {e}")).await?;
+            }
+        },
+
+        ("POST", "/api/config") => {
+            let body = String::from_utf8_lossy(http_body_bytes(&request.raw));
+            let owner_fingerprint =
+                match require_header(&request.raw, CONFIG_OWNER_FINGERPRINT_HEADER) {
+                    Ok(v) => v,
+                    Err(code) => {
+                        respond_error(&mut stream, code, "Missing owner fingerprint").await?;
+                        return Ok(());
+                    }
+                };
+            let timestamp = match require_header(&request.raw, CONFIG_TIMESTAMP_HEADER)
+                .ok()
+                .and_then(|v| v.parse::<i64>().ok())
+            {
+                Some(v) => v,
+                None => {
+                    respond_error(&mut stream, 401, "Missing or invalid timestamp").await?;
+                    return Ok(());
+                }
+            };
+            let prev_config_hash = match require_header(&request.raw, CONFIG_PREV_HASH_HEADER) {
+                Ok(v) => v,
+                Err(code) => {
+                    respond_error(&mut stream, code, "Missing prev_config_hash").await?;
+                    return Ok(());
+                }
+            };
+            let signature = match require_header(&request.raw, CONFIG_SIGNATURE_HEADER) {
+                Ok(v) => v,
+                Err(code) => {
+                    respond_error(&mut stream, code, "Missing signature").await?;
+                    return Ok(());
+                }
+            };
+
+            match replay_signature_seen_before(&signature) {
+                Ok(true) => {
+                    respond_error(&mut stream, 409, "replayed signed checkpoint").await?;
+                    return Ok(());
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    respond_error(
+                        &mut stream,
+                        500,
+                        &format!("Failed to check replay state: {e}"),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            }
+
+            let local_owner_fingerprint = {
+                let node = state.inner.lock().await.node.clone();
+                node.owner_fingerprint().await
+            };
+            let Some(local_owner_fingerprint) = local_owner_fingerprint else {
+                respond_error(&mut stream, 403, "This node has no owner key").await?;
+                return Ok(());
+            };
+
+            if owner_fingerprint != local_owner_fingerprint {
+                respond_error(
+                    &mut stream,
+                    403,
+                    "Owner fingerprint does not match this node",
+                )
+                .await?;
+                return Ok(());
+            }
+
+            if is_stale_config_timestamp(timestamp) {
+                respond_error(&mut stream, 401, "Stale config timestamp").await?;
+                return Ok(());
+            }
+
+            let config_path = mesh_config_path();
+            let config_file_exists = config_path.exists();
+            let current_config_hash = match current_mesh_config_hash(&config_path) {
+                Ok(hash) => hash,
+                Err(e) => {
+                    respond_error(
+                        &mut stream,
+                        500,
+                        &format!("Failed to read current config hash: {e}"),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
+            if config_file_exists && prev_config_hash != current_config_hash {
+                respond_error(&mut stream, 409, "stale prev_config_hash").await?;
+                return Ok(());
+            }
+
+            let canonical_payload = canonical_config_signature_payload(
+                method,
+                "/api/config",
+                body.as_ref(),
+                &owner_fingerprint,
+                timestamp,
+                &prev_config_hash,
+            );
+            let verify_result =
+                verify_signed_config_checkpoint(state, &canonical_payload, &signature).await;
+            if !verify_result {
+                respond_error(&mut stream, 401, "Invalid signature").await?;
+                return Ok(());
+            }
+
+            let split_catalog = {
+                let node = state.inner.lock().await.node.clone();
+                build_split_validation_catalog(&node).await
+            };
+
+            let parsed = match parse_and_validate_mesh_config(body.as_ref(), &split_catalog) {
+                Ok(cfg) => cfg,
+                Err(errors) => {
+                    respond_validation_errors(&mut stream, &errors).await?;
+                    return Ok(());
+                }
+            };
+
+            if let Err(e) = parsed.save(&mesh_config_path()) {
+                respond_error(&mut stream, 500, &format!("Failed to save config: {e}")).await?;
+                return Ok(());
+            }
+
+            let local_node_id = {
+                let inner = state.inner.lock().await;
+                inner.node.id().fmt_short().to_string()
+            };
+            if let Err(e) = sync_node_runtime_config(&parsed, &local_node_id) {
+                respond_error(
+                    &mut stream,
+                    500,
+                    &format!("Failed to save node runtime config: {e}"),
+                )
+                .await?;
+                return Ok(());
+            }
+
+            if let Err(e) = remember_applied_signature(&signature) {
+                respond_error(
+                    &mut stream,
+                    500,
+                    &format!("Failed to persist replay state: {e}"),
+                )
+                .await?;
+                return Ok(());
+            }
+
+            let resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 18\r\n\r\n{\"status\":\"saved\"}";
+            stream.write_all(resp.as_bytes()).await?;
+        }
+
+        ("GET", p) if p.starts_with("/api/config/node/") => {
+            let node_id = p.trim_start_matches("/api/config/node/");
+            if node_id.is_empty() {
+                respond_error(&mut stream, 404, "Not found").await?;
+                return Ok(());
+            }
+
+            let local_node_id = {
+                let inner = state.inner.lock().await;
+                inner.node.id().fmt_short().to_string()
+            };
+            if node_id == local_node_id {
+                match NodeConfig::load(&node_config_path()) {
+                    Ok(Some(node_cfg)) => {
+                        let json = serde_json::to_string(&node_cfg)?;
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                            json.len(),
+                            json
+                        );
+                        stream.write_all(resp.as_bytes()).await?;
+                        return Ok(());
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        respond_error(
+                            &mut stream,
+                            500,
+                            &format!("Failed to read node runtime config: {e}"),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                }
+            }
+
+            let config = match AuthoredMeshConfig::load(&mesh_config_path()) {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    respond_error(&mut stream, 500, &format!("Failed to read config: {e}")).await?;
+                    return Ok(());
+                }
+            };
+
+            if let Some(node_cfg) = config.for_node_runtime(node_id) {
+                let json = serde_json::to_string(&node_cfg)?;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    json.len(),
+                    json
+                );
+                stream.write_all(resp.as_bytes()).await?;
+            } else {
+                respond_error(&mut stream, 404, "Node config not found").await?;
+            }
+        }
+
+        ("POST", "/api/scan") => {
+            let node = state.inner.lock().await.node.clone();
+            if let Err(e) = mesh::Node::run_local_scan(&node).await {
+                tracing::warn!("Local scan failed: {e}");
+            }
+            state.push_status().await;
+
+            let resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\n\r\n{\"ok\":true}";
+            stream.write_all(resp.as_bytes()).await?;
         }
 
         // ── SSE event stream ──
@@ -1613,11 +1945,245 @@ async fn handle_request(mut stream: TcpStream, state: &MeshApi) -> anyhow::Resul
             }
         }
 
+        // ── Broadcast config to all peers ──
+        ("POST", "/api/config/broadcast") => {
+            if !request_origin_is_loopback(&request.raw, remote_ip) {
+                respond_error(
+                    &mut stream,
+                    403,
+                    "Only loopback origin may broadcast config",
+                )
+                .await?;
+                return Ok(());
+            }
+
+            let body_str = String::from_utf8_lossy(http_body_bytes(&request.raw));
+            let split_catalog = {
+                let node = state.inner.lock().await.node.clone();
+                build_split_validation_catalog(&node).await
+            };
+
+            let parsed = match parse_and_validate_mesh_config(body_str.as_ref(), &split_catalog) {
+                Ok(cfg) => cfg,
+                Err(errors) => {
+                    respond_validation_errors(&mut stream, &errors).await?;
+                    return Ok(());
+                }
+            };
+
+            let prev_config_hash = match current_mesh_config_hash(&mesh_config_path()) {
+                Ok(hash) => hash,
+                Err(e) => {
+                    respond_error(
+                        &mut stream,
+                        500,
+                        &format!("Failed to read current config hash: {e}"),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
+
+            let owner_fingerprint = {
+                let node = state.inner.lock().await.node.clone();
+                node.owner_fingerprint().await
+            };
+            let Some(owner_fingerprint) = owner_fingerprint else {
+                respond_error(&mut stream, 403, "This node has no owner key").await?;
+                return Ok(());
+            };
+            let timestamp = now_unix_timestamp();
+            let canonical_payload = canonical_config_signature_payload(
+                "POST",
+                "/api/config",
+                body_str.as_ref(),
+                &owner_fingerprint,
+                timestamp,
+                &prev_config_hash,
+            );
+            let signature = match sign_config_payload(&canonical_payload) {
+                Ok(signature) => signature,
+                Err(e) => {
+                    respond_error(
+                        &mut stream,
+                        500,
+                        &format!("Failed to sign config payload: {e}"),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
+
+            if let Err(e) = parsed.save(&mesh_config_path()) {
+                respond_error(
+                    &mut stream,
+                    500,
+                    &format!("Failed to save config locally: {e}"),
+                )
+                .await?;
+                return Ok(());
+            }
+
+            let local_node_id = {
+                let inner = state.inner.lock().await;
+                inner.node.id().fmt_short().to_string()
+            };
+            if let Err(e) = sync_node_runtime_config(&parsed, &local_node_id) {
+                respond_error(
+                    &mut stream,
+                    500,
+                    &format!("Failed to save node runtime config: {e}"),
+                )
+                .await?;
+                return Ok(());
+            }
+
+            let (peers, api_port) = {
+                let inner = state.inner.lock().await;
+                (inner.node.peers().await, inner.api_port)
+            };
+
+            let toml_body = body_str.to_string();
+            let relay_peers: Vec<mesh::PeerInfo> = peers
+                .into_iter()
+                .filter(|peer| {
+                    peer.owner_fingerprint_verified
+                        && peer.owner_fingerprint.as_deref() == Some(owner_fingerprint.as_str())
+                })
+                .collect();
+            let relay_headers = ConfigRelayHeaders {
+                owner_fingerprint,
+                timestamp,
+                prev_config_hash,
+                signature,
+            };
+            let results =
+                relay_config_to_peers(&relay_peers, api_port, &toml_body, &relay_headers).await;
+
+            let saved = 1 + results.iter().filter(|r| r.ok).count();
+            let total = 1 + results.len();
+            let failed: Vec<String> = results
+                .iter()
+                .filter(|r| !r.ok)
+                .map(|r| r.node.clone())
+                .collect();
+
+            let resp_body = serde_json::json!({
+                "saved": saved,
+                "total": total,
+                "failed": failed,
+            });
+            let resp_str = resp_body.to_string();
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                resp_str.len(),
+                resp_str
+            );
+            stream.write_all(resp.as_bytes()).await?;
+        }
+
+        // ── Broadcast scan to all peers ──
+        ("POST", "/api/scan/broadcast") => {
+            let node = state.inner.lock().await.node.clone();
+            if let Err(e) = mesh::Node::run_local_scan(&node).await {
+                tracing::warn!("Local scan failed during broadcast: {e}");
+            }
+            state.push_status().await;
+
+            let results = node.relay_scan_to_peers().await;
+
+            let refreshed = 1 + results.iter().filter(|(_, ok)| *ok).count();
+            let total = 1 + results.len();
+            let failed: Vec<String> = results
+                .into_iter()
+                .filter(|(_, ok)| !*ok)
+                .map(|(name, _)| name)
+                .collect();
+
+            let resp_body = serde_json::json!({
+                "refreshed": refreshed,
+                "total": total,
+                "failed": failed,
+            });
+            let resp_str = resp_body.to_string();
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                resp_str.len(),
+                resp_str
+            );
+            stream.write_all(resp.as_bytes()).await?;
+        }
+
         _ => {
             respond_error(&mut stream, 404, "Not found").await?;
         }
     }
     Ok(())
+}
+
+// ── Peer relay helpers ──
+
+struct RelayResult {
+    node: String,
+    ok: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ConfigRelayHeaders {
+    owner_fingerprint: String,
+    timestamp: i64,
+    prev_config_hash: String,
+    signature: String,
+}
+
+async fn relay_config_to_peers(
+    peers: &[mesh::PeerInfo],
+    api_port: u16,
+    toml_body: &str,
+    headers: &ConfigRelayHeaders,
+) -> Vec<RelayResult> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap_or_default();
+
+    let mut set = tokio::task::JoinSet::new();
+    for peer in peers {
+        let Some(ref hostname) = peer.hostname else {
+            continue;
+        };
+        let url = format!("http://{}:{}/api/config", hostname, api_port);
+        let node_label = hostname.clone();
+        let client = client.clone();
+        let body = toml_body.to_string();
+        let headers = headers.clone();
+        set.spawn(async move {
+            let ok = client
+                .post(&url)
+                .header("Content-Type", "application/toml")
+                .header(CONFIG_OWNER_FINGERPRINT_HEADER, headers.owner_fingerprint)
+                .header(CONFIG_TIMESTAMP_HEADER, headers.timestamp.to_string())
+                .header(CONFIG_PREV_HASH_HEADER, headers.prev_config_hash)
+                .header(CONFIG_SIGNATURE_HEADER, headers.signature)
+                .body(body)
+                .send()
+                .await
+                .map(|r| r.status().is_success())
+                .unwrap_or(false);
+            RelayResult {
+                node: node_label,
+                ok,
+            }
+        });
+    }
+
+    let mut results = Vec::with_capacity(set.len());
+    while let Some(res) = set.join_next().await {
+        if let Ok(r) = res {
+            results.push(r);
+        }
+    }
+    results
 }
 
 fn http_body_text(raw: &[u8]) -> &str {
@@ -1627,6 +2193,536 @@ fn http_body_text(raw: &[u8]) -> &str {
         .map(|idx| idx + 4)
         .unwrap_or(raw.len());
     std::str::from_utf8(&raw[body_start..]).unwrap_or("")
+}
+
+fn parse_header_value(raw: &[u8], header_name: &str) -> Option<String> {
+    let header_end = find_header_end(raw)?;
+    let header_text = String::from_utf8_lossy(&raw[..header_end]);
+    for line in header_text.lines().skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case(header_name) {
+            return Some(value.trim().to_string());
+        }
+    }
+    None
+}
+
+fn require_header(raw: &[u8], header_name: &str) -> Result<String, u16> {
+    parse_header_value(raw, header_name).ok_or(401)
+}
+
+fn now_unix_timestamp() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn is_stale_config_timestamp(timestamp: i64) -> bool {
+    let now = now_unix_timestamp();
+    timestamp < now.saturating_sub(CONFIG_TIMESTAMP_MAX_AGE_SECS)
+        || timestamp > now.saturating_add(CONFIG_TIMESTAMP_MAX_FUTURE_SKEW_SECS)
+}
+
+fn canonical_config_signature_payload(
+    method: &str,
+    path: &str,
+    body: &str,
+    owner_fingerprint: &str,
+    timestamp: i64,
+    prev_config_hash: &str,
+) -> String {
+    let mut body_hasher = Sha256::new();
+    body_hasher.update(body.as_bytes());
+    let body_sha256 = format!("{:x}", body_hasher.finalize());
+    format!(
+        "method={method}\npath={path}\nbody_sha256={body_sha256}\nowner_fingerprint={owner_fingerprint}\ntimestamp={timestamp}\nprev_config_hash={prev_config_hash}"
+    )
+}
+
+fn current_mesh_config_hash(path: &Path) -> anyhow::Result<String> {
+    let toml = read_mesh_config_toml(path)?;
+    let mut hasher = Sha256::new();
+    hasher.update(toml.as_bytes());
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn replay_state_path() -> std::path::PathBuf {
+    mesh_config_path()
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("config-checkpoint-replay.log")
+}
+
+fn replay_signature_seen_before(signature: &str) -> anyhow::Result<bool> {
+    let path = replay_state_path();
+    if !path.exists() {
+        return Ok(false);
+    }
+    let raw = std::fs::read_to_string(path)?;
+    Ok(raw.lines().any(|line| line.trim() == signature))
+}
+
+fn remember_applied_signature(signature: &str) -> anyhow::Result<()> {
+    let path = replay_state_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    use std::io::Write;
+    writeln!(file, "{signature}")?;
+    Ok(())
+}
+
+fn owner_signing_key_path_from_args() -> anyhow::Result<std::path::PathBuf> {
+    let mut args = std::env::args_os().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--owner-key" {
+            if let Some(path) = args.next() {
+                return Ok(std::path::PathBuf::from(path));
+            }
+            break;
+        }
+        if let Some(arg_str) = arg.to_str() {
+            if let Some(rest) = arg_str.strip_prefix("--owner-key=") {
+                return Ok(std::path::PathBuf::from(rest));
+            }
+        }
+    }
+    let mut default_path = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    default_path.push(".mesh-llm");
+    default_path.push("owner-key");
+    Ok(default_path)
+}
+
+fn load_owner_signing_key() -> anyhow::Result<Option<ed25519_dalek::SigningKey>> {
+    let path = owner_signing_key_path_from_args()?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let contents = std::fs::read_to_string(&path)?;
+    let decoded = hex::decode(contents.trim())
+        .map_err(|e| anyhow::anyhow!("owner key at {} is not valid hex: {e}", path.display()))?;
+    let key_bytes: [u8; 32] = decoded.try_into().map_err(|_| {
+        anyhow::anyhow!(
+            "owner key at {} must be exactly 32 bytes (64 hex chars)",
+            path.display()
+        )
+    })?;
+    Ok(Some(ed25519_dalek::SigningKey::from_bytes(&key_bytes)))
+}
+
+fn sign_config_payload(canonical_payload: &str) -> anyhow::Result<String> {
+    let signing_key = load_owner_signing_key()?
+        .ok_or_else(|| anyhow::anyhow!("owner signing key not available for config broadcast"))?;
+    let sig: Signature = signing_key.sign(canonical_payload.as_bytes());
+    Ok(hex::encode(sig.to_bytes()))
+}
+
+async fn verify_signed_config_checkpoint(
+    state: &MeshApi,
+    canonical_payload: &str,
+    signature: &str,
+) -> bool {
+    if let Ok(Some(signing_key)) = load_owner_signing_key() {
+        let verifying = VerifyingKey::from(&signing_key);
+        if let Ok(sig_bytes) = hex::decode(signature) {
+            if let Ok(sig_array) = <[u8; 64]>::try_from(sig_bytes.as_slice()) {
+                let sig = Signature::from_bytes(&sig_array);
+                if verifying.verify(canonical_payload.as_bytes(), &sig).is_ok() {
+                    return true;
+                }
+            }
+        }
+    }
+
+    let node = state.inner.lock().await.node.clone();
+    let Some(attestation) = node.owner_attestation().await else {
+        return false;
+    };
+    let Ok(pubkey) = <[u8; 32]>::try_from(attestation.owner_public_key.as_slice()) else {
+        return false;
+    };
+    let Ok(verifying) = VerifyingKey::from_bytes(&pubkey) else {
+        return false;
+    };
+    let Ok(sig_bytes) = hex::decode(signature) else {
+        return false;
+    };
+    let Ok(sig_array) = <[u8; 64]>::try_from(sig_bytes.as_slice()) else {
+        return false;
+    };
+    let sig = Signature::from_bytes(&sig_array);
+    verifying.verify(canonical_payload.as_bytes(), &sig).is_ok()
+}
+
+fn request_origin_is_loopback(raw: &[u8], remote_ip: std::net::IpAddr) -> bool {
+    if let Some(forwarded) = parse_header_value(raw, "X-Forwarded-For") {
+        return forwarded.split(',').map(|part| part.trim()).all(|part| {
+            if part.eq_ignore_ascii_case("localhost") {
+                return true;
+            }
+            part.parse::<std::net::IpAddr>()
+                .map(|ip| ip.is_loopback())
+                .unwrap_or(false)
+        });
+    }
+    remote_ip.is_loopback()
+}
+
+fn is_console_index_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/" | "/dashboard" | "/chat" | "/config" | "/dashboard/" | "/chat/" | "/config/"
+    ) || path.starts_with("/chat/")
+}
+
+fn sync_node_runtime_config(config: &AuthoredMeshConfig, node_id: &str) -> anyhow::Result<()> {
+    let path = node_config_path();
+    sync_node_runtime_config_at(&path, config, node_id)
+}
+
+fn sync_node_runtime_config_at(
+    path: &Path,
+    config: &AuthoredMeshConfig,
+    node_id: &str,
+) -> anyhow::Result<()> {
+    if let Some(node_cfg) = config.for_node_runtime(node_id) {
+        node_cfg.save(path)?;
+    } else if path.exists() {
+        std::fs::remove_file(path)
+            .map_err(|e| anyhow::anyhow!("Failed to remove stale node runtime config: {e}"))?;
+    }
+    Ok(())
+}
+
+fn read_mesh_config_toml(path: &Path) -> anyhow::Result<String> {
+    let config = AuthoredMeshConfig::load(path)?;
+    Ok(toml::to_string_pretty(&config)?)
+}
+
+fn parse_and_validate_mesh_config(
+    raw: &str,
+    split_catalog: &SplitValidationCatalog,
+) -> Result<AuthoredMeshConfig, Vec<ConfigValidationError>> {
+    let parsed: AuthoredMeshConfig = toml::from_str(raw).map_err(|e| {
+        vec![ConfigValidationError {
+            code: "invalid_toml".into(),
+            path: "$".into(),
+            message: format!("Invalid TOML: {e}"),
+        }]
+    })?;
+    validate_mesh_config(&parsed, split_catalog)?;
+    Ok(parsed)
+}
+
+fn validate_mesh_config(
+    config: &AuthoredMeshConfig,
+    split_catalog: &SplitValidationCatalog,
+) -> Result<(), Vec<ConfigValidationError>> {
+    let mut errors = Vec::new();
+
+    if config.version != AUTHORED_CONFIG_VERSION {
+        errors.push(ConfigValidationError {
+            code: "unsupported_version".into(),
+            path: "version".into(),
+            message: format!(
+                "Unsupported config version {}, expected {}",
+                config.version, AUTHORED_CONFIG_VERSION
+            ),
+        });
+    }
+
+    let mut split_groups: HashMap<String, Vec<SplitSegmentRef>> = HashMap::new();
+    let mut split_group_totals: HashMap<String, u32> = HashMap::new();
+
+    for (node_idx, node) in config.nodes.iter().enumerate() {
+        if node.node_id.trim().is_empty() {
+            errors.push(ConfigValidationError {
+                code: "empty_node_id".into(),
+                path: format!("nodes[{node_idx}].node_id"),
+                message: "node_id must not be empty".into(),
+            });
+        }
+
+        for (model_idx, model) in node.models.iter().enumerate() {
+            if model.name.trim().is_empty() {
+                errors.push(ConfigValidationError {
+                    code: "empty_model_name".into(),
+                    path: format!("nodes[{node_idx}].models[{model_idx}].name"),
+                    message: "name must not be empty".into(),
+                });
+            }
+
+            if let Some(model_key) = model.model_key.as_ref() {
+                if model_key.trim().is_empty() {
+                    errors.push(ConfigValidationError {
+                        code: "empty_model_key".into(),
+                        path: format!("nodes[{node_idx}].models[{model_idx}].model_key"),
+                        message: "model_key must not be empty when present".into(),
+                    });
+                }
+            }
+
+            let Some(split) = model.split.as_ref() else {
+                continue;
+            };
+
+            let model_path = format!("nodes[{node_idx}].models[{model_idx}]");
+            let Some(model_key_raw) = model.model_key.as_deref() else {
+                errors.push(ConfigValidationError {
+                    code: "missing_model_key".into(),
+                    path: format!("{model_path}.model_key"),
+                    message: "model_key is required when split is set".into(),
+                });
+                continue;
+            };
+
+            let model_key = model_key_raw.trim();
+            if model_key.is_empty() {
+                errors.push(ConfigValidationError {
+                    code: "empty_model_key".into(),
+                    path: format!("{model_path}.model_key"),
+                    message: "model_key must not be empty when split is set".into(),
+                });
+                continue;
+            }
+
+            if split.total == 0 {
+                errors.push(ConfigValidationError {
+                    code: "invalid_split_total".into(),
+                    path: format!("{model_path}.split.total"),
+                    message: "split.total must be greater than 0".into(),
+                });
+                continue;
+            }
+
+            if split.end <= split.start {
+                errors.push(ConfigValidationError {
+                    code: "zero_length_range".into(),
+                    path: format!("{model_path}.split"),
+                    message: "split range must have end > start".into(),
+                });
+                continue;
+            }
+
+            if split.start >= split.total || split.end >= split.total {
+                errors.push(ConfigValidationError {
+                    code: "split_out_of_range".into(),
+                    path: format!("{model_path}.split"),
+                    message: "split.start and split.end must be within split.total".into(),
+                });
+                continue;
+            }
+
+            if let Some(existing_total) = split_group_totals.get(model_key) {
+                if *existing_total != split.total {
+                    errors.push(ConfigValidationError {
+                        code: "mismatched_split_totals".into(),
+                        path: format!("{model_path}.split.total"),
+                        message: format!(
+                            "split.total {} does not match group total {} for model_key {}",
+                            split.total, existing_total, model_key
+                        ),
+                    });
+                }
+            } else {
+                split_group_totals.insert(model_key.to_string(), split.total);
+            }
+
+            split_groups
+                .entry(model_key.to_string())
+                .or_default()
+                .push(SplitSegmentRef {
+                    path: model_path,
+                    start: split.start,
+                    end: split.end,
+                });
+        }
+    }
+
+    for (model_key, segments) in split_groups.iter_mut() {
+        let Some(expected_total) = split_group_totals.get(model_key).copied() else {
+            continue;
+        };
+
+        match split_catalog.totals_by_model_key.get(model_key).copied() {
+            Some(catalog_total) if catalog_total != expected_total => {
+                errors.push(ConfigValidationError {
+                    code: "mismatched_total_offloadable_layers".into(),
+                    path: format!("model_key:{model_key}"),
+                    message: format!(
+                        "split total {} does not match total_offloadable_layers {} for model_key {}",
+                        expected_total, catalog_total, model_key
+                    ),
+                });
+            }
+            None => {
+                errors.push(ConfigValidationError {
+                    code: "unknown_model_key".into(),
+                    path: format!("model_key:{model_key}"),
+                    message: format!(
+                        "model_key {} not found in model_scans with total_offloadable_layers",
+                        model_key
+                    ),
+                });
+            }
+            _ => {}
+        }
+
+        segments.sort_by_key(|segment| segment.start);
+
+        let mut expected_start = 0u32;
+        for segment in segments.iter() {
+            if segment.start < expected_start {
+                errors.push(ConfigValidationError {
+                    code: "overlapping_split_ranges".into(),
+                    path: format!("{}.split", segment.path),
+                    message: format!(
+                        "split range {}-{} overlaps previous segment for model_key {}",
+                        segment.start, segment.end, model_key
+                    ),
+                });
+            } else if segment.start > expected_start {
+                errors.push(ConfigValidationError {
+                    code: "split_gap".into(),
+                    path: format!("{}.split", segment.path),
+                    message: format!(
+                        "split gap before segment {}-{} for model_key {}",
+                        segment.start, segment.end, model_key
+                    ),
+                });
+            }
+
+            expected_start = segment.end.saturating_add(1);
+        }
+
+        if expected_start != expected_total {
+            errors.push(ConfigValidationError {
+                code: "incomplete_split_coverage".into(),
+                path: format!("model_key:{model_key}"),
+                message: format!(
+                    "split coverage ends at {}, expected contiguous coverage through {} for model_key {}",
+                    expected_start.saturating_sub(1),
+                    expected_total.saturating_sub(1),
+                    model_key
+                ),
+            });
+        }
+    }
+
+    for (node_idx, node) in config.nodes.iter().enumerate() {
+        for (model_idx, model) in node.models.iter().enumerate() {
+            let model_path = format!("nodes[{node_idx}].models[{model_idx}]");
+            match node.placement_mode {
+                PlacementMode::Pooled => {
+                    if model.gpu_index.is_some() {
+                        errors.push(ConfigValidationError {
+                            code: "gpu_index_in_pooled_mode".into(),
+                            path: format!("{model_path}.gpu_index"),
+                            message: format!(
+                                "gpu_index must not be set when placement_mode is pooled (node {})",
+                                node.node_id
+                            ),
+                        });
+                    }
+                }
+                PlacementMode::Separate => {
+                    if model.gpu_index.is_none() {
+                        errors.push(ConfigValidationError {
+                            code: "missing_gpu_index_in_separate_mode".into(),
+                            path: format!("{model_path}.gpu_index"),
+                            message: format!(
+                                "gpu_index is required when placement_mode is separate (node {})",
+                                node.node_id
+                            ),
+                        });
+                    }
+                }
+            }
+
+            if let (Some(gpu_idx), Some(&gpu_count)) = (
+                model.gpu_index,
+                split_catalog.gpu_counts_by_node_id.get(&node.node_id),
+            ) {
+                if gpu_idx >= gpu_count {
+                    errors.push(ConfigValidationError {
+                        code: "gpu_index_out_of_range".into(),
+                        path: format!("{model_path}.gpu_index"),
+                        message: format!(
+                            "gpu_index {} is out of range (node {} has {} GPU(s))",
+                            gpu_idx, node.node_id, gpu_count
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+async fn build_split_validation_catalog(node: &mesh::Node) -> SplitValidationCatalog {
+    let mut totals_by_model_key = HashMap::new();
+
+    for model in node.available_model_metadata().await {
+        if let Some(total) = model.metadata.total_offloadable_layers {
+            totals_by_model_key.insert(model.model_key, total);
+        }
+    }
+
+    for peer in node.peers().await {
+        if let Some(model_metadata) = peer.model_metadata {
+            for model in model_metadata {
+                if let Some(total) = model.metadata.total_offloadable_layers {
+                    totals_by_model_key.entry(model.model_key).or_insert(total);
+                }
+            }
+        }
+    }
+
+    SplitValidationCatalog {
+        totals_by_model_key,
+        ..Default::default()
+    }
+}
+
+fn find_header_end(req: &[u8]) -> Option<usize> {
+    req.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+fn parse_content_length(header: &str) -> Option<usize> {
+    header.lines().find_map(|line| {
+        line.split_once(':').and_then(|(k, v)| {
+            if k.trim().eq_ignore_ascii_case("content-length") {
+                v.trim().parse::<usize>().ok()
+            } else {
+                None
+            }
+        })
+    })
+}
+
+fn http_body_bytes(req: &[u8]) -> &[u8] {
+    if let Some(header_end) = find_header_end(req) {
+        let header_text = String::from_utf8_lossy(&req[..header_end]);
+        let body_start = header_end + 4;
+        if let Some(content_len) = parse_content_length(&header_text) {
+            let body_end = body_start.saturating_add(content_len).min(req.len());
+            return &req[body_start..body_end];
+        }
+        return &req[body_start..];
+    }
+    &[]
 }
 
 async fn respond_error(stream: &mut TcpStream, code: u16, msg: &str) -> anyhow::Result<()> {
@@ -1666,6 +2762,23 @@ async fn respond_json<T: Serialize>(
         "HTTP/1.1 {code} {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
         json.len(),
         json
+    );
+    stream.write_all(resp.as_bytes()).await?;
+    Ok(())
+}
+
+async fn respond_validation_errors(
+    stream: &mut TcpStream,
+    errors: &[ConfigValidationError],
+) -> anyhow::Result<()> {
+    let payload = ConfigValidationErrorResponse {
+        error: "config_validation_failed".into(),
+        errors: errors.to_vec(),
+    };
+    let body = serde_json::to_string(&payload)?;
+    let resp = format!(
+        "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(), body
     );
     stream.write_all(resp.as_bytes()).await?;
     Ok(())
@@ -1837,11 +2950,39 @@ async fn respond_bytes_cached(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{
+        AuthoredModelAssignment, AuthoredNodeConfig, MeshConfig, ModelAssignment, ModelSplit,
+        NodeConfig, PlacementMode,
+    };
+    use iroh::SecretKey;
+    use iroh::{EndpointAddr, EndpointId};
     use mesh_llm_plugin::MeshVisibility;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::mpsc;
+
+    fn split_catalog(entries: &[(&str, u32)]) -> SplitValidationCatalog {
+        let totals_by_model_key = entries
+            .iter()
+            .map(|(key, total)| (key.to_string(), *total))
+            .collect();
+        SplitValidationCatalog {
+            totals_by_model_key,
+            ..Default::default()
+        }
+    }
+
+    fn make_temp_dir() -> std::path::PathBuf {
+        let mut dir = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        dir.push(format!("mesh-llm-api-test-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
     #[test]
     fn test_build_gpus_both_none() {
@@ -2062,6 +3203,7 @@ mod tests {
         let node = mesh::Node::new_for_tests(mesh::NodeRole::Worker)
             .await
             .unwrap();
+        node.set_owner_key_material(Some([0x42; 32])).await;
         let resolved_plugins = plugin::ResolvedPlugins {
             externals: vec![],
             inactive: vec![],
@@ -2095,8 +3237,8 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            handle_request(stream, &state).await
+            let (stream, remote) = listener.accept().await.unwrap();
+            handle_request(stream, remote.ip(), &state).await
         });
         (addr, handle)
     }
@@ -2131,6 +3273,102 @@ mod tests {
             response.extend_from_slice(&chunk[..n]);
         }
         response
+    }
+
+    fn hex_signature(secret: &SecretKey, canonical_payload: &str) -> String {
+        let signature = secret.sign(canonical_payload.as_bytes());
+        hex::encode(signature.to_bytes())
+    }
+
+    fn configure_test_owner_key(home_root: &std::path::Path, owner_secret: &SecretKey) {
+        std::fs::create_dir_all(home_root.join(".mesh-llm")).unwrap();
+        std::env::set_var("HOME", home_root);
+        std::fs::write(
+            home_root.join(".mesh-llm/owner-key"),
+            hex::encode(owner_secret.to_bytes()),
+        )
+        .unwrap();
+    }
+
+    fn peer_info_with_owner(
+        seed: u8,
+        hostname: &str,
+        owner_fingerprint: Option<&str>,
+        verified: bool,
+    ) -> mesh::PeerInfo {
+        let secret = SecretKey::from_bytes(&[seed; 32]);
+        let id = EndpointId::from(secret.public());
+        mesh::PeerInfo {
+            id,
+            addr: EndpointAddr {
+                id,
+                addrs: Default::default(),
+            },
+            tunnel_port: None,
+            role: mesh::NodeRole::Worker,
+            models: vec![],
+            vram_bytes: 0,
+            rtt_ms: None,
+            model_source: None,
+            serving_models: vec![],
+            hosted_models: vec![],
+            hosted_models_known: false,
+            available_models: vec![],
+            model_sizes: None,
+            model_metadata: None,
+            requested_models: vec![],
+            last_seen: std::time::Instant::now(),
+            version: None,
+            gpu_name: None,
+            hostname: Some(hostname.to_string()),
+            is_soc: None,
+            gpu_vram: None,
+            gpu_bandwidth_gbps: None,
+            available_model_metadata: vec![],
+            experts_summary: None,
+            available_model_sizes: HashMap::new(),
+            owner_id: owner_fingerprint.map(|v| v.to_string()),
+            owner_fingerprint: owner_fingerprint.map(|v| v.to_string()),
+            served_model_descriptors: vec![],
+            owner_fingerprint_verified: verified,
+            owner_fingerprint_transitive: !verified && owner_fingerprint.is_some(),
+        }
+    }
+
+    fn http_post_with_headers(path: &str, body: &str, headers: &[(&str, String)]) -> Vec<u8> {
+        let mut req = format!(
+            "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/toml\r\nContent-Length: {}\r\n",
+            body.len()
+        );
+        for (name, value) in headers {
+            req.push_str(&format!("{name}: {value}\r\n"));
+        }
+        req.push_str("\r\n");
+
+        let mut bytes = req.into_bytes();
+        bytes.extend_from_slice(body.as_bytes());
+        bytes
+    }
+
+    async fn send_management_request_once(state: MeshApi, request_bytes: Vec<u8>) -> String {
+        let (addr, handle) = spawn_management_test_server(state).await;
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream.write_all(&request_bytes).await.unwrap();
+
+        let mut response_bytes = Vec::new();
+        stream.read_to_end(&mut response_bytes).await.unwrap();
+        handle.await.unwrap().unwrap();
+
+        String::from_utf8_lossy(&response_bytes).to_string()
+    }
+
+    fn status_code(response: &str) -> u16 {
+        response
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(0)
     }
 
     #[tokio::test]
@@ -2197,5 +3435,1088 @@ mod tests {
 
         drop(stream);
         handle.abort();
+    }
+
+    #[tokio::test]
+    async fn config_requires_valid_owner_signature() {
+        let body = "version = 3\n\n[[nodes]]\nnode_id = \"node-a\"\n";
+        let method = "POST";
+        let path = "/api/config";
+
+        let temp = make_temp_dir();
+        std::fs::create_dir_all(temp.join(".mesh-llm")).unwrap();
+        std::env::set_var("HOME", &temp);
+
+        let owner_secret = SecretKey::from_bytes(&[0x42; 32]);
+        let owner_fingerprint = hex::encode(Sha256::digest(owner_secret.public().as_bytes()));
+        std::fs::write(
+            temp.join(".mesh-llm/owner-key"),
+            hex::encode(owner_secret.to_bytes()),
+        )
+        .unwrap();
+
+        std::fs::write(temp.join(".mesh-llm/mesh.toml"), "version = 3\n").unwrap();
+
+        let fresh_timestamp = now_unix_timestamp();
+        let stale_timestamp = now_unix_timestamp() - (CONFIG_TIMESTAMP_MAX_AGE_SECS + 5);
+        let wrong_owner_fingerprint = "owner-fp-other";
+
+        let prev_config_hash = current_mesh_config_hash(&mesh_config_path()).unwrap();
+        let stale_prev_config_hash = "cfg-hash-stale";
+
+        let valid_payload = canonical_config_signature_payload(
+            method,
+            path,
+            body,
+            &owner_fingerprint,
+            fresh_timestamp,
+            &prev_config_hash,
+        );
+        let valid_signature = hex_signature(&owner_secret, &valid_payload);
+
+        let wrong_owner_payload = canonical_config_signature_payload(
+            method,
+            path,
+            body,
+            wrong_owner_fingerprint,
+            fresh_timestamp,
+            &prev_config_hash,
+        );
+        let wrong_owner_signature = hex_signature(&owner_secret, &wrong_owner_payload);
+
+        let stale_payload = canonical_config_signature_payload(
+            method,
+            path,
+            body,
+            &owner_fingerprint,
+            stale_timestamp,
+            &prev_config_hash,
+        );
+        let stale_signature = hex_signature(&owner_secret, &stale_payload);
+
+        let stale_prev_payload = canonical_config_signature_payload(
+            method,
+            path,
+            body,
+            &owner_fingerprint,
+            fresh_timestamp,
+            stale_prev_config_hash,
+        );
+        let stale_prev_signature = hex_signature(&owner_secret, &stale_prev_payload);
+
+        let mut cases: Vec<(&str, Vec<(&str, String)>, u16)> = Vec::new();
+        cases.push((
+            "missing signature",
+            vec![
+                (
+                    CONFIG_OWNER_FINGERPRINT_HEADER,
+                    owner_fingerprint.to_string(),
+                ),
+                (CONFIG_TIMESTAMP_HEADER, fresh_timestamp.to_string()),
+                (CONFIG_PREV_HASH_HEADER, prev_config_hash.to_string()),
+            ],
+            401,
+        ));
+        cases.push((
+            "invalid signature",
+            vec![
+                (
+                    CONFIG_OWNER_FINGERPRINT_HEADER,
+                    owner_fingerprint.to_string(),
+                ),
+                (CONFIG_TIMESTAMP_HEADER, fresh_timestamp.to_string()),
+                (CONFIG_PREV_HASH_HEADER, prev_config_hash.to_string()),
+                (CONFIG_SIGNATURE_HEADER, "invalid-signature".to_string()),
+            ],
+            401,
+        ));
+        cases.push((
+            "wrong owner key",
+            vec![
+                (
+                    "X-Mesh-Owner-Fingerprint",
+                    wrong_owner_fingerprint.to_string(),
+                ),
+                (CONFIG_TIMESTAMP_HEADER, fresh_timestamp.to_string()),
+                (CONFIG_PREV_HASH_HEADER, prev_config_hash.to_string()),
+                (CONFIG_SIGNATURE_HEADER, wrong_owner_signature),
+            ],
+            403,
+        ));
+        cases.push((
+            "stale timestamp",
+            vec![
+                (
+                    CONFIG_OWNER_FINGERPRINT_HEADER,
+                    owner_fingerprint.to_string(),
+                ),
+                (CONFIG_TIMESTAMP_HEADER, stale_timestamp.to_string()),
+                (CONFIG_PREV_HASH_HEADER, prev_config_hash.to_string()),
+                (CONFIG_SIGNATURE_HEADER, stale_signature),
+            ],
+            401,
+        ));
+        cases.push((
+            "stale prev_config_hash",
+            vec![
+                (
+                    CONFIG_OWNER_FINGERPRINT_HEADER,
+                    owner_fingerprint.to_string(),
+                ),
+                (CONFIG_TIMESTAMP_HEADER, fresh_timestamp.to_string()),
+                (CONFIG_PREV_HASH_HEADER, stale_prev_config_hash.to_string()),
+                (CONFIG_SIGNATURE_HEADER, stale_prev_signature),
+            ],
+            409,
+        ));
+        cases.push((
+            "valid signed apply",
+            vec![
+                (
+                    CONFIG_OWNER_FINGERPRINT_HEADER,
+                    owner_fingerprint.to_string(),
+                ),
+                (CONFIG_TIMESTAMP_HEADER, fresh_timestamp.to_string()),
+                (CONFIG_PREV_HASH_HEADER, prev_config_hash.to_string()),
+                (CONFIG_SIGNATURE_HEADER, valid_signature),
+            ],
+            200,
+        ));
+
+        for (name, headers, expected_status) in cases {
+            let response = send_management_request_once(
+                build_test_mesh_api().await,
+                http_post_with_headers(path, body, &headers),
+            )
+            .await;
+
+            assert_eq!(
+                status_code(&response),
+                expected_status,
+                "case {name} failed; response was: {response}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn config_broadcast_requires_loopback_origin() {
+        let body = "version = 3\n\n[[nodes]]\nnode_id = \"node-a\"\n";
+
+        let temp = make_temp_dir();
+        let owner_secret = SecretKey::from_bytes(&[0x42; 32]);
+        configure_test_owner_key(&temp, &owner_secret);
+
+        let non_loopback_response = send_management_request_once(
+            build_test_mesh_api().await,
+            http_post_with_headers(
+                "/api/config/broadcast",
+                body,
+                &[("X-Forwarded-For", "203.0.113.8".to_string())],
+            ),
+        )
+        .await;
+
+        assert_eq!(
+            status_code(&non_loopback_response),
+            403,
+            "non-loopback origin must be rejected; response was: {non_loopback_response}"
+        );
+
+        let mixed_forward_chain_response = send_management_request_once(
+            build_test_mesh_api().await,
+            http_post_with_headers(
+                "/api/config/broadcast",
+                body,
+                &[("X-Forwarded-For", "203.0.113.8, 127.0.0.1".to_string())],
+            ),
+        )
+        .await;
+
+        assert_eq!(
+            status_code(&mixed_forward_chain_response),
+            403,
+            "forward chain with non-loopback hop must be rejected; response was: {mixed_forward_chain_response}"
+        );
+
+        let loopback_response = send_management_request_once(
+            build_test_mesh_api().await,
+            http_post_with_headers(
+                "/api/config/broadcast",
+                body,
+                &[("X-Forwarded-For", "127.0.0.1".to_string())],
+            ),
+        )
+        .await;
+
+        assert_eq!(
+            status_code(&loopback_response),
+            200,
+            "loopback origin should remain allowed; response was: {loopback_response}"
+        );
+
+        let full_loopback_chain_response = send_management_request_once(
+            build_test_mesh_api().await,
+            http_post_with_headers(
+                "/api/config/broadcast",
+                body,
+                &[("X-Forwarded-For", "127.0.0.1, ::1, localhost".to_string())],
+            ),
+        )
+        .await;
+
+        assert_eq!(
+            status_code(&full_loopback_chain_response),
+            200,
+            "all-loopback forwarded chain should remain allowed; response was: {full_loopback_chain_response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_prev_config_hash_returns_conflict() {
+        let body = "version = 3\n\n[[nodes]]\nnode_id = \"node-a\"\n";
+        let owner_secret = SecretKey::from_bytes(&[0x42; 32]);
+        let owner_fingerprint = hex::encode(Sha256::digest(owner_secret.public().as_bytes()));
+
+        let temp = make_temp_dir();
+        configure_test_owner_key(&temp, &owner_secret);
+        std::fs::write(temp.join(".mesh-llm/mesh.toml"), "version = 3\n").unwrap();
+
+        let timestamp = now_unix_timestamp();
+        let stale_prev_config_hash = "cfg-hash-stale";
+        let payload = canonical_config_signature_payload(
+            "POST",
+            "/api/config",
+            body,
+            &owner_fingerprint,
+            timestamp,
+            stale_prev_config_hash,
+        );
+        let signature = hex_signature(&owner_secret, &payload);
+
+        let response = send_management_request_once(
+            build_test_mesh_api().await,
+            http_post_with_headers(
+                "/api/config",
+                body,
+                &[
+                    (CONFIG_OWNER_FINGERPRINT_HEADER, owner_fingerprint),
+                    (CONFIG_TIMESTAMP_HEADER, timestamp.to_string()),
+                    (CONFIG_PREV_HASH_HEADER, stale_prev_config_hash.to_string()),
+                    (CONFIG_SIGNATURE_HEADER, signature),
+                ],
+            ),
+        )
+        .await;
+
+        assert_eq!(status_code(&response), 409, "response was: {response}");
+    }
+
+    #[tokio::test]
+    async fn config_accepted_when_receiver_has_no_config_file() {
+        let body = "version = 3\n\n[[nodes]]\nnode_id = \"node-a\"\n";
+        let owner_secret = SecretKey::from_bytes(&[0x42; 32]);
+        let owner_fingerprint = hex::encode(Sha256::digest(owner_secret.public().as_bytes()));
+
+        let temp = make_temp_dir();
+        configure_test_owner_key(&temp, &owner_secret);
+
+        // Verify no config file exists (configure_test_owner_key creates .mesh-llm/
+        // but not mesh.toml).
+        assert!(
+            !mesh_config_path().exists(),
+            "precondition: config file must not exist"
+        );
+
+        // Use a prev_config_hash that does NOT match the default empty config hash —
+        // simulates a broadcaster that already has a saved config.
+        let mismatched_prev_hash = "abc123deadbeef";
+        let timestamp = now_unix_timestamp();
+        let payload = canonical_config_signature_payload(
+            "POST",
+            "/api/config",
+            body,
+            &owner_fingerprint,
+            timestamp,
+            mismatched_prev_hash,
+        );
+        let signature = hex_signature(&owner_secret, &payload);
+
+        let response = send_management_request_once(
+            build_test_mesh_api().await,
+            http_post_with_headers(
+                "/api/config",
+                body,
+                &[
+                    (CONFIG_OWNER_FINGERPRINT_HEADER, owner_fingerprint),
+                    (CONFIG_TIMESTAMP_HEADER, timestamp.to_string()),
+                    (CONFIG_PREV_HASH_HEADER, mismatched_prev_hash.to_string()),
+                    (CONFIG_SIGNATURE_HEADER, signature),
+                ],
+            ),
+        )
+        .await;
+
+        assert_eq!(
+            status_code(&response),
+            200,
+            "config push to node with no config file must succeed regardless of prev_config_hash; response was: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn replayed_signed_checkpoint_is_rejected_after_restart() {
+        let body = "version = 3\n\n[[nodes]]\nnode_id = \"node-a\"\n";
+        let owner_secret = SecretKey::from_bytes(&[0x42; 32]);
+        let owner_fingerprint = hex::encode(Sha256::digest(owner_secret.public().as_bytes()));
+
+        let temp = make_temp_dir();
+        configure_test_owner_key(&temp, &owner_secret);
+
+        let timestamp = now_unix_timestamp();
+        let prev_config_hash = current_mesh_config_hash(&mesh_config_path()).unwrap();
+        let payload = canonical_config_signature_payload(
+            "POST",
+            "/api/config",
+            body,
+            &owner_fingerprint,
+            timestamp,
+            &prev_config_hash,
+        );
+        let signature = hex_signature(&owner_secret, &payload);
+
+        let signed_request = http_post_with_headers(
+            "/api/config",
+            body,
+            &[
+                (CONFIG_OWNER_FINGERPRINT_HEADER, owner_fingerprint.clone()),
+                (CONFIG_TIMESTAMP_HEADER, timestamp.to_string()),
+                (CONFIG_PREV_HASH_HEADER, prev_config_hash),
+                (CONFIG_SIGNATURE_HEADER, signature),
+            ],
+        );
+
+        let first =
+            send_management_request_once(build_test_mesh_api().await, signed_request.clone()).await;
+        assert_eq!(status_code(&first), 200, "first apply failed: {first}");
+        assert!(
+            replay_signature_seen_before(
+                &parse_header_value(&signed_request, CONFIG_SIGNATURE_HEADER).unwrap()
+            )
+            .unwrap(),
+            "signature must be persisted after first apply"
+        );
+
+        let replay =
+            send_management_request_once(build_test_mesh_api().await, signed_request).await;
+        assert_eq!(status_code(&replay), 409, "replay must conflict: {replay}");
+    }
+
+    #[tokio::test]
+    async fn loopback_broadcast_signs_and_relays_to_owned_peers() {
+        let owner_secret = SecretKey::from_bytes(&[0x42; 32]);
+        let owner_fingerprint = hex::encode(Sha256::digest(owner_secret.public().as_bytes()));
+        let body = "version = 3\n\n[[nodes]]\nnode_id = \"node-a\"\n";
+
+        let temp = make_temp_dir();
+        configure_test_owner_key(&temp, &owner_secret);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_port = listener.local_addr().unwrap().port();
+        let (captured_tx, captured_rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = proxy::read_http_request(&mut stream).await.unwrap();
+            let _ = captured_tx.send(request.raw.clone());
+            let response = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+            stream.write_all(response).await.unwrap();
+        });
+
+        let prev_config_hash = current_mesh_config_hash(&mesh_config_path()).unwrap();
+        let timestamp = now_unix_timestamp();
+        let canonical_payload = canonical_config_signature_payload(
+            "POST",
+            "/api/config",
+            body,
+            &owner_fingerprint,
+            timestamp,
+            &prev_config_hash,
+        );
+        let signature = sign_config_payload(&canonical_payload).unwrap();
+
+        let peers = vec![
+            peer_info_with_owner(0x11, "127.0.0.1", Some(&owner_fingerprint), true),
+            peer_info_with_owner(0x22, "198.51.100.11", Some("owner-fp-other"), true),
+            peer_info_with_owner(0x33, "198.51.100.12", Some(&owner_fingerprint), false),
+        ];
+        let relay_peers: Vec<mesh::PeerInfo> = peers
+            .into_iter()
+            .filter(|peer| {
+                peer.owner_fingerprint_verified
+                    && peer.owner_fingerprint.as_deref() == Some(owner_fingerprint.as_str())
+            })
+            .collect();
+        assert_eq!(
+            relay_peers.len(),
+            1,
+            "only same-owner verified peers must be relayed to"
+        );
+
+        let headers = ConfigRelayHeaders {
+            owner_fingerprint: owner_fingerprint.clone(),
+            timestamp,
+            prev_config_hash: prev_config_hash.clone(),
+            signature: signature.clone(),
+        };
+        let relay_results = relay_config_to_peers(&relay_peers, relay_port, body, &headers).await;
+        assert_eq!(relay_results.len(), 1, "exactly one relay expected");
+        assert!(relay_results[0].ok, "owned peer relay should succeed");
+
+        let relayed_raw = captured_rx.await.unwrap();
+        let relayed_text = String::from_utf8_lossy(&relayed_raw);
+        assert!(relayed_text.starts_with("POST /api/config HTTP/1.1"));
+        assert_eq!(
+            parse_header_value(&relayed_raw, CONFIG_OWNER_FINGERPRINT_HEADER),
+            Some(owner_fingerprint)
+        );
+        assert_eq!(
+            parse_header_value(&relayed_raw, CONFIG_TIMESTAMP_HEADER),
+            Some(timestamp.to_string())
+        );
+        assert_eq!(
+            parse_header_value(&relayed_raw, CONFIG_PREV_HASH_HEADER),
+            Some(prev_config_hash)
+        );
+        assert_eq!(
+            parse_header_value(&relayed_raw, CONFIG_SIGNATURE_HEADER),
+            Some(signature)
+        );
+    }
+
+    #[tokio::test]
+    async fn unowned_broadcast_does_not_mutate_local_config_or_runtime_files() {
+        let body = "version = 3\n\n[[nodes]]\nnode_id = \"node-a\"\n";
+
+        let temp = make_temp_dir();
+        std::fs::create_dir_all(temp.join(".mesh-llm")).unwrap();
+        std::env::set_var("HOME", &temp);
+
+        let mesh_path = mesh_config_path();
+        let node_path = node_config_path();
+        let initial_mesh = "version = 3\n";
+        let initial_node = "node_id = \"sentinel\"\n";
+        std::fs::write(&mesh_path, initial_mesh).unwrap();
+        std::fs::write(&node_path, initial_node).unwrap();
+
+        let state = build_test_mesh_api().await;
+        {
+            let node = state.inner.lock().await.node.clone();
+            node.set_owner_key_material(None).await;
+        }
+
+        let response = send_management_request_once(
+            state,
+            http_post_with_headers(
+                "/api/config/broadcast",
+                body,
+                &[("X-Forwarded-For", "127.0.0.1".to_string())],
+            ),
+        )
+        .await;
+
+        assert_eq!(
+            status_code(&response),
+            403,
+            "unowned node must reject broadcast before local mutation; response was: {response}"
+        );
+        assert_eq!(std::fs::read_to_string(&mesh_path).unwrap(), initial_mesh);
+        assert_eq!(std::fs::read_to_string(&node_path).unwrap(), initial_node);
+    }
+
+    #[test]
+    fn test_peer_payload_serializes_model_scans_when_present() {
+        let payload = PeerPayload {
+            id: "peer1".into(),
+            role: "Worker".into(),
+            models: vec!["Qwen3-8B-Q4_K_M".into()],
+            available_models: vec![],
+            requested_models: vec![],
+            vram_gb: 24.0,
+            serving_models: vec![],
+            hosted_models: vec![],
+            hosted_models_known: false,
+            rtt_ms: Some(12),
+            hostname: Some("node-a".into()),
+            is_soc: Some(false),
+            owner_id: None,
+            owner_fingerprint: None,
+            owner_fingerprint_verified: false,
+            owner_fingerprint_transitive: false,
+            gpus: vec![],
+            model_sizes: Some(vec![("Qwen3-8B-Q4_K_M".into(), 5_000_000_000)]),
+            model_scans: Some(vec![mesh::ScannedModel {
+                name: "Qwen3-8B-Q4_K_M".into(),
+                model_key: "abc123".into(),
+                size_bytes: 5_000_000_000,
+                metadata: mesh::CompactModelMetadata {
+                    architecture: Some("llama".into()),
+                    total_layers: Some(32),
+                    total_offloadable_layers: Some(33),
+                    file_size: 5_000_000_000,
+                    dense_split_capable: true,
+                    ..Default::default()
+                },
+            }]),
+        };
+
+        let json = serde_json::to_value(&payload).unwrap();
+        assert!(json.get("model_scans").is_some());
+        assert_eq!(json["model_scans"][0]["model_key"], "abc123");
+        assert_eq!(
+            json["model_scans"][0]["metadata"]["total_offloadable_layers"],
+            33
+        );
+    }
+
+    #[test]
+    fn test_peer_payload_omits_model_scans_when_missing() {
+        let payload = PeerPayload {
+            id: "peer1".into(),
+            role: "Worker".into(),
+            models: vec![],
+            available_models: vec![],
+            requested_models: vec![],
+            vram_gb: 0.0,
+            serving_models: vec![],
+            hosted_models: vec![],
+            hosted_models_known: false,
+            rtt_ms: None,
+            hostname: None,
+            is_soc: None,
+            owner_id: None,
+            owner_fingerprint: None,
+            owner_fingerprint_verified: false,
+            owner_fingerprint_transitive: false,
+            gpus: vec![],
+            model_sizes: None,
+            model_scans: None,
+        };
+
+        let json = serde_json::to_value(&payload).unwrap();
+        assert!(json.get("model_scans").is_none());
+    }
+
+    #[test]
+    fn test_config_round_trip_post_then_get_toml() {
+        let temp = make_temp_dir();
+        let path = temp.join("mesh.toml");
+
+        let input = r#"
+version = 2
+
+[[nodes]]
+node_id = "abc123"
+
+[[nodes.models]]
+name = "llama-3.3-70b"
+model_key = "mk-llama-70b"
+split = { start = 0, end = 32, total = 33 }
+ctx_size = 4096
+"#;
+
+        let parsed =
+            parse_and_validate_mesh_config(input, &split_catalog(&[("mk-llama-70b", 33)])).unwrap();
+        parsed.save(&path).unwrap();
+
+        let got_toml = read_mesh_config_toml(&path).unwrap();
+        let got: AuthoredMeshConfig = toml::from_str(&got_toml).unwrap();
+
+        assert_eq!(got.version, AUTHORED_CONFIG_VERSION);
+        assert_eq!(got.nodes.len(), 1);
+        assert_eq!(got.nodes[0].node_id, "abc123");
+        assert_eq!(got.nodes[0].models.len(), 1);
+        assert_eq!(got.nodes[0].models[0].name, "llama-3.3-70b");
+        assert_eq!(
+            got.nodes[0].models[0].model_key.as_deref(),
+            Some("mk-llama-70b")
+        );
+        assert_eq!(got.nodes[0].models[0].split.as_ref().unwrap().total, 33);
+        assert_eq!(got.nodes[0].models[0].ctx_size, Some(4096));
+    }
+
+    #[test]
+    fn test_invalid_toml_rejected() {
+        let err = parse_and_validate_mesh_config(
+            "invalid = [broken toml",
+            &SplitValidationCatalog::default(),
+        )
+        .unwrap_err();
+        assert!(err.iter().any(|e| e.code == "invalid_toml"));
+    }
+
+    #[test]
+    fn test_empty_node_id_rejected() {
+        let cfg = AuthoredMeshConfig {
+            version: AUTHORED_CONFIG_VERSION,
+            nodes: vec![AuthoredNodeConfig {
+                node_id: "   ".into(),
+                hostname: None,
+                placement_mode: PlacementMode::Pooled,
+                models: vec![],
+            }],
+        };
+        let err = validate_mesh_config(&cfg, &SplitValidationCatalog::default()).unwrap_err();
+        assert!(err.iter().any(|e| e.code == "empty_node_id"));
+    }
+
+    #[test]
+    fn test_empty_model_name_rejected() {
+        let cfg = AuthoredMeshConfig {
+            version: AUTHORED_CONFIG_VERSION,
+            nodes: vec![AuthoredNodeConfig {
+                node_id: "node-a".into(),
+                hostname: None,
+                placement_mode: PlacementMode::Pooled,
+                models: vec![AuthoredModelAssignment {
+                    name: "   ".into(),
+                    model_key: None,
+                    split: None,
+                    path: None,
+                    ctx_size: None,
+                    moe_experts: None,
+                    gpu_index: None,
+                }],
+            }],
+        };
+        let err = validate_mesh_config(&cfg, &SplitValidationCatalog::default()).unwrap_err();
+        assert!(err.iter().any(|e| e.code == "empty_model_name"));
+    }
+
+    #[test]
+    fn test_node_lookup_found_and_missing() {
+        let cfg = MeshConfig {
+            nodes: vec![NodeConfig {
+                node_id: "node-1".into(),
+                hostname: Some("alpha.local".into()),
+                models: vec![ModelAssignment {
+                    name: "Qwen3-8B-Q4_K_M".into(),
+                    path: None,
+                    ctx_size: Some(4096),
+                    moe_experts: None,
+                }],
+            }],
+        };
+
+        let found = cfg.for_node("node-1");
+        assert!(found.is_some());
+        assert!(cfg.for_node("missing").is_none());
+    }
+
+    #[test]
+    fn test_sync_node_runtime_config_writes_selected_node() {
+        let temp = make_temp_dir();
+        let node_path = temp.join("node.toml");
+        let cfg = AuthoredMeshConfig {
+            version: AUTHORED_CONFIG_VERSION,
+            nodes: vec![
+                AuthoredNodeConfig {
+                    node_id: "node-a".into(),
+                    hostname: Some("alpha.local".into()),
+                    placement_mode: PlacementMode::Pooled,
+                    models: vec![],
+                },
+                AuthoredNodeConfig {
+                    node_id: "node-b".into(),
+                    hostname: Some("beta.local".into()),
+                    placement_mode: PlacementMode::Pooled,
+                    models: vec![AuthoredModelAssignment {
+                        name: "Qwen3-8B-Q4_K_M".into(),
+                        model_key: Some("mk-qwen3-8b".into()),
+                        split: Some(ModelSplit {
+                            start: 0,
+                            end: 32,
+                            total: 33,
+                        }),
+                        path: None,
+                        ctx_size: Some(8192),
+                        moe_experts: None,
+                        gpu_index: None,
+                    }],
+                },
+            ],
+        };
+
+        sync_node_runtime_config_at(&node_path, &cfg, "node-b").unwrap();
+        let saved = NodeConfig::load(&node_path).unwrap().unwrap();
+
+        assert_eq!(saved.node_id, "node-b");
+        assert_eq!(saved.hostname.as_deref(), Some("beta.local"));
+        assert_eq!(saved.models.len(), 1);
+        assert_eq!(saved.models[0].name, "Qwen3-8B-Q4_K_M");
+    }
+
+    #[test]
+    fn test_sync_node_runtime_config_removes_stale_file_when_node_missing() {
+        let temp = make_temp_dir();
+        let node_path = temp.join("node.toml");
+        let stale = NodeConfig {
+            node_id: "node-a".into(),
+            hostname: None,
+            models: vec![],
+        };
+        stale.save(&node_path).unwrap();
+        assert!(node_path.exists());
+
+        let cfg = AuthoredMeshConfig {
+            version: AUTHORED_CONFIG_VERSION,
+            nodes: vec![AuthoredNodeConfig {
+                node_id: "node-b".into(),
+                hostname: None,
+                placement_mode: PlacementMode::Pooled,
+                models: vec![],
+            }],
+        };
+
+        sync_node_runtime_config_at(&node_path, &cfg, "node-a").unwrap();
+        assert!(!node_path.exists());
+    }
+
+    #[test]
+    fn test_read_mesh_config_missing_file_returns_empty_toml() {
+        let temp = make_temp_dir();
+        let missing = temp.join("missing-mesh.toml");
+        let toml = read_mesh_config_toml(&missing).unwrap();
+        let parsed: AuthoredMeshConfig = toml::from_str(&toml).unwrap();
+        assert_eq!(parsed.version, AUTHORED_CONFIG_VERSION);
+        assert!(parsed.nodes.is_empty());
+    }
+
+    #[test]
+    fn test_split_validation_rejects_overlap_gap_and_total_mismatch() {
+        let cfg = AuthoredMeshConfig {
+            version: AUTHORED_CONFIG_VERSION,
+            nodes: vec![AuthoredNodeConfig {
+                node_id: "node-a".into(),
+                hostname: None,
+                placement_mode: PlacementMode::Pooled,
+                models: vec![
+                    AuthoredModelAssignment {
+                        name: "ModelA".into(),
+                        model_key: Some("mk-model-a".into()),
+                        split: Some(ModelSplit {
+                            start: 0,
+                            end: 10,
+                            total: 33,
+                        }),
+                        path: None,
+                        ctx_size: None,
+                        moe_experts: None,
+                        gpu_index: None,
+                    },
+                    AuthoredModelAssignment {
+                        name: "ModelA".into(),
+                        model_key: Some("mk-model-a".into()),
+                        split: Some(ModelSplit {
+                            start: 10,
+                            end: 20,
+                            total: 34,
+                        }),
+                        path: None,
+                        ctx_size: None,
+                        moe_experts: None,
+                        gpu_index: None,
+                    },
+                ],
+            }],
+        };
+
+        let err = validate_mesh_config(&cfg, &split_catalog(&[("mk-model-a", 33)])).unwrap_err();
+        assert!(err.iter().any(|e| e.code == "mismatched_split_totals"));
+        assert!(err.iter().any(|e| e.code == "overlapping_split_ranges"));
+        assert!(err
+            .iter()
+            .any(|e| e.code == "incomplete_split_coverage" || e.code == "split_gap"));
+    }
+
+    #[test]
+    fn test_split_validation_rejects_unknown_model_key_and_out_of_range() {
+        let cfg = AuthoredMeshConfig {
+            version: AUTHORED_CONFIG_VERSION,
+            nodes: vec![AuthoredNodeConfig {
+                node_id: "node-a".into(),
+                hostname: None,
+                placement_mode: PlacementMode::Pooled,
+                models: vec![AuthoredModelAssignment {
+                    name: "ModelA".into(),
+                    model_key: Some("mk-missing".into()),
+                    split: Some(ModelSplit {
+                        start: 0,
+                        end: 40,
+                        total: 33,
+                    }),
+                    path: None,
+                    ctx_size: None,
+                    moe_experts: None,
+                    gpu_index: None,
+                }],
+            }],
+        };
+
+        let err = validate_mesh_config(&cfg, &SplitValidationCatalog::default()).unwrap_err();
+        assert!(err.iter().any(|e| e.code == "split_out_of_range"));
+    }
+
+    #[test]
+    fn test_split_validation_rejects_unsupported_version() {
+        let cfg = AuthoredMeshConfig {
+            version: AUTHORED_CONFIG_VERSION + 1,
+            nodes: vec![],
+        };
+
+        let err = validate_mesh_config(&cfg, &SplitValidationCatalog::default()).unwrap_err();
+        assert!(err.iter().any(|e| e.code == "unsupported_version"));
+    }
+
+    #[test]
+    fn placement_validation_requires_gpu_index_in_separate_mode() {
+        let cfg = AuthoredMeshConfig {
+            version: AUTHORED_CONFIG_VERSION,
+            nodes: vec![AuthoredNodeConfig {
+                node_id: "node-a".into(),
+                hostname: None,
+                placement_mode: PlacementMode::Separate,
+                models: vec![AuthoredModelAssignment {
+                    name: "ModelA".into(),
+                    model_key: None,
+                    split: None,
+                    path: None,
+                    ctx_size: None,
+                    moe_experts: None,
+                    gpu_index: None,
+                }],
+            }],
+        };
+
+        let err = validate_mesh_config(&cfg, &SplitValidationCatalog::default()).unwrap_err();
+        assert!(
+            err.iter()
+                .any(|e| e.code == "missing_gpu_index_in_separate_mode"),
+            "expected missing_gpu_index_in_separate_mode error, got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn placement_validation_forbids_gpu_index_in_pooled_mode() {
+        let cfg = AuthoredMeshConfig {
+            version: AUTHORED_CONFIG_VERSION,
+            nodes: vec![AuthoredNodeConfig {
+                node_id: "node-a".into(),
+                hostname: None,
+                placement_mode: PlacementMode::Pooled,
+                models: vec![AuthoredModelAssignment {
+                    name: "ModelA".into(),
+                    model_key: None,
+                    split: None,
+                    path: None,
+                    ctx_size: None,
+                    moe_experts: None,
+                    gpu_index: Some(0),
+                }],
+            }],
+        };
+
+        let err = validate_mesh_config(&cfg, &SplitValidationCatalog::default()).unwrap_err();
+        assert!(
+            err.iter().any(|e| e.code == "gpu_index_in_pooled_mode"),
+            "expected gpu_index_in_pooled_mode error, got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn placement_validation_and_split_validation_report_separately() {
+        let cfg = AuthoredMeshConfig {
+            version: AUTHORED_CONFIG_VERSION,
+            nodes: vec![AuthoredNodeConfig {
+                node_id: "node-a".into(),
+                hostname: None,
+                placement_mode: PlacementMode::Separate,
+                models: vec![
+                    AuthoredModelAssignment {
+                        name: "ModelA".into(),
+                        model_key: Some("mk-model-a".into()),
+                        split: Some(ModelSplit {
+                            start: 0,
+                            end: 10,
+                            total: 20,
+                        }),
+                        path: None,
+                        ctx_size: None,
+                        moe_experts: None,
+                        gpu_index: Some(0),
+                    },
+                    AuthoredModelAssignment {
+                        name: "ModelA".into(),
+                        model_key: Some("mk-model-a".into()),
+                        split: Some(ModelSplit {
+                            start: 5,
+                            end: 19,
+                            total: 20,
+                        }),
+                        path: None,
+                        ctx_size: None,
+                        moe_experts: None,
+                        gpu_index: Some(5),
+                    },
+                ],
+            }],
+        };
+
+        let mut catalog = split_catalog(&[("mk-model-a", 20)]);
+        catalog.gpu_counts_by_node_id.insert("node-a".into(), 2);
+
+        let err = validate_mesh_config(&cfg, &catalog).unwrap_err();
+        assert!(
+            err.iter()
+                .any(|e| e.code == "overlapping_split_ranges" || e.code == "split_gap"),
+            "expected a split error, got: {:?}",
+            err
+        );
+        assert!(
+            err.iter().any(|e| e.code == "gpu_index_out_of_range"),
+            "expected gpu_index_out_of_range error, got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_invalid_config_does_not_overwrite_existing_file() {
+        let temp = make_temp_dir();
+        let path = temp.join("mesh.toml");
+
+        let valid = AuthoredMeshConfig {
+            version: AUTHORED_CONFIG_VERSION,
+            nodes: vec![AuthoredNodeConfig {
+                node_id: "node-a".into(),
+                hostname: None,
+                placement_mode: PlacementMode::Pooled,
+                models: vec![AuthoredModelAssignment {
+                    name: "ModelA".into(),
+                    model_key: Some("mk-model-a".into()),
+                    split: Some(ModelSplit {
+                        start: 0,
+                        end: 32,
+                        total: 33,
+                    }),
+                    path: None,
+                    ctx_size: None,
+                    moe_experts: None,
+                    gpu_index: None,
+                }],
+            }],
+        };
+        valid.save(&path).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let invalid = r#"
+version = 2
+
+[[nodes]]
+node_id = "node-a"
+
+[[nodes.models]]
+name = "ModelA"
+model_key = "mk-model-a"
+split = { start = 0, end = 31, total = 33 }
+"#;
+        let result = parse_and_validate_mesh_config(invalid, &split_catalog(&[("mk-model-a", 33)]));
+        assert!(result.is_err());
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn test_console_index_routes_include_config_dashboard_chat() {
+        assert!(is_console_index_path("/config"));
+        assert!(is_console_index_path("/config/"));
+        assert!(is_console_index_path("/dashboard"));
+        assert!(is_console_index_path("/chat"));
+        assert!(is_console_index_path("/chat/abc"));
+        assert!(!is_console_index_path("/api/does-not-exist"));
+    }
+
+    #[tokio::test]
+    async fn test_respond_error_uses_json_404_payload() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            let mut buf = vec![0u8; 512];
+            let n = stream.read(&mut buf).await.unwrap();
+            String::from_utf8_lossy(&buf[..n]).to_string()
+        });
+
+        let (mut server_stream, _) = listener.accept().await.unwrap();
+        respond_error(&mut server_stream, 404, "Not found")
+            .await
+            .unwrap();
+
+        let resp = client.await.unwrap();
+        assert!(resp.starts_with("HTTP/1.1 404 Not Found"));
+        assert!(resp.contains("Content-Type: application/json"));
+        assert!(resp.contains("{\"error\":\"Not found\"}"));
+    }
+
+    #[tokio::test]
+    async fn test_console_index_response_is_html_200() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            let mut buf = vec![0u8; 2048];
+            let n = stream.read(&mut buf).await.unwrap();
+            String::from_utf8_lossy(&buf[..n]).to_string()
+        });
+
+        let (mut server_stream, _) = listener.accept().await.unwrap();
+        let served = respond_console_index(&mut server_stream).await.unwrap();
+        assert!(served, "embedded UI index.html should be available");
+
+        let resp = client.await.unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200 OK"));
+        assert!(resp.contains("Content-Type: text/html; charset=utf-8"));
+    }
+
+    #[tokio::test]
+    async fn test_respond_validation_errors_returns_machine_readable_payload() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            let mut buf = vec![0u8; 2048];
+            let n = stream.read(&mut buf).await.unwrap();
+            String::from_utf8_lossy(&buf[..n]).to_string()
+        });
+
+        let (mut server_stream, _) = listener.accept().await.unwrap();
+        respond_validation_errors(
+            &mut server_stream,
+            &[ConfigValidationError {
+                code: "split_gap".into(),
+                path: "nodes[0].models[0].split".into(),
+                message: "split gap before segment".into(),
+            }],
+        )
+        .await
+        .unwrap();
+
+        let resp = client.await.unwrap();
+        assert!(resp.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(resp.contains("\"error\":\"config_validation_failed\""));
+        assert!(resp.contains("\"code\":\"split_gap\""));
     }
 }

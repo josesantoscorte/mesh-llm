@@ -416,7 +416,11 @@ pub async fn download_hf_repo_file(
     paths.sort();
     paths
         .into_iter()
-        .find(|path| path.ends_with(&asset.file))
+        .find(|path| {
+            path.file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|name| name.eq_ignore_ascii_case(&asset.file))
+        })
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "Downloaded Hugging Face asset not found in cache: {repo}/{file}@{revision}"
@@ -439,7 +443,9 @@ pub async fn download_model(model: &CatalogModel) -> Result<PathBuf> {
         return paths
             .into_iter()
             .find(|path| {
-                path.file_name().and_then(|value| value.to_str()) == Some(model.file.as_str())
+                path.file_name()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|name| name.eq_ignore_ascii_case(&model.file))
             })
             .ok_or_else(|| {
                 anyhow::anyhow!(

@@ -221,6 +221,7 @@ pub struct GgufCompactMeta {
     pub feed_forward_length: u32,
     pub key_length: u32,
     pub value_length: u32,
+    pub head_count_kv: u32,
     pub tokenizer_model_name: String,
     pub rope_scale: f32,
     pub rope_freq_base: f32,
@@ -312,6 +313,8 @@ pub fn scan_gguf_compact_meta(path: &Path) -> Option<GgufCompactMeta> {
             skip_gguf_value(&mut f, vtype).ok()?;
         }
     }
+
+    meta.head_count_kv = kv_head_count;
 
     if meta.head_count > 0 {
         if meta.key_length == 0 {

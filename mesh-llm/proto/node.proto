@@ -35,6 +35,11 @@ message PeerAnnouncement {
   optional bool hosted_models_known = 24;            // false/absent when relayed from legacy JSON peers
   repeated ServedModelDescriptor served_model_descriptors = 25;
   repeated ServedModelIdentity served_model_identities = 26;
+  optional string owner_id = 27;
+  optional string owner_fingerprint = 28;            // SHA-256(owner public key); canonical owner identifier
+  optional OwnerAttestation owner_attestation = 29;  // self-announcement proof binding owner key to node identity
+  optional bool owner_fingerprint_verified = 30;     // true only when directly verified from self-announcement
+  optional bool owner_fingerprint_transitive = 31;   // true when metadata arrived transitively and is display-only
 }
 
 message ServedModelDescriptor {
@@ -53,6 +58,7 @@ message ServedModelIdentity {
   optional string artifact = 7;
   optional string local_file_name = 8;
   optional string identity_hash = 9;
+  optional uint64 file_size = 10;
 }
 
 message ModelCapabilities {
@@ -80,6 +86,11 @@ message ModelMoeInfo {
   optional string source = 4;
 }
 
+message OwnerAttestation {
+  bytes owner_public_key = 1; // exactly 32 bytes (ed25519 public key)
+  bytes signature = 2;        // owner-key signature over attestation payload
+}
+
 message CompactModelMetadata {
   string model_key = 1;
   uint32 context_length = 2;
@@ -99,6 +110,7 @@ message CompactModelMetadata {
   uint32 expert_count = 16;
   uint32 used_expert_count = 17;
   string quantization_type = 18;                     // GGUF quantization type string (e.g. "Q4_K_M")
+  uint32 head_count_kv = 19;
 }
 
 message SpecialToken {
@@ -166,6 +178,20 @@ message PeerDown {
 message PeerLeaving {
   bytes peer_id = 1;   // exactly 32 bytes; must match the QUIC sender identity
   uint32 gen = 2;      // must equal NODE_PROTOCOL_GENERATION; rejected otherwise
+}
+
+// Stream 0x0b — Scan Request (QUIC relay)
+message ScanRequest {
+  uint32 gen = 1;      // must equal NODE_PROTOCOL_GENERATION; rejected otherwise
+  bytes requester_id = 2;  // 32 bytes — originating node's endpoint id
+}
+
+message ScanResponse {
+  uint32 gen = 1;      // must equal NODE_PROTOCOL_GENERATION
+  bool success = 2;
+  optional string error = 3;
+  repeated CompactModelMetadata model_metadata = 4;   // models discovered by the scan
+  map<string, uint64> model_sizes = 5;                // file sizes (bytes) per GGUF model name
 }
 
 // Shared enum

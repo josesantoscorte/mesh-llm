@@ -34,6 +34,7 @@ import {
   Hash,
   ImagePlus,
   Info,
+  Key,
   Laptop,
   Loader2,
   MessageSquarePlus,
@@ -103,6 +104,12 @@ import {
   TableHeader,
   TableRow,
 } from "./components/ui/table";
+import {
+  Tabs,
+  TabsContent,
+  TabsList,
+  TabsTrigger,
+} from "./components/ui/tabs";
 import { Textarea } from "./components/ui/textarea";
 import {
   Tooltip,
@@ -119,7 +126,9 @@ import {
 } from "./components/ui/sheet";
 import { BrandIcon } from "./components/brand-icon";
 import { MeshLlmWordmark } from "./components/mesh-llm-wordmark";
+import { shortenHardwareModelName } from "./lib/hardware";
 import { cn } from "./lib/utils";
+import { ConfigPage } from "./pages/ConfigPage";
 import githubBlackLogo from "./assets/icons/github-invertocat-black.svg";
 import githubWhiteLogo from "./assets/icons/github-invertocat-white.svg";
 
@@ -215,9 +224,13 @@ type Peer = {
   hostname?: string;
   is_soc?: boolean;
   gpus?: { name: string; vram_bytes: number; bandwidth_gbps?: number }[];
+  owner_id?: string | null;
+  owner_fingerprint?: string | null;
+  owner_fingerprint_verified?: boolean;
+  owner_fingerprint_transitive?: boolean;
 };
 
-type StatusPayload = {
+export type StatusPayload = {
   version?: string;
   latest_version?: string | null;
   node_id: string;
@@ -244,6 +257,10 @@ type StatusPayload = {
   my_hostname?: string;
   my_is_soc?: boolean;
   gpus?: { name: string; vram_bytes: number; bandwidth_gbps?: number }[];
+  owner_id?: string | null;
+  owner_fingerprint?: string | null;
+  owner_fingerprint_verified?: boolean;
+  owner_fingerprint_transitive?: boolean;
 };
 
 type ModelsPayload = {
@@ -280,7 +297,7 @@ type ModelServingStat = {
   vramGb: number;
 };
 
-type TopSection = "dashboard" | "chat";
+type TopSection = "dashboard" | "chat" | "config";
 type AppRoute = {
   section: TopSection;
   chatId: string | null;
@@ -312,6 +329,13 @@ const CHAT_SAVE_DEBOUNCE_MS = 500;
 const CHAT_MAX_CONVERSATIONS = 80;
 const CHAT_MAX_MESSAGES_PER_CONVERSATION = 240;
 const CHAT_MAX_TEXT_CHARS = 12000;
+const RECONNECT_STATUS_MESSAGE = 'Trying to reconnect automatically. Live updates will resume shortly.';
+
+async function fetchStatusPayload(): Promise<StatusPayload> {
+  const response = await fetch('/api/status');
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  return response.json() as Promise<StatusPayload>;
+}
 
 function peerAssignedModels(peer: Peer): string[] {
   return peer.serving_models?.filter(Boolean) ?? [];
@@ -356,6 +380,7 @@ function sectionFromPathname(pathname: string): TopSection | null {
     pathname.startsWith("/chat/")
   )
     return "chat";
+  if (pathname === "/config" || pathname === "/config/") return "config";
   return null;
 }
 
@@ -371,6 +396,8 @@ function readRouteFromLocation(): AppRoute {
     return { section: "dashboard", chatId: null };
   if (pathname === "/chat" || pathname === "/chat/")
     return { section: "chat", chatId: null };
+  if (pathname === "/config" || pathname === "/config/")
+    return { section: "config", chatId: null };
   if (pathname.startsWith("/chat/")) {
     const raw = pathname.slice("/chat/".length);
     const chatId = raw ? decodeURIComponent(raw.split("/")[0]) : null;
@@ -382,6 +409,7 @@ function readRouteFromLocation(): AppRoute {
 
 function pathnameForRoute(route: AppRoute): string {
   if (route.section === "dashboard") return "/dashboard";
+  if (route.section === "config") return "/config";
   return route.chatId ? `/chat/${encodeURIComponent(route.chatId)}` : "/chat";
 }
 
@@ -898,8 +926,6 @@ export function App() {
     let reconnectTimer: number | null = null;
     let retryMs = 1000;
     const MAX_RETRY_MS = 15000;
-    const reconnectStatusMessage =
-      "Trying to reconnect automatically. Live updates will resume shortly.";
 
     const clearReconnectTimer = () => {
       if (reconnectTimer !== null) {
@@ -918,11 +944,7 @@ export function App() {
     };
 
     const loadStatus = () => {
-      fetch("/api/status")
-        .then((r) => {
-          if (!r.ok) throw new Error(`HTTP ${r.status}`);
-          return r.json() as Promise<StatusPayload>;
-        })
+      fetchStatusPayload()
         .then((data) => {
           if (stop) return;
           setStatus(data);
@@ -930,7 +952,7 @@ export function App() {
         })
         .catch((err: Error) => {
           if (!stop) {
-            setStatusError(reconnectStatusMessage);
+            setStatusError(RECONNECT_STATUS_MESSAGE);
             console.warn("Failed to fetch /api/status:", err.message);
           }
         });
@@ -974,7 +996,7 @@ export function App() {
 
     const scheduleReconnect = () => {
       if (stop || reconnectTimer !== null) return;
-      setStatusError(reconnectStatusMessage);
+      setStatusError(RECONNECT_STATUS_MESSAGE);
       console.warn("Connection lost. Reconnecting...");
       closeStatusEvents();
       reconnectTimer = window.setTimeout(() => {
@@ -1033,13 +1055,26 @@ export function App() {
 
   useEffect(() => () => currentAbortRef.current?.abort(), []);
 
-  const canChat =
-    !!status &&
-    (status.llama_ready || (status.is_client && warmModels.length > 0));
-  const canRegenerate =
-    canChat &&
-    !!activeConversation &&
-    findLastUserMessageIndex(activeConversation.messages) >= 0;
+    const canChat =
+      !!status &&
+      (status.llama_ready || (status.is_client && warmModels.length > 0));
+    const canRegenerate =
+      canChat &&
+      !!activeConversation &&
+      findLastUserMessageIndex(activeConversation.messages) >= 0;
+
+  const refreshStatus = useCallback(async () => {
+    try {
+      const data = await fetchStatusPayload();
+      setStatus(data);
+      setStatusError(null);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setStatusError(RECONNECT_STATUS_MESSAGE);
+      console.warn("Failed to fetch /api/status:", message);
+      throw err;
+    }
+  }, []);
 
   function updateChatState(updater: (prev: ChatState) => ChatState) {
     setChatState((prev) => updater(prev));
@@ -1482,6 +1517,7 @@ export function App() {
   const sections: Array<{ key: TopSection; label: string }> = [
     { key: "dashboard", label: "Network" },
     { key: "chat", label: "Chat" },
+    { key: "config", label: "Configuration" },
   ];
 
   function navigateToSection(next: TopSection) {
@@ -1578,6 +1614,14 @@ export function App() {
               </div>
             </div>
           ) : null}
+
+          {section === 'config' ? (
+            <div className="min-h-0 flex-1 overflow-y-auto">
+              <div className="mx-auto w-full max-w-7xl p-4">
+                <ConfigPage status={status} onRefreshStatus={refreshStatus} />
+              </div>
+            </div>
+          ) : null}
         </main>
         <footer
           className={cn(
@@ -1667,6 +1711,8 @@ function AppHeader({
   const [inviteClientCopied, setInviteClientCopied] = useState(false);
   const [tokenCopied, setTokenCopied] = useState(false);
   const [apiDirectCopied, setApiDirectCopied] = useState(false);
+  const [keygenCopied, setKeygenCopied] = useState(false);
+  const [ownerStartCopied, setOwnerStartCopied] = useState(false);
   const [isThemePopoverOpen, setIsThemePopoverOpen] = useState(false);
 
   async function copyInviteWithModelCommand() {
@@ -1699,6 +1745,28 @@ function AppHeader({
       window.setTimeout(() => setTokenCopied(false), 1500);
     } catch {
       setTokenCopied(false);
+    }
+  }
+
+  async function copyKeygenCommand() {
+    try {
+      await navigator.clipboard.writeText("mesh-llm keygen");
+      setKeygenCopied(true);
+      window.setTimeout(() => setKeygenCopied(false), 1500);
+    } catch {
+      setKeygenCopied(false);
+    }
+  }
+
+  async function copyOwnerStartCommand() {
+    try {
+      await navigator.clipboard.writeText(
+        "mesh-llm --auto --owner-key ~/.mesh-llm/owner-key",
+      );
+      setOwnerStartCopied(true);
+      window.setTimeout(() => setOwnerStartCopied(false), 1500);
+    } catch {
+      setOwnerStartCopied(false);
     }
   }
 
@@ -1737,7 +1805,13 @@ function AppHeader({
               <NavigationMenuItem key={key}>
                 <NavigationMenuLink asChild>
                   <a
-                    href={key === "chat" ? "/chat" : "/dashboard"}
+                    href={
+                      key === "chat"
+                        ? "/chat"
+                        : key === "config"
+                          ? "/config"
+                          : "/dashboard"
+                    }
                     onClick={(event) => {
                       const isPlainLeftClick =
                         event.button === 0 &&
@@ -1937,116 +2011,238 @@ function AppHeader({
                 <TooltipContent>Invite</TooltipContent>
               </Tooltip>
               <PopoverContent
-                className="w-[calc(100vw-2rem)] max-w-[420px] space-y-3"
+                className="w-[calc(100vw-2rem)] max-w-[420px] p-0"
                 align="end"
               >
-                <div className="space-y-1">
-                  <div className="flex items-center gap-2 text-sm font-medium">
-                    <UserPlus className="h-4 w-4 text-muted-foreground" />
-                    <span>Invite to this mesh</span>
-                  </div>
-                  <div className="text-xs text-muted-foreground">
-                    Invite with a model loaded to add compute, or invite as a
-                    client for API-only access.
-                  </div>
-                </div>
-                <div className="space-y-1">
-                  <div className="flex items-center gap-2 text-xs font-medium">
-                    <span>Contribute compute</span>
-                    <Badge className="h-5 gap-1 border-emerald-500/40 bg-emerald-500/10 px-2 text-[10px] text-emerald-700 dark:text-emerald-300">
-                      <Sparkles className="h-3 w-3" />
-                      Recommended
-                    </Badge>
-                  </div>
-                  <div className="text-xs text-muted-foreground">
-                    Joins and serves the model{" "}
-                    {inviteWithModelName || "selected model"}
-                  </div>
-                </div>
-                {inviteWithModelCommand ? (
-                  <div className="flex items-center gap-2 rounded-md border bg-muted/40 px-2 py-1.5">
-                    <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap text-xs">
-                      {inviteWithModelCommand}
-                    </code>
-                    <Button
-                      type="button"
-                      size="icon"
-                      variant="ghost"
-                      className="h-7 w-7 shrink-0"
-                      aria-label="Copy model command"
-                      onClick={() => void copyInviteWithModelCommand()}
-                    >
-                      {inviteWithModelCopied ? (
-                        <Check className="h-3.5 w-3.5" />
-                      ) : (
-                        <Copy className="h-3.5 w-3.5" />
-                      )}
-                    </Button>
-                  </div>
-                ) : (
-                  <div className="text-xs text-muted-foreground">
-                    No warm model selected yet.
-                  </div>
-                )}
-                <div className="space-y-1 pt-1">
-                  <div className="text-xs font-medium">Join as client</div>
-                  <div className="text-xs text-muted-foreground">
-                    Connects for API access without loading a model.
-                  </div>
-                </div>
-                {inviteClientCommand ? (
-                  <div className="flex items-center gap-2 rounded-md border bg-muted/40 px-2 py-1.5">
-                    <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap text-xs">
-                      {inviteClientCommand}
-                    </code>
-                    <Button
-                      type="button"
-                      size="icon"
-                      variant="ghost"
-                      className="h-7 w-7 shrink-0"
-                      aria-label="Copy client command"
-                      onClick={() => void copyInviteClientCommand()}
-                    >
-                      {inviteClientCopied ? (
-                        <Check className="h-3.5 w-3.5" />
-                      ) : (
-                        <Copy className="h-3.5 w-3.5" />
-                      )}
-                    </Button>
-                  </div>
-                ) : (
-                  <div className="text-xs text-muted-foreground">
-                    No invite token available yet.
-                  </div>
-                )}
-                <div className="space-y-1 pt-1">
-                  <div className="text-xs font-medium">Invite token</div>
-                  {inviteToken ? (
-                    <div className="flex items-center gap-2 rounded-md border bg-muted/40 px-2 py-1.5">
-                      <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap text-xs">
-                        {inviteToken}
-                      </code>
-                      <Button
-                        type="button"
-                        size="icon"
-                        variant="ghost"
-                        className="h-7 w-7 shrink-0"
-                        aria-label="Copy invite token"
-                        onClick={() => void copyInviteToken()}
-                      >
-                        {tokenCopied ? (
-                          <Check className="h-3.5 w-3.5" />
-                        ) : (
-                          <Copy className="h-3.5 w-3.5" />
-                        )}
-                      </Button>
+                <div className="px-5 pt-5 pb-3">
+                  <div className="space-y-1">
+                    <div className="flex items-center gap-2 text-sm font-medium">
+                      <UserPlus className="h-4 w-4 text-muted-foreground" />
+                      <span>Invite to this mesh</span>
                     </div>
-                  ) : (
                     <div className="text-xs text-muted-foreground">
-                      No invite token available yet.
+                      Invite with a model loaded to add compute, or invite as a
+                      client for API-only access.
                     </div>
-                  )}
+                  </div>
                 </div>
+                <Separator className="opacity-50" />
+                <Tabs defaultValue="simple">
+                  <div className="px-5 pt-4">
+                    <TabsList className="w-full">
+                      <TabsTrigger value="simple" className="flex-1">
+                        Simple
+                      </TabsTrigger>
+                      <TabsTrigger value="managed" className="flex-1">
+                        <Key className="mr-1.5 h-3 w-3" />
+                        Managed
+                      </TabsTrigger>
+                    </TabsList>
+                  </div>
+                  <TabsContent value="simple" className="mt-0 px-5 pb-5">
+                    <div className="space-y-4">
+                      <div className="space-y-1">
+                        <div className="flex items-center gap-2 text-xs font-medium">
+                          <span>Contribute compute</span>
+                          <Badge className="h-5 gap-1 border-emerald-500/40 bg-emerald-500/10 px-2 text-[10px] text-emerald-700 dark:text-emerald-300">
+                            <Sparkles className="h-3 w-3" />
+                            Recommended
+                          </Badge>
+                        </div>
+                        <div className="text-xs text-muted-foreground">
+                          Joins and serves the model{" "}
+                          {inviteWithModelName || "selected model"}
+                        </div>
+                      </div>
+                      {inviteWithModelCommand ? (
+                        <div className="flex items-center gap-2 rounded-md border bg-muted/40 px-3 py-2">
+                          <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap text-xs">
+                            {inviteWithModelCommand}
+                          </code>
+                          <Button
+                            type="button"
+                            size="icon"
+                            variant="ghost"
+                            className="h-7 w-7 shrink-0"
+                            aria-label="Copy model command"
+                            onClick={() => void copyInviteWithModelCommand()}
+                          >
+                            {inviteWithModelCopied ? (
+                              <Check className="h-3.5 w-3.5" />
+                            ) : (
+                              <Copy className="h-3.5 w-3.5" />
+                            )}
+                          </Button>
+                        </div>
+                      ) : (
+                        <div className="text-xs text-muted-foreground">
+                          No warm model selected yet.
+                        </div>
+                      )}
+                      <Separator className="py-0.5 opacity-50" />
+                      <div className="space-y-1">
+                        <div className="text-xs font-medium">
+                          Join as client
+                        </div>
+                        <div className="text-xs text-muted-foreground">
+                          Connects for API access without loading a model.
+                        </div>
+                      </div>
+                      {inviteClientCommand ? (
+                        <div className="flex items-center gap-2 rounded-md border bg-muted/40 px-3 py-2">
+                          <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap text-xs">
+                            {inviteClientCommand}
+                          </code>
+                          <Button
+                            type="button"
+                            size="icon"
+                            variant="ghost"
+                            className="h-7 w-7 shrink-0"
+                            aria-label="Copy client command"
+                            onClick={() => void copyInviteClientCommand()}
+                          >
+                            {inviteClientCopied ? (
+                              <Check className="h-3.5 w-3.5" />
+                            ) : (
+                              <Copy className="h-3.5 w-3.5" />
+                            )}
+                          </Button>
+                        </div>
+                      ) : (
+                        <div className="text-xs text-muted-foreground">
+                          No invite token available yet.
+                        </div>
+                      )}
+                      <Separator className="py-0.5 opacity-50" />
+                      <div className="space-y-1">
+                        <div className="text-xs font-medium">Invite token</div>
+                        {inviteToken ? (
+                          <div className="flex items-center gap-2 rounded-md border bg-muted/40 px-3 py-2">
+                            <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap text-xs">
+                              {inviteToken}
+                            </code>
+                            <Button
+                              type="button"
+                              size="icon"
+                              variant="ghost"
+                              className="h-7 w-7 shrink-0"
+                              aria-label="Copy invite token"
+                              onClick={() => void copyInviteToken()}
+                            >
+                              {tokenCopied ? (
+                                <Check className="h-3.5 w-3.5" />
+                              ) : (
+                                <Copy className="h-3.5 w-3.5" />
+                              )}
+                            </Button>
+                          </div>
+                        ) : (
+                          <div className="text-xs text-muted-foreground">
+                            No invite token available yet.
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </TabsContent>
+                  <TabsContent value="managed" className="mt-0 px-5 pb-5">
+                    <div className="space-y-4">
+                      <div className="space-y-1">
+                        <div className="text-xs text-muted-foreground">
+                          Managed nodes require an owner key to join. The owner
+                          controls which nodes can participate.
+                        </div>
+                      </div>
+                      <div className="space-y-1">
+                        <div className="text-xs font-medium">
+                          1. Generate an owner key
+                        </div>
+                        <div className="text-xs text-muted-foreground">
+                          Run this once on the machine that manages the mesh.
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-2 rounded-md border bg-muted/40 px-3 py-2">
+                        <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap text-xs">
+                          mesh-llm keygen
+                        </code>
+                        <Button
+                          type="button"
+                          size="icon"
+                          variant="ghost"
+                          className="h-7 w-7 shrink-0"
+                          aria-label="Copy keygen command"
+                          onClick={() => void copyKeygenCommand()}
+                        >
+                          {keygenCopied ? (
+                            <Check className="h-3.5 w-3.5" />
+                          ) : (
+                            <Copy className="h-3.5 w-3.5" />
+                          )}
+                        </Button>
+                      </div>
+                      <Separator className="py-0.5 opacity-50" />
+                      <div className="space-y-1">
+                        <div className="text-xs font-medium">
+                          2. Start with your key
+                        </div>
+                        <div className="text-xs text-muted-foreground">
+                          Launch the mesh owner node.
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-2 rounded-md border bg-muted/40 px-3 py-2">
+                        <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap text-xs">
+                          mesh-llm --auto --owner-key ~/.mesh-llm/owner-key
+                        </code>
+                        <Button
+                          type="button"
+                          size="icon"
+                          variant="ghost"
+                          className="h-7 w-7 shrink-0"
+                          aria-label="Copy owner start command"
+                          onClick={() => void copyOwnerStartCommand()}
+                        >
+                          {ownerStartCopied ? (
+                            <Check className="h-3.5 w-3.5" />
+                          ) : (
+                            <Copy className="h-3.5 w-3.5" />
+                          )}
+                        </Button>
+                      </div>
+                      <Separator className="py-0.5 opacity-50" />
+                      <div className="space-y-1">
+                        <div className="text-xs font-medium">
+                          3. Invite a node
+                        </div>
+                        <div className="text-xs text-muted-foreground">
+                          Share this command — only nodes with the owner's public
+                          key can join.
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-2 rounded-md border bg-muted/40 px-3 py-2">
+                        <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap text-xs">
+                          mesh-llm --join {inviteToken || "(token)"} --owner-pub
+                          &lt;public-key&gt;
+                        </code>
+                        <Button
+                          type="button"
+                          size="icon"
+                          variant="ghost"
+                          className="h-7 w-7 shrink-0"
+                          aria-label="Copy invite node command"
+                          onClick={() => void copyInviteToken()}
+                        >
+                          {tokenCopied ? (
+                            <Check className="h-3.5 w-3.5" />
+                          ) : (
+                            <Copy className="h-3.5 w-3.5" />
+                          )}
+                        </Button>
+                      </div>
+                      <div className="text-[11px] text-muted-foreground">
+                        The public key is printed when you run keygen.
+                      </div>
+                    </div>
+                  </TabsContent>
+                </Tabs>
               </PopoverContent>
             </Popover>
             <Popover
@@ -3748,16 +3944,7 @@ function TopologyFlowNode({ data }: NodeProps<TopologyFlowDiagramNode>) {
                 : isIntel
                   ? "#0071C5"
                   : undefined;
-            const model = gpu.name
-              .replace(/^NVIDIA GeForce\s+/i, "")
-              .replace(/^NVIDIA Quadro\s+/i, "")
-              .replace(/^NVIDIA\s+/i, "")
-              .replace(/^AMD Radeon\s+/i, "")
-              .replace(/^AMD\s+/i, "")
-              .replace(/^Intel Arc\s+/i, "")
-              .replace(/^Intel\s+/i, "")
-              .replace(/^Apple\s+/i, "")
-              .trim();
+            const model = shortenHardwareModelName(gpu.name);
             const vramGb = gpu.vram_bytes / (1024 * 1024 * 1024);
             const GpuIcon = data.info.isSoc ? Cpu : Gpu;
             return (

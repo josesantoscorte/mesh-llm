@@ -5,6 +5,7 @@
 //! Every mesh change: kill llama-server, re-elect, winner starts fresh.
 //! mesh-llm owns :api_port and proxies to the right host by model name.
 
+use crate::config::{AuthoredMeshConfig, ModelSplit};
 use crate::{launch, mesh, models, moe, tunnel};
 use mesh::NodeRole;
 use std::collections::HashMap;
@@ -272,6 +273,7 @@ pub async fn election_loop(
     ctx_size_override: Option<u32>,
     target_tx: Arc<watch::Sender<ModelTargets>>,
     mut stop_rx: watch::Receiver<bool>,
+    authored_config: std::sync::Arc<AuthoredMeshConfig>,
     mut on_change: impl FnMut(bool, bool) + Send,
     mut on_process: impl FnMut(Option<LocalProcessInfo>) + Send,
 ) {
@@ -304,6 +306,7 @@ pub async fn election_loop(
     // MoE mode: each node runs its own llama-server with its expert shard.
     // Only enter MoE split mode if the model doesn't fit locally or --split is forced.
     // Otherwise, just run the full model — every node is independent.
+
     if let Some(ref moe_cfg) = moe_config {
         let need_moe_split = force_split || !model_fits_locally;
         if need_moe_split {
@@ -349,11 +352,50 @@ pub async fn election_loop(
             .cloned()
             .collect();
 
+        // Determine this node identity for authored-split overrides
+        let my_node_id = node.id().fmt_short().to_string();
+        // Compute manual splits for this node for the current model, if configured
+        let manual_splits_for_node: Vec<ModelSplit> = {
+            if let Some(node_cfg) = authored_config
+                .nodes
+                .iter()
+                .find(|n| n.node_id == my_node_id)
+            {
+                let mut v: Vec<ModelSplit> = Vec::new();
+                for m in &node_cfg.models {
+                    if m.name == model_name || m.model_key.as_deref() == Some(&model_name) {
+                        if let Some(s) = &m.split {
+                            v.push(s.clone());
+                        }
+                    }
+                }
+                v
+            } else {
+                Vec::new()
+            }
+        };
+        let have_manual_split = if !manual_splits_for_node.is_empty() {
+            let total = manual_splits_for_node[0].total;
+            let ok = manual_splits_for_node
+                .iter()
+                .all(|s| s.total == total && s.start <= s.end);
+            if !ok {
+                eprintln!("🧩 [{}] Detected invalid authored split configuration for model '{}' on node {}: ignoring manual split", model_name, model_name, my_node_id);
+            }
+            ok
+        } else {
+            false
+        };
+
         // Splitting decision: only split when forced OR when the model
         // genuinely doesn't fit on this node alone. If it fits, every
         // node serving this model runs its own independent llama-server
         // (no election needed — everyone is a host).
-        let need_split = force_split || !model_fits_locally;
+        let mut need_split = force_split || !model_fits_locally;
+        if have_manual_split {
+            // Manual splits imply distribution across devices; override VRAM heuristic
+            need_split = true;
+        }
 
         let i_am_host = if need_split {
             // Distributed mode: elect one host from the model group
@@ -537,8 +579,10 @@ pub async fn election_loop(
                 draft.as_deref(),
                 draft_max,
                 force_split,
+                have_manual_split,
                 binary_flavor,
                 ctx_size_override,
+                authored_config.clone(),
             )
             .await
             {
@@ -1070,15 +1114,18 @@ async fn start_llama(
     draft: Option<&Path>,
     draft_max: u16,
     force_split: bool,
+    have_manual_split: bool,
     binary_flavor: Option<launch::BinaryFlavor>,
     ctx_size_override: Option<u32>,
+    authored_config: std::sync::Arc<AuthoredMeshConfig>,
 ) -> Option<(u16, launch::InferenceServerProcess)> {
     let my_vram = node.vram_bytes();
     let model_bytes = total_model_bytes(model);
     let min_vram = (model_bytes as f64 * 1.1) as u64;
 
-    // Decide whether to split: only if model doesn't fit on host alone, or --split forced
-    let need_split = force_split || my_vram < min_vram;
+    // Decide whether to split: only if model doesn't fit on host alone, --split forced,
+    // or authored config has a manual split for this node+model.
+    let need_split = force_split || have_manual_split || my_vram < min_vram;
 
     // Only use workers from our model group, preferring lowest-latency peers.
     // Take just enough to cover the VRAM shortfall, sorted by RTT.
@@ -1197,7 +1244,7 @@ async fn start_llama(
     }
     all_vrams.push(my_vram_f); // Host device is last
     let total: f64 = all_vrams.iter().sum();
-    let split = if total > 0.0 && !rpc_ports.is_empty() {
+    let auto_tensor_split: Option<String> = if total > 0.0 && !rpc_ports.is_empty() {
         let s: Vec<String> = all_vrams
             .iter()
             .map(|v| format!("{:.2}", v / total))
@@ -1212,6 +1259,63 @@ async fn start_llama(
     } else {
         eprintln!("  Serving entirely ({:.0}GB VRAM)", my_vram_f / 1e9);
         None
+    };
+
+    // If an authored manual split exists, prefer it over the VRAM-derived split.
+    let my_node_id = node.id().fmt_short().to_string();
+    let authored_cfg_ref = authored_config.as_ref();
+    let authored_node_config = authored_cfg_ref
+        .nodes
+        .iter()
+        .find(|n| n.node_id == my_node_id);
+
+    let have_manual_split = authored_node_config
+        .and_then(|n| n.models.iter().find(|m| m.name == model_name))
+        .map(|m| m.split.is_some())
+        .unwrap_or(false);
+
+    let manual_total_layers = authored_node_config
+        .and_then(|n| n.models.iter().find(|m| m.name == model_name))
+        .and_then(|m| m.split.as_ref())
+        .map(|s| s.total)
+        .unwrap_or(0);
+
+    let manual_splits_for_node: Vec<ModelSplit> = authored_node_config
+        .and_then(|n| n.models.iter().find(|m| m.name == model_name))
+        .and_then(|m| m.split.clone())
+        .map(|s| vec![s])
+        .unwrap_or_default();
+
+    // Compute the final tensor_split to pass to llama-server (prefer authored splits)
+    let final_tensor_split: Option<String> = if have_manual_split {
+        let total_layers = manual_total_layers as f64;
+        let host_layers: u32 = manual_splits_for_node
+            .iter()
+            .map(|s| s.end.saturating_sub(s.start).saturating_add(1))
+            .sum();
+        let host_frac = if total_layers > 0.0 {
+            host_layers as f64 / total_layers
+        } else {
+            0.0
+        };
+        let remotes = rpc_ports.len();
+        let mut weights = Vec::new();
+        if remotes > 0 {
+            let per = (1.0 - host_frac) / remotes as f64;
+            for _ in 0..remotes {
+                weights.push(per);
+            }
+        }
+        weights.push(host_frac);
+        Some(
+            weights
+                .iter()
+                .map(|f| format!("{:.6}", f))
+                .collect::<Vec<_>>()
+                .join(","),
+        )
+    } else {
+        auto_tensor_split.clone()
     };
 
     // Launch on ephemeral port
@@ -1249,7 +1353,7 @@ async fn start_llama(
             model,
             http_port: llama_port,
             tunnel_ports: &rpc_ports,
-            tensor_split: split.as_deref(),
+            tensor_split: final_tensor_split.as_deref(),
             draft,
             draft_max,
             model_bytes,

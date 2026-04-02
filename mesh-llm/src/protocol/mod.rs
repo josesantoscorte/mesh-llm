@@ -31,6 +31,15 @@ pub const ALPN: &[u8] = ALPN_V1;
 pub(crate) const NODE_PROTOCOL_GENERATION: u32 = 1;
 pub(crate) const MAX_CONTROL_FRAME_BYTES: usize = 8 * 1024 * 1024; // 8 MiB
 
+pub(crate) fn owner_attestation_payload(node_id: EndpointId, owner_fingerprint: &str) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(32 + owner_fingerprint.len() + 32);
+    payload.extend_from_slice(b"mesh-llm-owner-attestation-v1:");
+    payload.extend_from_slice(node_id.as_bytes());
+    payload.extend_from_slice(b":");
+    payload.extend_from_slice(owner_fingerprint.as_bytes());
+    payload
+}
+
 pub(crate) const STREAM_GOSSIP: u8 = 0x01;
 pub(crate) const STREAM_TUNNEL: u8 = 0x02;
 pub(crate) const STREAM_TUNNEL_MAP: u8 = 0x03;
@@ -41,6 +50,7 @@ pub(crate) const STREAM_PEER_LEAVING: u8 = 0x07;
 pub(crate) const STREAM_BLACKBOARD: u8 = 0x08;
 pub(crate) const STREAM_PLUGIN_CHANNEL: u8 = 0x09;
 pub(crate) const STREAM_PLUGIN_BULK_TRANSFER: u8 = 0x0a;
+pub(crate) const STREAM_SCAN_REQUEST: u8 = 0x0b;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ControlProtocol {
@@ -208,6 +218,27 @@ impl ValidateControlFrame for crate::proto::node::PeerLeaving {
         Ok(())
     }
 }
+impl ValidateControlFrame for crate::proto::node::ScanRequest {
+    fn validate_frame(&self) -> Result<(), ControlFrameError> {
+        if self.gen != NODE_PROTOCOL_GENERATION {
+            return Err(ControlFrameError::BadGeneration { got: self.gen });
+        }
+        if !self.requester_id.is_empty() && self.requester_id.len() != 32 {
+            return Err(ControlFrameError::InvalidEndpointId {
+                got: self.requester_id.len(),
+            });
+        }
+        Ok(())
+    }
+}
+impl ValidateControlFrame for crate::proto::node::ScanResponse {
+    fn validate_frame(&self) -> Result<(), ControlFrameError> {
+        if self.gen != NODE_PROTOCOL_GENERATION {
+            return Err(ControlFrameError::BadGeneration { got: self.gen });
+        }
+        Ok(())
+    }
+}
 
 pub(crate) fn validate_peer_announcement(
     pa: &crate::proto::node::PeerAnnouncement,
@@ -305,11 +336,13 @@ pub(crate) fn decode_gossip_payload(
                     remote.fmt_short()
                 );
             }
-            Ok(frame
-                .peers
-                .iter()
-                .filter_map(proto_ann_to_local)
-                .collect::<Vec<_>>())
+            let mut decoded = Vec::with_capacity(frame.peers.len());
+            for pa in &frame.peers {
+                if let Some(local) = proto_ann_to_local(pa, remote)? {
+                    decoded.push(local);
+                }
+            }
+            Ok(decoded)
         }
         ControlProtocol::JsonV0 => {
             let anns: Vec<PeerAnnouncementV0> = serde_json::from_slice(buf)?;
@@ -381,6 +414,7 @@ mod tests {
     use crate::mesh::{resolve_peer_down, resolve_peer_leaving, ModelDemand, PeerInfo};
     use crate::proto::node::{GossipFrame, NodeRole, PeerAnnouncement, RouteTableRequest};
     use iroh::{EndpointAddr, EndpointId, SecretKey};
+    use sha2::Digest;
     use std::collections::{HashMap, HashSet};
 
     fn make_valid_gossip_frame() -> GossipFrame {
@@ -424,6 +458,12 @@ mod tests {
             experts_summary: None,
             available_model_sizes: HashMap::new(),
             served_model_descriptors: vec![],
+            model_sizes: None,
+            model_metadata: None,
+            owner_id: None,
+            owner_fingerprint: None,
+            owner_fingerprint_verified: false,
+            owner_fingerprint_transitive: false,
         }
     }
 
@@ -471,6 +511,10 @@ mod tests {
             experts_summary: None,
             available_model_sizes: HashMap::from([("Qwen".into(), 1234_u64)]),
             served_model_descriptors: vec![],
+            owner_fingerprint: None,
+            owner_attestation: None,
+            owner_fingerprint_verified: false,
+            owner_fingerprint_transitive: false,
         };
         let json = serde_json::to_vec(&vec![PeerAnnouncementV0::from(&ann)]).unwrap();
 
@@ -877,6 +921,10 @@ mod tests {
             experts_summary: None,
             available_model_sizes: HashMap::new(),
             served_model_descriptors: vec![],
+            owner_fingerprint: None,
+            owner_attestation: None,
+            owner_fingerprint_verified: false,
+            owner_fingerprint_transitive: false,
         };
         let json = serde_json::to_vec(&vec![PeerAnnouncementV0::from(&ann)])
             .expect("JSON serialization must succeed");
@@ -932,6 +980,246 @@ mod tests {
         assert!(
             bad_result.is_err(),
             "ProtoV1 gossip with gen=99 must be rejected by the generation gate"
+        );
+    }
+
+    #[test]
+    fn direct_peer_owner_attestation_is_verified() {
+        use prost::Message as _;
+
+        let remote_id = EndpointId::from(SecretKey::from_bytes(&[0x31; 32]).public());
+        let owner_secret = SecretKey::from_bytes(&[0x51; 32]);
+        let owner_fingerprint = hex::encode(sha2::Sha256::digest(owner_secret.public().as_bytes()));
+        let payload = owner_attestation_payload(remote_id, &owner_fingerprint);
+        let signature = owner_secret.sign(&payload);
+        let frame = GossipFrame {
+            gen: NODE_PROTOCOL_GENERATION,
+            sender_id: remote_id.as_bytes().to_vec(),
+            peers: vec![PeerAnnouncement {
+                endpoint_id: remote_id.as_bytes().to_vec(),
+                role: NodeRole::Worker as i32,
+                owner_fingerprint: Some(owner_fingerprint.clone()),
+                owner_attestation: Some(crate::proto::node::OwnerAttestation {
+                    owner_public_key: owner_secret.public().as_bytes().to_vec(),
+                    signature: signature.to_bytes().to_vec(),
+                }),
+                ..Default::default()
+            }],
+        };
+
+        let encoded = frame.encode_to_vec();
+        let decoded = decode_gossip_payload(ControlProtocol::ProtoV1, remote_id, &encoded)
+            .expect("owner attestation from a direct self-announcement must verify");
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(
+            decoded[0].1.owner_fingerprint.as_deref(),
+            Some(owner_fingerprint.as_str())
+        );
+        assert!(decoded[0].1.owner_fingerprint_verified);
+        assert!(!decoded[0].1.owner_fingerprint_transitive);
+    }
+
+    #[test]
+    fn scan_request_response_roundtrip() {
+        use crate::proto::node::{ScanRequest, ScanResponse};
+
+        let req = ScanRequest {
+            gen: NODE_PROTOCOL_GENERATION,
+            requester_id: vec![0u8; 32],
+        };
+        let encoded = encode_control_frame(STREAM_SCAN_REQUEST, &req);
+        let decoded: ScanRequest = decode_control_frame(STREAM_SCAN_REQUEST, &encoded)
+            .expect("valid ScanRequest must decode successfully");
+        assert_eq!(decoded.gen, NODE_PROTOCOL_GENERATION);
+        assert_eq!(decoded.requester_id.len(), 32);
+
+        let req_empty = ScanRequest {
+            gen: NODE_PROTOCOL_GENERATION,
+            requester_id: vec![],
+        };
+        let encoded = encode_control_frame(STREAM_SCAN_REQUEST, &req_empty);
+        let decoded: ScanRequest = decode_control_frame(STREAM_SCAN_REQUEST, &encoded)
+            .expect("ScanRequest with empty requester_id must decode");
+        assert!(decoded.requester_id.is_empty());
+
+        let resp_ok = ScanResponse {
+            gen: NODE_PROTOCOL_GENERATION,
+            success: true,
+            error: None,
+            ..Default::default()
+        };
+        let encoded = encode_control_frame(STREAM_SCAN_REQUEST, &resp_ok);
+        let decoded: ScanResponse = decode_control_frame(STREAM_SCAN_REQUEST, &encoded)
+            .expect("valid ScanResponse must decode");
+        assert!(decoded.success);
+        assert!(decoded.error.is_none());
+        assert!(decoded.model_metadata.is_empty());
+        assert!(decoded.model_sizes.is_empty());
+
+        let resp_err = ScanResponse {
+            gen: NODE_PROTOCOL_GENERATION,
+            success: false,
+            error: Some("scan failed".to_string()),
+            ..Default::default()
+        };
+        let encoded = encode_control_frame(STREAM_SCAN_REQUEST, &resp_err);
+        let decoded: ScanResponse = decode_control_frame(STREAM_SCAN_REQUEST, &encoded)
+            .expect("ScanResponse with error must decode");
+        assert!(!decoded.success);
+        assert_eq!(decoded.error.as_deref(), Some("scan failed"));
+
+        // Roundtrip with model data populated
+        use crate::proto::node::CompactModelMetadata;
+        let resp_with_models = ScanResponse {
+            gen: NODE_PROTOCOL_GENERATION,
+            success: true,
+            error: None,
+            model_metadata: vec![
+                CompactModelMetadata {
+                    model_key: "Qwen3-4B-Q4_K_M".to_string(),
+                    context_length: 8192,
+                    layer_count: 36,
+                    architecture: "qwen3".to_string(),
+                    head_count_kv: 8,
+                    ..Default::default()
+                },
+                CompactModelMetadata {
+                    model_key: "Llama-3.1-8B-Q8_0".to_string(),
+                    context_length: 131072,
+                    layer_count: 32,
+                    architecture: "llama".to_string(),
+                    head_count_kv: 8,
+                    ..Default::default()
+                },
+            ],
+            model_sizes: [
+                ("Qwen3-4B-Q4_K_M".to_string(), 2_500_000_000u64),
+                ("Llama-3.1-8B-Q8_0".to_string(), 8_000_000_000u64),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let encoded = encode_control_frame(STREAM_SCAN_REQUEST, &resp_with_models);
+        let decoded: ScanResponse = decode_control_frame(STREAM_SCAN_REQUEST, &encoded)
+            .expect("ScanResponse with model data must decode");
+        assert!(decoded.success);
+        assert_eq!(decoded.model_metadata.len(), 2);
+        assert_eq!(decoded.model_metadata[0].model_key, "Qwen3-4B-Q4_K_M");
+        assert_eq!(decoded.model_metadata[0].context_length, 8192);
+        assert_eq!(decoded.model_metadata[1].model_key, "Llama-3.1-8B-Q8_0");
+        assert_eq!(decoded.model_metadata[1].layer_count, 32);
+        assert_eq!(decoded.model_sizes.len(), 2);
+        assert_eq!(
+            decoded.model_sizes.get("Qwen3-4B-Q4_K_M"),
+            Some(&2_500_000_000u64)
+        );
+        assert_eq!(
+            decoded.model_sizes.get("Llama-3.1-8B-Q8_0"),
+            Some(&8_000_000_000u64)
+        );
+    }
+
+    #[test]
+    fn scan_request_rejects_bad_generation_and_invalid_requester_id() {
+        use crate::proto::node::{ScanRequest, ScanResponse};
+
+        let bad_gen_req = ScanRequest {
+            gen: 0,
+            requester_id: vec![0u8; 32],
+        };
+        let encoded = encode_control_frame(STREAM_SCAN_REQUEST, &bad_gen_req);
+        let err = decode_control_frame::<ScanRequest>(STREAM_SCAN_REQUEST, &encoded)
+            .expect_err("ScanRequest gen=0 must be rejected");
+        assert!(
+            matches!(err, ControlFrameError::BadGeneration { got: 0 }),
+            "expected BadGeneration{{got:0}}, got {:?}",
+            err
+        );
+
+        let wrong_gen_req = ScanRequest {
+            gen: 99,
+            requester_id: vec![0u8; 32],
+        };
+        let encoded = encode_control_frame(STREAM_SCAN_REQUEST, &wrong_gen_req);
+        let err = decode_control_frame::<ScanRequest>(STREAM_SCAN_REQUEST, &encoded)
+            .expect_err("ScanRequest gen=99 must be rejected");
+        assert!(
+            matches!(err, ControlFrameError::BadGeneration { got: 99 }),
+            "expected BadGeneration{{got:99}}, got {:?}",
+            err
+        );
+
+        let bad_id_req = ScanRequest {
+            gen: NODE_PROTOCOL_GENERATION,
+            requester_id: vec![0u8; 16],
+        };
+        let encoded = encode_control_frame(STREAM_SCAN_REQUEST, &bad_id_req);
+        let err = decode_control_frame::<ScanRequest>(STREAM_SCAN_REQUEST, &encoded)
+            .expect_err("ScanRequest with 16-byte requester_id must be rejected");
+        assert!(
+            matches!(err, ControlFrameError::InvalidEndpointId { got: 16 }),
+            "expected InvalidEndpointId{{got:16}}, got {:?}",
+            err
+        );
+
+        let bad_gen_resp = ScanResponse {
+            gen: 0,
+            success: true,
+            error: None,
+            ..Default::default()
+        };
+        let encoded = encode_control_frame(STREAM_SCAN_REQUEST, &bad_gen_resp);
+        let err = decode_control_frame::<ScanResponse>(STREAM_SCAN_REQUEST, &encoded)
+            .expect_err("ScanResponse gen=0 must be rejected");
+        assert!(
+            matches!(err, ControlFrameError::BadGeneration { got: 0 }),
+            "expected BadGeneration{{got:0}} for ScanResponse, got {:?}",
+            err
+        );
+
+        let wrong_gen_resp = ScanResponse {
+            gen: 42,
+            success: true,
+            error: None,
+            ..Default::default()
+        };
+        let encoded = encode_control_frame(STREAM_SCAN_REQUEST, &wrong_gen_resp);
+        let err = decode_control_frame::<ScanResponse>(STREAM_SCAN_REQUEST, &encoded)
+            .expect_err("ScanResponse gen=42 must be rejected");
+        assert!(
+            matches!(err, ControlFrameError::BadGeneration { got: 42 }),
+            "expected BadGeneration{{got:42}} for ScanResponse, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn malformed_owner_attestation_is_rejected() {
+        use prost::Message as _;
+
+        let remote_id = EndpointId::from(SecretKey::from_bytes(&[0x32; 32]).public());
+        let owner_fingerprint = "owner-fingerprint-malformed".to_string();
+        let frame = GossipFrame {
+            gen: NODE_PROTOCOL_GENERATION,
+            sender_id: remote_id.as_bytes().to_vec(),
+            peers: vec![PeerAnnouncement {
+                endpoint_id: remote_id.as_bytes().to_vec(),
+                role: NodeRole::Worker as i32,
+                owner_fingerprint: Some(owner_fingerprint),
+                owner_attestation: Some(crate::proto::node::OwnerAttestation {
+                    owner_public_key: vec![0xAB; 31],
+                    signature: vec![0xCD; 7],
+                }),
+                ..Default::default()
+            }],
+        };
+
+        let encoded = frame.encode_to_vec();
+        let err = decode_gossip_payload(ControlProtocol::ProtoV1, remote_id, &encoded)
+            .expect_err("malformed owner attestation payload must be rejected");
+        assert!(
+            err.to_string().contains("attestation"),
+            "expected malformed-attestation rejection, got: {err}"
         );
     }
 }

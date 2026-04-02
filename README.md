@@ -153,6 +153,12 @@ mesh-llm                                   # no args — prints --help and exits
 ```
 Does not start the console or bind any ports. Use the CLI flags shown in `--help` to start or join a mesh.
 
+### Owner key and config authorization
+
+- Node ownership uses a dedicated owner key at `~/.mesh-llm/owner-key` (or `--owner-key <path>`).
+- Trusted same-owner grouping is based on verified owner fingerprints (`sha256(owner_public_key)`).
+- Config writes are authorized via signed checkpoints; `/api/config/broadcast` is loopback-only and signs relay/apply requests.
+
 ## Background service
 
 To install it as a per-user background service:
@@ -208,6 +214,64 @@ Live topology, VRAM bars per node, model picker, built-in chat. Everything comes
 ### Development
 
 Build-from-source and UI development instructions are in [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## GPU placement config
+
+The config file (`~/.mesh-llm/mesh.toml`) lets you control how models are placed across GPUs on each node. The current schema version is **3**.
+
+### Schema version
+
+Config files carry a `version` field. Version 2 configs load without error and default to pooled mode — no migration step required.
+
+### `placement_mode`
+
+Each node has a `placement_mode` field with two values:
+
+- `"pooled"` (default) — all GPUs on the node are treated as a single VRAM pool. llama.cpp decides layer distribution internally.
+- `"separate"` — each model assignment targets a specific GPU by index. Use this when you want explicit control over which GPU runs which model.
+
+### `gpu_index`
+
+When `placement_mode = "separate"`, each model assignment can carry a `gpu_index` field. This is a zero-based integer that maps to the nth GPU probed at startup. Out-of-range values fail with an explicit error at launch — there's no silent fallback.
+
+`gpu_index` is only meaningful in separate mode. In pooled mode it's ignored.
+
+### Mixed-GPU nodes
+
+Nodes with different GPU models can use either placement mode. In separate mode, the console shows a warning because VRAM estimates across mixed GPUs may be less accurate.
+
+### v1 scope
+
+Manual placement applies to whole models and dense split shards. MoE expert-level GPU routing and global dashboard redesign are out of scope for v1. The mesh topology view and peer cards remain aggregate-only.
+
+### Examples
+
+Pooled mode (default):
+
+```toml
+version = 3
+
+[[nodes]]
+node_id = "alpha.local"
+placement_mode = "pooled"
+
+[[nodes.models]]
+name = "Llama-3.2-3B-Instruct-Q4_K_M"
+```
+
+Separate mode with explicit GPU assignment:
+
+```toml
+version = 3
+
+[[nodes]]
+node_id = "alpha.local"
+placement_mode = "separate"
+
+[[nodes.models]]
+name = "Llama-3.2-3B-Instruct-Q4_K_M"
+gpu_index = 0
+```
 
 ## Using with agents
 

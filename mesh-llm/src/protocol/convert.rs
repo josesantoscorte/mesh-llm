@@ -2,7 +2,10 @@
 use crate::mesh::RouteEntry;
 use crate::mesh::{ModelDemand, NodeRole, PeerAnnouncement, RoutingTable};
 use crate::protocol::NODE_PROTOCOL_GENERATION;
+use anyhow::Result;
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use iroh::{EndpointAddr, EndpointId};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
 fn local_source_kind_to_proto(kind: crate::mesh::ModelSourceKind) -> i32 {
@@ -76,6 +79,7 @@ fn descriptor_identity_to_proto(
         artifact: identity.artifact.clone(),
         local_file_name: identity.local_file_name.clone(),
         identity_hash: identity.identity_hash.clone(),
+        file_size: identity.file_size.clone(),
     }
 }
 
@@ -92,6 +96,7 @@ fn proto_identity_to_local(
         artifact: identity.artifact.clone(),
         local_file_name: identity.local_file_name.clone(),
         identity_hash: identity.identity_hash.clone(),
+        file_size: identity.file_size.clone(),
     }
 }
 
@@ -222,6 +227,11 @@ pub(crate) fn local_ann_to_proto_ann(
         hosted_models_known: Some(ann.hosted_models.is_some()),
         served_model_identities,
         served_model_descriptors,
+        owner_id: ann.owner_fingerprint.clone(),
+        owner_fingerprint: ann.owner_fingerprint.clone(),
+        owner_attestation: ann.owner_attestation.clone(),
+        owner_fingerprint_verified: Some(ann.owner_fingerprint_verified),
+        owner_fingerprint_transitive: Some(ann.owner_fingerprint_transitive),
     }
 }
 
@@ -238,11 +248,56 @@ pub(crate) fn build_gossip_frame(
     }
 }
 
+fn owner_fingerprint_from_public_key(owner_public_key: &[u8]) -> String {
+    hex::encode(Sha256::digest(owner_public_key))
+}
+
+fn verify_direct_owner_attestation(
+    endpoint_id: EndpointId,
+    owner_fingerprint_claim: &str,
+    attestation: &crate::proto::node::OwnerAttestation,
+) -> Result<String> {
+    if attestation.owner_public_key.len() != 32 {
+        anyhow::bail!("owner attestation rejected: owner_public_key must be 32 bytes")
+    }
+    if attestation.signature.len() != 64 {
+        anyhow::bail!("owner attestation rejected: signature must be 64 bytes")
+    }
+    let verifying_key =
+        VerifyingKey::from_bytes(&attestation.owner_public_key.as_slice().try_into().map_err(
+            |_| anyhow::anyhow!("owner attestation rejected: malformed owner_public_key"),
+        )?)
+        .map_err(|_| anyhow::anyhow!("owner attestation rejected: invalid owner_public_key"))?;
+    let derived_fingerprint = owner_fingerprint_from_public_key(&attestation.owner_public_key);
+    if derived_fingerprint != owner_fingerprint_claim {
+        anyhow::bail!("owner attestation rejected: fingerprint does not match owner public key")
+    }
+    let signature = Signature::from_bytes(
+        &attestation
+            .signature
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("owner attestation rejected: malformed signature"))?,
+    );
+    let payload = crate::protocol::owner_attestation_payload(endpoint_id, owner_fingerprint_claim);
+    verifying_key.verify(&payload, &signature).map_err(|_| {
+        anyhow::anyhow!("owner attestation rejected: signature verification failed")
+    })?;
+    Ok(derived_fingerprint)
+}
+
 pub(crate) fn proto_ann_to_local(
     pa: &crate::proto::node::PeerAnnouncement,
-) -> Option<(EndpointAddr, PeerAnnouncement)> {
-    let id_arr: [u8; 32] = pa.endpoint_id.as_slice().try_into().ok()?;
-    let pk = iroh::PublicKey::from_bytes(&id_arr).ok()?;
+    remote: EndpointId,
+) -> Result<Option<(EndpointAddr, PeerAnnouncement)>> {
+    let id_arr: [u8; 32] = match pa.endpoint_id.as_slice().try_into() {
+        Ok(arr) => arr,
+        Err(_) => return Ok(None),
+    };
+    let pk = match iroh::PublicKey::from_bytes(&id_arr) {
+        Ok(pk) => pk,
+        Err(_) => return Ok(None),
+    };
     let peer_id = EndpointId::from(pk);
     let addr: EndpointAddr = if !pa.serialized_addr.is_empty() {
         serde_json::from_slice(&pa.serialized_addr).unwrap_or(EndpointAddr {
@@ -273,6 +328,31 @@ pub(crate) fn proto_ann_to_local(
         .hosted_models_known
         .unwrap_or(!pa.hosted_models.is_empty())
         .then(|| pa.hosted_models.clone());
+    let mut owner_fingerprint = pa.owner_fingerprint.clone();
+    let mut owner_fingerprint_verified = false;
+    let mut owner_fingerprint_transitive = false;
+
+    let is_direct_self_announcement = peer_id == remote;
+    if is_direct_self_announcement {
+        if let Some(attestation) = pa.owner_attestation.as_ref() {
+            let fingerprint_claim = owner_fingerprint.clone().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "owner attestation rejected: missing owner fingerprint claim for direct peer announcement"
+                )
+            })?;
+            let verified_fingerprint =
+                verify_direct_owner_attestation(peer_id, &fingerprint_claim, attestation)?;
+            owner_fingerprint = Some(verified_fingerprint);
+            owner_fingerprint_verified = true;
+        } else if owner_fingerprint.is_some() {
+            anyhow::bail!(
+                "owner attestation rejected: direct peer owner fingerprint requires attestation"
+            );
+        }
+    } else if owner_fingerprint.is_some() {
+        owner_fingerprint_transitive = true;
+    }
+
     let mut ann = PeerAnnouncement {
         addr: addr.clone(),
         role,
@@ -293,7 +373,7 @@ pub(crate) fn proto_ann_to_local(
         gpu_bandwidth_gbps: None,
         available_model_metadata: Vec::new(),
         experts_summary: pa.experts_summary.clone(),
-        available_model_sizes: HashMap::new(),
+        available_model_sizes: pa.available_model_sizes.clone(),
         served_model_descriptors: if !pa.served_model_descriptors.is_empty() {
             let descriptors: Vec<_> = pa
                 .served_model_descriptors
@@ -345,9 +425,13 @@ pub(crate) fn proto_ann_to_local(
                 .map(legacy_descriptor_from_identity)
                 .collect()
         },
+        owner_fingerprint,
+        owner_attestation: None,
+        owner_fingerprint_verified,
+        owner_fingerprint_transitive,
     };
     crate::mesh::backfill_legacy_descriptors(&mut ann);
-    Some((addr, ann))
+    Ok(Some((addr, ann)))
 }
 
 pub(crate) fn routing_table_to_proto(table: &RoutingTable) -> crate::proto::node::RouteTable {

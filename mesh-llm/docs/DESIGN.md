@@ -161,6 +161,10 @@ and the embedded web dashboard.
 | `/api/discover` | GET | Browse Nostr-published meshes |
 | `/api/join` | POST | Join a mesh by invite token `{"token":"..."}` |
 | `/api/chat` | POST | Proxy to inference API (`/v1/chat/completions`) |
+| `/api/config` | GET | Current mesh config (TOML) |
+| `/api/config` | POST | Save mesh config (TOML body; validates before writing) |
+| `/api/config/node/:id` | GET | Config for a specific node (JSON) |
+| `/api/scan` | POST | Trigger immediate model rescan and regossip |
 | `/` | GET | Embedded web dashboard |
 
 The dashboard is a thin client — everything it shows comes from `/api/status`
@@ -209,6 +213,11 @@ trait Collector {
 | `available_model_sizes` | `map<string, uint64>` | File sizes in bytes per model name |
 | `mesh_id` | `optional string` | Stable mesh identity (self entry only) |
 | `demand` | `repeated ModelDemandEntry` | Per-model demand entries (self entry only) |
+| `owner_id` | `optional string` | Compatibility mirror of `owner_fingerprint` for older readers |
+| `owner_fingerprint` | `optional string` | SHA-256(owner public key); canonical owner identifier |
+| `owner_attestation` | `optional OwnerAttestation` | Owner-key signature binding owner fingerprint to node identity |
+| `owner_fingerprint_verified` | `optional bool` | True only for directly verified self-announcements |
+| `owner_fingerprint_transitive` | `optional bool` | True for display-only transitive ownership metadata |
 
 GGUF-derived metadata (architecture, quantization type, tokenizer, RoPE parameters, expert counts) is transported via `CompactModelMetadata` in the `available_model_metadata` field. This lets peers learn model capabilities without downloading the file. The `ScannedModel` type in the proto schema carries the same information for catalog-level model listings.
 
@@ -235,6 +244,105 @@ Controls whether `gpu_name`, `hostname`, and `gpu_vram` appear in gossip. `is_so
 ```json
 {"hostname": "lemony-28", "is_soc": true, "gpus": [{"name": "Tegra AGX Orin", "vram_bytes": 0}]}
 ```
+
+## Configuration System
+
+mesh-llm supports declarative node configuration via TOML files. Users can assign models to nodes through the web console's Configuration page, or edit TOML directly.
+
+### Node Ownership
+
+- Nodes are owned by a dedicated owner key (`~/.mesh-llm/owner-key` by default, or `--owner-key <path>`)
+- Ownership identity is `owner_fingerprint = sha256(owner_public_key)`
+- Direct peers trust owner metadata only when `owner_attestation` verifies against the sender identity
+- Transitive ownership metadata is display-only and does not grant trusted same-owner control
+- The configuration UI groups nodes by verified owner fingerprint
+
+### Config File
+
+- **Location**: `~/.mesh-llm/mesh.toml`
+- **Format**: TOML (MeshConfig schema)
+- **Precedence**: CLI flags > saved config > defaults
+- One master config covers all nodes; per-node config is accessible via the node-specific endpoint
+
+### API Endpoints
+
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `/api/config` | GET | Current config as TOML |
+| `/api/config` | POST | Apply signed config checkpoint (owner signature + timestamp + lineage required) |
+| `/api/config/broadcast` | POST | Loopback-only console entrypoint that signs and relays config updates |
+| `/api/config/node/:id` | GET | Config for a specific node (JSON) |
+| `/api/scan` | POST | Trigger immediate model rescan and regossip |
+
+### Config Schema
+
+```rust
+struct MeshConfig {
+    nodes: Vec<NodeConfig>,          // all configured nodes
+}
+
+struct NodeConfig {
+    node_id: String,                 // stable node identity (EndpointId)
+    hostname: Option<String>,        // display name
+    models: Vec<ModelAssignment>,    // model assignments for this node
+}
+
+struct ModelAssignment {
+    name: String,                    // model name (catalog name or filename)
+    path: Option<String>,            // explicit GGUF path (overrides catalog lookup)
+    ctx_size: Option<u32>,           // context window override
+    moe_experts: Option<u32>,        // MoE expert count override
+}
+```
+
+### Future: Dynamic Apply
+
+Config persistence is implemented. Runtime application (restarting inference without a binary restart) is planned as a separate feature. The "Apply to Mesh" button is present in the UI but disabled pending inference engine separation.
+
+## GPU Placement
+
+### Schema v3
+
+The authored config schema is versioned. The current version is `3`. Version 2 configs load without error and default to `placement_mode = "pooled"` with no `gpu_index` — no migration step is required.
+
+### `placement_mode`
+
+`placement_mode` is a node-level field in `AuthoredNodeConfig`. It controls how the node's GPUs are presented to llama.cpp at launch:
+
+- `"pooled"` (default) — all GPUs on the node are pooled. llama.cpp distributes layers across them internally.
+- `"separate"` — each model assignment targets a specific GPU by ordinal via `gpu_index`.
+
+The field is serialized as `snake_case` in TOML (`"pooled"`, `"separate"`). It defaults to `Pooled` in Rust via `#[serde(default)]`.
+
+### `gpu_index`
+
+`gpu_index` is a model-level field in `AuthoredModelAssignment`. It is a zero-based integer that identifies which GPU to use when `placement_mode = "separate"`.
+
+At launch, `resolve_gpu_ordinal(ordinal, probed_devices)` maps the authored `gpu_index` to the nth device string returned by the hardware probe. If the ordinal is out of range, the launch fails with an explicit error — there is no silent fallback to GPU 0.
+
+`gpu_index` is only meaningful in separate mode. In pooled mode it is ignored.
+
+### v2 to v3 migration
+
+When a v2 config is loaded:
+- Each node defaults to `placement_mode = "pooled"`
+- No `gpu_index` is set on any model assignment
+- The config is otherwise loaded as-is
+
+No user action is required. The next save from the UI or API will write a v3 config.
+
+### Mixed-GPU nodes
+
+Nodes with heterogeneous GPUs (different models or VRAM sizes) can use either placement mode. In separate mode, the UI shows a warning because VRAM estimates across mixed GPUs may be less accurate.
+
+### v1 scope boundaries
+
+The following are explicitly out of scope for v1:
+
+- **Auto-placement changes** — the mesh's automatic GPU assignment logic is unchanged. Only manually authored `placement_mode` and `gpu_index` values are honored.
+- **MoE expert-level GPU routing** — expert sharding assigns experts to nodes, not to specific GPUs within a node.
+- **Stable hardware UUIDs** — `gpu_index` is an ordinal into the probed device list, not a persistent hardware identifier.
+- **Dashboard redesign** — the mesh topology view and peer cards remain aggregate-only. Per-GPU breakdowns are shown in the node config panel only.
 
 ## Nostr Discovery
 

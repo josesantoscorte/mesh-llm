@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
-// ── GGUF assembler: combine trunk + expert files into a shard ──
+// GGUF detection code lives in models/gguf.rs
 
 // ── Ranking cache ──
 

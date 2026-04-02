@@ -27,15 +27,21 @@ httparse = "1"
 tokio-stream = "0.1"
 libc = "0.2.183"
 regex-lite = "0.1"
+ed25519-dalek = "2"
 rmcp = { version = "1.2", features = ["server", "transport-io"] }
 schemars = "1"
 prost = "0.14"
 toml = "0.9"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 hf-hub = { git = "https://github.com/i386/hf-hub.git", rev = "3afec18e119569d21083b13b682e8629bb874dea", default-features = false, features = ["ureq", "tokio", "rustls-tls", "cache-manager"] }
+argon2 = { version = "0.5", features = ["zeroize"] }
+rpassword = "7"
+unicode-normalization = "0.1"
+zeroize = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 serial_test = "3"
+tempfile = "3"
 
 [build-dependencies]
 prost-build = "0.14"

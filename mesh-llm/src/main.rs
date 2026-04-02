@@ -1,8 +1,10 @@
 mod affinity;
 mod api;
+mod auth;
 mod autoupdate;
 mod benchmark;
 mod cli;
+mod config;
 mod election;
 mod hardware;
 mod launch;
@@ -19,6 +21,7 @@ mod proxy;
 mod rewrite;
 mod router;
 mod tunnel;
+mod wordlist;
 
 pub mod proto {
     pub mod node {
@@ -35,6 +38,7 @@ use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser};
 use cli::models::dispatch_models_command;
 use cli::{Cli, Command, PluginCommand};
+use config::{mesh_config_path, AuthoredMeshConfig, MeshConfig};
 use mesh::NodeRole;
 use models::catalog;
 use std::collections::HashMap;
@@ -240,7 +244,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("mesh_inference=info".parse()?)
+                .add_directive("mesh_inference=debug".parse()?)
                 .add_directive("nostr_relay_pool=off".parse()?)
                 .add_directive("nostr_sdk=warn".parse()?)
                 .add_directive("noq_proto::connection=warn".parse()?),
@@ -275,6 +279,10 @@ async fn main() -> Result<()> {
     }
 
     let mut cli = Cli::parse();
+    // Preload authored mesh config for T11 and share via Arc across election loops
+    let authored_cfg =
+        std::sync::Arc::new(AuthoredMeshConfig::load(&mesh_config_path()).unwrap_or_default());
+    let owner_key_material = resolve_owner_key_material(cli.owner_key.clone()).await?;
 
     if let Some(name) = cli.plugin.clone() {
         return plugin::run_plugin_process(name).await;
@@ -290,6 +298,8 @@ async fn main() -> Result<()> {
     if !checked_updates {
         autoupdate::check_for_update().await;
     }
+
+    // Authored mesh config will be loaded once and shared with election loops
 
     // Subcommand dispatch
     if let Some(cmd) = &cli.command {
@@ -384,7 +394,7 @@ async fn main() -> Result<()> {
                 mcp,
             } => {
                 if *mcp {
-                    return run_plugin_mcp(&cli).await;
+                    return run_plugin_mcp(&cli, owner_key_material).await;
                 }
                 if text.as_deref() == Some("install-skill") {
                     return install_skill();
@@ -401,6 +411,10 @@ async fn main() -> Result<()> {
             }
             Command::Plugin { command } => {
                 return run_plugin_command(command, &cli).await;
+            }
+            Command::Auth { command } => {
+                cli::auth::dispatch_auth_command(command.clone()).await?;
+                return Ok(());
             }
         }
     }
@@ -428,6 +442,41 @@ async fn main() -> Result<()> {
     } else if mesh::was_previously_public() {
         eprintln!("🔑 Previous run was public — rotating identity for private mesh");
         mesh::clear_public_identity();
+    }
+
+    if cli_allows_startup_mesh_config(&cli) {
+        let config_path = mesh_config_path();
+        if !config_path.exists() {
+            tracing::debug!(
+                target: "mesh_inference",
+                "No mesh config found at ~/.mesh-llm/mesh.toml, using defaults"
+            );
+        } else {
+            match MeshConfig::load(&config_path) {
+                Ok(config) => match my_node_id_for_config_lookup().await {
+                    Ok(my_node_id) => {
+                        if apply_model_from_mesh_config_if_allowed(&mut cli, &config, &my_node_id) {
+                            tracing::info!(
+                                target: "mesh_inference",
+                                "Loaded mesh config from ~/.mesh-llm/mesh.toml"
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "mesh_inference",
+                            "Failed to derive node id for startup config lookup: {err}. Falling back to defaults"
+                        );
+                    }
+                },
+                Err(err) => {
+                    tracing::warn!(
+                        target: "mesh_inference",
+                        "Failed to load mesh config from ~/.mesh-llm/mesh.toml: {err}. Falling back to defaults"
+                    );
+                }
+            }
+        }
     }
 
     // --- Auto-discover ---
@@ -578,6 +627,22 @@ async fn main() -> Result<()> {
     if cli.client && (!cli.model.is_empty() || !cli.gguf.is_empty()) {
         anyhow::bail!("--client and --model are mutually exclusive");
     }
+    // No args at all = idle mode with console for browsing/joining
+    if cli.model.is_empty()
+        && cli.gguf.is_empty()
+        && cli.join.is_empty()
+        && !cli.client
+        && !cli.auto
+    {
+        {
+            let bin_dir = match &cli.bin_dir {
+                Some(d) => d.clone(),
+                None => detect_bin_dir()?,
+            };
+            return run_idle(cli, bin_dir, owner_key_material).await;
+        }
+    }
+
     // --- Resolve models from CLI ---
     // All --model entries get resolved/downloaded. First is primary (gets rpc/tunnel).
     // Additional models run as solo llama-servers (must fit in VRAM independently).
@@ -611,7 +676,15 @@ async fn main() -> Result<()> {
         None => detect_bin_dir()?,
     };
 
-    run_auto(cli, resolved_models, requested_model_names, bin_dir).await
+    run_auto(
+        cli,
+        resolved_models,
+        requested_model_names,
+        bin_dir,
+        owner_key_material,
+        authored_cfg,
+    )
+    .await
 }
 
 /// Resolve a model path: local file, catalog name, or HuggingFace URL.
@@ -681,6 +754,129 @@ async fn resolve_model(input: &std::path::Path) -> Result<PathBuf> {
     anyhow::bail!("Model not found: {}", s);
 }
 
+fn owner_key_path(cli_owner_key: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(path) = cli_owner_key {
+        return Ok(path);
+    }
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
+    Ok(home.join(".mesh-llm").join("owner-key"))
+}
+
+fn legacy_owner_secret_path() -> Result<PathBuf> {
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
+    Ok(home.join(".mesh-llm").join("owner"))
+}
+
+fn decode_owner_key_material(contents: &str, key_path: &Path) -> Result<[u8; 32]> {
+    let raw = contents.trim_end_matches(&['\r', '\n'][..]);
+    if raw.is_empty() {
+        anyhow::bail!(
+            "Owner key file is empty at {}. Provide a 32-byte hex owner key.",
+            key_path.display()
+        );
+    }
+    let bytes = hex::decode(raw)
+        .with_context(|| format!("Owner key at {} must be 32-byte hex", key_path.display()))?;
+    if bytes.len() != 32 {
+        anyhow::bail!(
+            "Owner key at {} has invalid length: expected 32 bytes hex, got {} bytes",
+            key_path.display(),
+            bytes.len()
+        );
+    }
+    Ok(bytes.try_into().unwrap())
+}
+
+async fn resolve_owner_key_material(cli_owner_key: Option<PathBuf>) -> Result<Option<[u8; 32]>> {
+    let key_path = owner_key_path(cli_owner_key)?;
+    if key_path.exists() {
+        let contents = tokio::fs::read_to_string(&key_path).await?;
+        let key = decode_owner_key_material(&contents, &key_path)?;
+        tracing::info!("Loaded owner key from {}", key_path.display());
+        return Ok(Some(key));
+    }
+
+    let legacy_path = legacy_owner_secret_path()?;
+    if legacy_path.exists() {
+        anyhow::bail!(
+            "Legacy owner secret found at {} but no owner key configured at {}.\n\
+             Migrate to owner-key bootstrap: generate a dedicated key with\n\
+             `openssl rand -hex 32 > {}`\n\
+             then restart with `--owner-key <path>` (or place it at the default path).",
+            legacy_path.display(),
+            key_path.display(),
+            key_path.display()
+        );
+    }
+
+    Ok(None)
+}
+
+async fn load_or_create_startup_key_for_config() -> Result<iroh::SecretKey> {
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
+    let dir = home.join(".mesh-llm");
+    let key_path = dir.join("key");
+
+    let old_key = home.join(".mesh-inference").join("key");
+    if !key_path.exists() && old_key.exists() {
+        tokio::fs::create_dir_all(&dir).await?;
+        tokio::fs::copy(&old_key, &key_path).await?;
+        tracing::info!("Migrated key from {}", old_key.display());
+    }
+
+    if key_path.exists() {
+        let hex = tokio::fs::read_to_string(&key_path).await?;
+        let bytes = hex::decode(hex.trim())?;
+        if bytes.len() != 32 {
+            anyhow::bail!("Invalid key length in {}", key_path.display());
+        }
+        let key = iroh::SecretKey::from_bytes(&bytes.try_into().unwrap());
+        return Ok(key);
+    }
+
+    let key = iroh::SecretKey::generate(&mut rand::rng());
+    tokio::fs::create_dir_all(&dir).await?;
+    tokio::fs::write(&key_path, hex::encode(key.to_bytes())).await?;
+    Ok(key)
+}
+
+async fn my_node_id_for_config_lookup() -> Result<String> {
+    let key = load_or_create_startup_key_for_config().await?;
+    let endpoint_id: iroh::EndpointId = key.public().into();
+    Ok(endpoint_id.fmt_short().to_string())
+}
+
+fn apply_model_from_mesh_config_if_allowed(
+    cli: &mut Cli,
+    config: &MeshConfig,
+    my_node_id: &str,
+) -> bool {
+    let Some(node_cfg) = config.for_node(my_node_id) else {
+        return false;
+    };
+    if node_cfg.models.is_empty() {
+        return false;
+    }
+
+    for model in &node_cfg.models {
+        let selected_source = model
+            .path
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .unwrap_or(model.name.as_str());
+        cli.model.push(PathBuf::from(selected_source));
+    }
+    true
+}
+
+fn cli_allows_startup_mesh_config(cli: &Cli) -> bool {
+    cli.model.is_empty() && !cli.client
+}
+
 /// Look up the model filename in the catalog and check if its draft model exists on disk.
 /// If not on disk, downloads it (drafts are <1GB).
 pub async fn ensure_draft(model: &std::path::Path) -> Option<PathBuf> {
@@ -732,6 +928,22 @@ fn parse_size_str(s: &str) -> u64 {
     } else {
         0
     }
+}
+
+fn scan_result_to_names_and_sizes(
+    scan: &[mesh::ScannedModel],
+) -> (Vec<String>, HashMap<String, u64>) {
+    let mut names = Vec::with_capacity(scan.len());
+    let mut seen = std::collections::HashSet::new();
+    let mut sizes = HashMap::with_capacity(scan.len());
+    for model in scan {
+        if seen.insert(model.name.clone()) {
+            names.push(model.name.clone());
+        }
+        let entry = sizes.entry(model.name.clone()).or_insert(0);
+        *entry = (*entry).max(model.size_bytes);
+    }
+    (names, sizes)
 }
 
 /// Pick which model this node should serve, based on demand signals.
@@ -1089,7 +1301,7 @@ async fn join_mesh_for_mcp(cli: &Cli, node: &mesh::Node) -> Result<()> {
     Ok(())
 }
 
-async fn run_plugin_mcp(cli: &Cli) -> Result<()> {
+async fn run_plugin_mcp(cli: &Cli, owner_key_material: Option<[u8; 32]>) -> Result<()> {
     let resolved_plugins = load_resolved_plugins(cli)?;
     let (node, _channels) = mesh::Node::start(
         NodeRole::Client,
@@ -1099,6 +1311,7 @@ async fn run_plugin_mcp(cli: &Cli) -> Result<()> {
         cli.enumerate_host,
     )
     .await?;
+    node.set_owner_key_material(owner_key_material).await;
     node.start_accepting();
     node.set_blackboard_name(blackboard_display_name(cli, &node))
         .await;
@@ -1125,6 +1338,8 @@ async fn run_auto(
     resolved_models: Vec<PathBuf>,
     requested_model_names: Vec<String>,
     bin_dir: PathBuf,
+    owner_key_material: Option<[u8; 32]>,
+    authored_cfg: std::sync::Arc<AuthoredMeshConfig>,
 ) -> Result<()> {
     let resolved_plugins = load_resolved_plugins(&cli)?;
     let api_port = cli.port;
@@ -1132,10 +1347,12 @@ async fn run_auto(
     let is_client = cli.client;
 
     // Scan local models on disk
-    let local_models = if is_client {
-        vec![]
+    let (local_models, local_model_sizes, local_model_metadata) = if is_client {
+        (vec![], HashMap::new(), vec![])
     } else {
-        models::scan_local_models()
+        let scan = mesh::scan_local_model_metadata();
+        let (models, sizes) = scan_result_to_names_and_sizes(&scan);
+        (models, sizes, scan)
     };
     tracing::info!("Local models on disk: {:?}", local_models);
 
@@ -1155,6 +1372,7 @@ async fn run_auto(
         cli.enumerate_host,
     )
     .await?;
+    node.set_owner_key_material(owner_key_material).await;
     node.start_accepting();
     let token = node.invite_token();
     node.set_blackboard_name(blackboard_display_name(&cli, &node))
@@ -1168,8 +1386,36 @@ async fn run_auto(
 
     // Advertise what we have on disk and what we want the mesh to serve
     node.set_available_models(local_models.clone()).await;
+    node.set_available_model_sizes(local_model_sizes).await;
+    node.set_available_model_metadata(local_model_metadata)
+        .await;
     node.set_requested_models(requested_model_names.clone())
         .await;
+
+    let (extra_model_tx, extra_model_rx) =
+        tokio::sync::watch::channel::<Option<(String, std::path::PathBuf)>>(None);
+
+    if !is_client {
+        let scan_node = node.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let mut scan = mesh::scan_local_model_metadata();
+                if let Some((ref name, ref path)) = *extra_model_rx.borrow() {
+                    if !scan.iter().any(|s| &s.name == name) {
+                        scan.push(mesh::scan_model_file(name.clone(), path));
+                    }
+                }
+                let (models, model_sizes) = scan_result_to_names_and_sizes(&scan);
+                scan_node.set_available_models(models).await;
+                scan_node.set_available_model_sizes(model_sizes).await;
+                scan_node.set_available_model_metadata(scan).await;
+                scan_node.regossip().await;
+            }
+        });
+    }
 
     // Start periodic health check to detect dead peers
     node.start_heartbeat();
@@ -1426,6 +1672,19 @@ async fn run_auto(
         }
     });
     node.set_model_source(model_source.clone()).await;
+
+    // Inject GGUF metadata for models outside model_dirs (e.g. --model /custom/path.gguf)
+    {
+        let current_meta = node.available_model_metadata().await;
+        if !current_meta.iter().any(|s| s.name == model_name) {
+            let extra = mesh::scan_model_file(model_name.clone(), &model);
+            let mut updated = current_meta;
+            updated.push(extra);
+            node.set_available_model_metadata(updated).await;
+        }
+        let _ = extra_model_tx.send(Some((model_name.clone(), model.clone())));
+    }
+
     // Set all serving models (primary + extras)
     let all_serving = build_serving_list(&resolved_models, &model_name);
     node.set_serving_models(all_serving.clone()).await;
@@ -1578,11 +1837,17 @@ async fn run_auto(
     let primary_process_model_name = model_name.clone();
     let primary_model_name_for_advertise = model_name.clone();
     let (primary_stop_tx, primary_stop_rx) = tokio::sync::watch::channel(false);
+    let authored_cfg_clone = authored_cfg.clone();
+    let ctx_size_for_election = cli.ctx_size.or_else(|| {
+        let my_id = node.id().fmt_short().to_string();
+        authored_cfg.model_ctx_size(&my_id, &model_name)
+    });
     let primary_task = tokio::spawn(async move {
         election::election_loop(
             node2, tunnel_mgr2, api_port, rpc_port, bin_dir2, model2, model_name_for_election,
-            draft2, draft_max, force_split, llama_flavor, cli.ctx_size, primary_target_tx,
+            draft2, draft_max, force_split, llama_flavor, ctx_size_for_election, primary_target_tx,
             primary_stop_rx,
+            authored_cfg_clone,
             move |is_host, llama_ready| {
                 let advertise_node = node_for_cb.clone();
                 let advertise_model = primary_model_name_for_advertise.clone();
@@ -1673,6 +1938,8 @@ async fn run_auto(
         node.set_models(all_names).await;
         node.regossip().await;
 
+        // Clone authored_cfg once before the loop so we can use it across iterations
+        let authored_cfg_for_loop = authored_cfg.clone();
         for extra_model in resolved_models.iter().skip(1) {
             let extra_name = {
                 let stem = extra_model
@@ -1699,11 +1966,17 @@ async fn run_auto(
             let managed_model_name = extra_name.clone();
             eprintln!("  + {extra_name}");
             let (extra_stop_tx, extra_stop_rx) = tokio::sync::watch::channel(false);
+            let authored_cfg_for_this = authored_cfg_for_loop.clone();
+            let extra_ctx_size = cli.ctx_size.or_else(|| {
+                let my_id = node.id().fmt_short().to_string();
+                authored_cfg_for_loop.model_ctx_size(&my_id, &extra_name)
+            });
             let extra_task = tokio::spawn(async move {
                 election::election_loop(
                     extra_node, extra_tunnel, api_port_extra, 0, extra_bin, extra_path, extra_model_name.clone(),
-                    None, 8, false, extra_llama_flavor, cli.ctx_size, extra_target_tx,
+                    None, 8, false, extra_llama_flavor, extra_ctx_size, extra_target_tx,
                     extra_stop_rx,
+                    authored_cfg_for_this,
                     move |is_host, llama_ready| {
                         let advertise_node = extra_node_for_advertise.clone();
                         let model_name = extra_model_name_for_advertise.clone();
@@ -1955,7 +2228,80 @@ async fn run_auto(
     Ok(())
 }
 
-/// Used by both --client (pure consumer) and standby GPU nodes (no matching model).
+/// Idle mode: no args → show instructions and read-only console.
+/// Use --auto or --join to actually connect to a mesh.
+async fn run_idle(cli: Cli, _bin_dir: PathBuf, owner_key_material: Option<[u8; 32]>) -> Result<()> {
+    let resolved_plugins = load_resolved_plugins(&cli)?;
+    let my_vram_gb = mesh::detect_vram_bytes_capped(cli.max_vram) as f64 / 1e9;
+    let local_model_metadata = mesh::scan_local_model_metadata();
+    let (local_models, local_model_sizes) = scan_result_to_names_and_sizes(&local_model_metadata);
+    eprintln!(
+        "mesh-llm v{VERSION} — {:.0}GB VRAM, {} models on disk",
+        my_vram_gb,
+        local_models.len()
+    );
+    eprintln!();
+    eprintln!("  Console: http://localhost:{}", cli.console);
+    eprintln!();
+    eprintln!("  Start a mesh:");
+    eprintln!("    mesh-llm --model Qwen2.5-32B                 serve a model");
+    eprintln!("    mesh-llm --auto --model GLM-4.7-Flash-Q4_K_M --mesh-name \"my-mesh\"");
+    eprintln!();
+    eprintln!("  Join a mesh:");
+    eprintln!("    mesh-llm --auto              discover and join automatically");
+    eprintln!("    mesh-llm --join <token>      join by invite token");
+    eprintln!("    mesh-llm --client --auto     join as API-only client");
+    eprintln!();
+    if models::legacy_models_present() {
+        models::cli::print_legacy_storage_warning();
+        eprintln!();
+    }
+
+    // Start a dormant node just for the console
+    let (node, _channels) = mesh::Node::start(
+        NodeRole::Worker,
+        &cli.relay,
+        cli.bind_port,
+        cli.max_vram,
+        cli.enumerate_host,
+    )
+    .await?;
+    node.set_owner_key_material(owner_key_material).await;
+    node.set_available_models(local_models).await;
+    node.set_available_model_sizes(local_model_sizes).await;
+    node.set_available_model_metadata(local_model_metadata)
+        .await;
+    node.set_blackboard_name(blackboard_display_name(&cli, &node))
+        .await;
+    let (plugin_mesh_tx, plugin_mesh_rx) = tokio::sync::mpsc::channel(256);
+    let plugin_manager =
+        plugin::PluginManager::start(&resolved_plugins, plugin_host_mode(&cli), plugin_mesh_tx)
+            .await?;
+    node.set_plugin_manager(plugin_manager.clone()).await;
+    node.start_plugin_channel_forwarder(plugin_mesh_rx);
+
+    let cs = api::MeshApi::new(
+        node.clone(),
+        "(idle)".into(),
+        cli.port,
+        0,
+        plugin_manager,
+        affinity::AffinityRouter::new(),
+    );
+    cs.set_nostr_relays(nostr_relays(&cli.nostr_relay)).await;
+    cs.update(false, false).await;
+    let cs2 = cs.clone();
+    let (_tx, rx) = tokio::sync::watch::channel(election::InferenceTarget::None);
+    tokio::spawn(async move {
+        api::start(cli.console, cs2, rx, cli.listen_all).await;
+    });
+
+    tokio::signal::ctrl_c().await?;
+    eprintln!("\nShutting down...");
+    Ok(())
+}
+
+/// Used by both --client (pure consumer) and idle GPU nodes (standby, no matching model).
 /// If `create_node` is true, creates a new Node (--client path). Otherwise reuses existing.
 /// Run as passive node (client or standby GPU).
 /// Returns Ok(Some(model_name)) if a standby GPU should promote to serve a model.
@@ -2062,7 +2408,6 @@ async fn run_passive(
     if !is_client {
         let watch_node = node.clone();
         let mut peer_rx = node.peer_change_rx.clone();
-        let local_models = models::scan_local_models();
         tokio::spawn(async move {
             // Wait for initial mesh settle
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
@@ -2086,6 +2431,17 @@ async fn run_passive(
                     }
                 }
                 // Check if there's an unserved or demand-imbalanced model we can handle
+                let local_model_metadata = mesh::scan_local_model_metadata();
+                let (local_models, local_model_sizes) =
+                    scan_result_to_names_and_sizes(&local_model_metadata);
+                watch_node.set_available_models(local_models.clone()).await;
+                watch_node
+                    .set_available_model_sizes(local_model_sizes)
+                    .await;
+                watch_node
+                    .set_available_model_metadata(local_model_metadata)
+                    .await;
+                watch_node.regossip().await;
                 if let Some(model_name) = check_unserved_model(&watch_node, &local_models).await {
                     eprintln!("🚀 Promoting from standby — serving {model_name}");
                     let _ = promote_tx.send(model_name).await;
@@ -3273,6 +3629,7 @@ fn build_serving_list(resolved_models: &[PathBuf], model_name: &str) -> Vec<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{ModelAssignment, NodeConfig};
     use hf_hub::{Cache, Repo, RepoType};
     use serde_json::json;
     use serial_test::serial;
@@ -3414,6 +3771,85 @@ mod tests {
         } else {
             std::env::remove_var(key);
         }
+    }
+
+    fn test_temp_dir(prefix: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "mesh-llm-{prefix}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn owner_key_bootstrap_replaces_legacy_owner_secret() {
+        let prev_home = std::env::var_os("HOME");
+        let temp_home = test_temp_dir("owner-key-replaces-legacy");
+        let mesh_dir = temp_home.join(".mesh-llm");
+        std::fs::create_dir_all(&mesh_dir).unwrap();
+        std::fs::write(mesh_dir.join("owner"), "legacy-shared-secret").unwrap();
+        let owner_key_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        std::fs::write(mesh_dir.join("owner-key"), owner_key_hex).unwrap();
+
+        std::env::set_var("HOME", &temp_home);
+
+        let owner_key = resolve_owner_key_material(None)
+            .await
+            .expect("owner key bootstrap should prefer owner-key file")
+            .expect("owner key should be loaded");
+
+        assert_eq!(hex::encode(owner_key), owner_key_hex);
+
+        restore_env("HOME", prev_home);
+        let _ = std::fs::remove_dir_all(temp_home);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn missing_owner_key_reports_unowned_state() {
+        let prev_home = std::env::var_os("HOME");
+        let temp_home = test_temp_dir("missing-owner-key-unowned");
+        std::env::set_var("HOME", &temp_home);
+
+        let owner_key = resolve_owner_key_material(None)
+            .await
+            .expect("missing owner-key should not fail when no legacy file exists");
+        assert!(owner_key.is_none(), "missing owner-key should be unowned");
+
+        restore_env("HOME", prev_home);
+        let _ = std::fs::remove_dir_all(temp_home);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn legacy_owner_file_without_owner_key_fails_startup() {
+        let prev_home = std::env::var_os("HOME");
+        let temp_home = test_temp_dir("legacy-owner-without-key");
+        let mesh_dir = temp_home.join(".mesh-llm");
+        std::fs::create_dir_all(&mesh_dir).unwrap();
+        std::fs::write(mesh_dir.join("owner"), "legacy-shared-secret").unwrap();
+        std::env::set_var("HOME", &temp_home);
+
+        let err = resolve_owner_key_material(None)
+            .await
+            .expect_err("legacy owner file without owner-key must fail loudly");
+        let message = err.to_string();
+        assert!(
+            message.contains("Legacy owner secret found"),
+            "error should call out legacy plaintext owner file"
+        );
+        assert!(
+            message.contains("--owner-key"),
+            "error should include migration guidance"
+        );
+
+        restore_env("HOME", prev_home);
+        let _ = std::fs::remove_dir_all(temp_home);
     }
 
     #[tokio::test]
@@ -4144,5 +4580,115 @@ mod tests {
             }
         })
         .await;
+    }
+
+    #[test]
+    fn test_cli_allows_startup_mesh_config_precedence() {
+        let cli_none = Cli::parse_from(["mesh-llm"]);
+        assert!(cli_allows_startup_mesh_config(&cli_none));
+
+        let cli_model = Cli::parse_from(["mesh-llm", "--model", "Qwen3-8B"]);
+        assert!(!cli_allows_startup_mesh_config(&cli_model));
+
+        let cli_auto = Cli::parse_from(["mesh-llm", "--auto"]);
+        assert!(!cli_allows_startup_mesh_config(&cli_auto));
+
+        let cli_join = Cli::parse_from(["mesh-llm", "--join", "token"]);
+        assert!(!cli_allows_startup_mesh_config(&cli_join));
+
+        let cli_client = Cli::parse_from(["mesh-llm", "--client"]);
+        assert!(!cli_allows_startup_mesh_config(&cli_client));
+    }
+
+    #[test]
+    fn test_apply_model_from_mesh_config_uses_first_model_only() {
+        let mut cli = Cli::parse_from(["mesh-llm"]);
+        let config = MeshConfig {
+            nodes: vec![NodeConfig {
+                node_id: "node-123".into(),
+                hostname: None,
+                models: vec![
+                    ModelAssignment {
+                        name: "FirstModel".into(),
+                        path: Some("/tmp/first.gguf".into()),
+                        ctx_size: Some(8192),
+                        moe_experts: Some(16),
+                    },
+                    ModelAssignment {
+                        name: "SecondModel".into(),
+                        path: Some("/tmp/second.gguf".into()),
+                        ctx_size: Some(4096),
+                        moe_experts: None,
+                    },
+                ],
+            }],
+        };
+
+        let applied = apply_model_from_mesh_config_if_allowed(&mut cli, &config, "node-123");
+        assert!(applied);
+        assert_eq!(cli.model, vec![PathBuf::from("/tmp/first.gguf")]);
+    }
+
+    #[test]
+    fn test_apply_model_from_mesh_config_falls_back_to_name_when_path_missing() {
+        let mut cli = Cli::parse_from(["mesh-llm"]);
+        let config = MeshConfig {
+            nodes: vec![NodeConfig {
+                node_id: "node-123".into(),
+                hostname: None,
+                models: vec![ModelAssignment {
+                    name: "FirstModel".into(),
+                    path: None,
+                    ctx_size: Some(8192),
+                    moe_experts: Some(16),
+                }],
+            }],
+        };
+
+        let applied = apply_model_from_mesh_config_if_allowed(&mut cli, &config, "node-123");
+        assert!(applied);
+        assert_eq!(cli.model, vec![PathBuf::from("FirstModel")]);
+    }
+
+    #[test]
+    fn test_apply_model_from_mesh_config_falls_back_to_name_when_path_blank() {
+        let mut cli = Cli::parse_from(["mesh-llm"]);
+        let config = MeshConfig {
+            nodes: vec![NodeConfig {
+                node_id: "node-123".into(),
+                hostname: None,
+                models: vec![ModelAssignment {
+                    name: "FirstModel".into(),
+                    path: Some("   ".into()),
+                    ctx_size: Some(8192),
+                    moe_experts: Some(16),
+                }],
+            }],
+        };
+
+        let applied = apply_model_from_mesh_config_if_allowed(&mut cli, &config, "node-123");
+        assert!(applied);
+        assert_eq!(cli.model, vec![PathBuf::from("FirstModel")]);
+    }
+
+    #[test]
+    fn test_apply_model_from_mesh_config_requires_matching_node() {
+        let mut cli = Cli::parse_from(["mesh-llm"]);
+        let config = MeshConfig {
+            nodes: vec![NodeConfig {
+                node_id: "other-node".into(),
+                hostname: None,
+                models: vec![ModelAssignment {
+                    name: "ConfiguredModel".into(),
+                    path: None,
+                    ctx_size: None,
+                    moe_experts: None,
+                }],
+            }],
+        };
+
+        let applied = apply_model_from_mesh_config_if_allowed(&mut cli, &config, "node-123");
+        assert!(!applied);
+        assert!(cli.model.is_empty());
     }
 }

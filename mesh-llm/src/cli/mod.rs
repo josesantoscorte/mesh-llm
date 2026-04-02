@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use crate::cli::runtime::RuntimeCommand;
 
+pub mod auth;
 pub mod models;
 pub(crate) mod runtime;
 
@@ -72,6 +73,10 @@ pub(crate) struct Cli {
     /// Your display name on the blackboard.
     #[arg(long)]
     pub(crate) name: Option<String>,
+
+    /// Path to the dedicated owner key used for node ownership and config authorization.
+    #[arg(long)]
+    pub(crate) owner_key: Option<PathBuf>,
 
     /// Internal plugin service mode.
     #[arg(long, hide = true)]
@@ -288,6 +293,11 @@ pub(crate) enum Command {
     Plugin {
         #[command(subcommand)]
         command: PluginCommand,
+    },
+    /// Manage owner key provisioning
+    Auth {
+        #[command(subcommand)]
+        command: auth::AuthCommand,
     },
 }
 
