@@ -42,7 +42,7 @@ function mergeRuntimeIntoConfig(
     return {
       node_id: node.id,
       hostname: savedNode?.hostname,
-      placement_mode: savedNode?.placement_mode,
+      placement_mode: savedNode?.placement_mode ?? ('pooled' as PlacementMode),
       models: [...keptFromSaved, ...stubs],
     };
   });

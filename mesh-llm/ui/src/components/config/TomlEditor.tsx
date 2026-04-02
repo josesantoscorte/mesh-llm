@@ -72,15 +72,17 @@ export function TomlEditor({
       clearTimeout(shikiTimerRef.current);
     }
     shikiTimerRef.current = setTimeout(() => {
-      void codeToHtml(tomlText, { lang: 'toml', theme: 'github-dark' }).then((html) => {
-        if (highlightDivRef.current) {
-          highlightDivRef.current.innerHTML = html;
-          const pre = highlightDivRef.current.querySelector('pre');
-          if (pre) {
-            pre.style.backgroundColor = 'transparent';
+      void codeToHtml(tomlText, { lang: 'toml', theme: 'github-dark' })
+        .then((html) => {
+          if (highlightDivRef.current) {
+            highlightDivRef.current.innerHTML = html;
+            const pre = highlightDivRef.current.querySelector('pre');
+            if (pre) {
+              pre.style.backgroundColor = 'transparent';
+            }
           }
-        }
-      });
+        })
+        .catch(() => {});
     }, SHIKI_DEBOUNCE_MS);
     return () => {
       if (shikiTimerRef.current !== null) {
