@@ -2,9 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use super::local::{
-    find_model_path as find_local_model_path, gguf_metadata_cache_path, model_dirs,
-};
+use super::local::{gguf_metadata_cache_path, model_dirs};
 
 #[derive(Clone, Debug, Default)]
 pub struct LocalModelInventorySnapshot {
@@ -266,8 +264,4 @@ pub fn scan_all_model_metadata() -> Vec<crate::proto::node::CompactModelMetadata
         .collect();
     result.sort_by(|a, b| a.model_key.cmp(&b.model_key));
     result
-}
-
-pub fn find_model_path(stem: &str) -> PathBuf {
-    find_local_model_path(stem)
 }

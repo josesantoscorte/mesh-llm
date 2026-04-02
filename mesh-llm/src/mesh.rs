@@ -820,10 +820,6 @@ pub fn scan_local_model_sizes() -> HashMap<String, u64> {
 pub fn scan_all_model_metadata() -> Vec<crate::proto::node::CompactModelMetadata> {
     crate::models::scan_all_model_metadata()
 }
-
-pub fn find_model_path(stem: &str) -> std::path::PathBuf {
-    crate::models::find_model_path(stem)
-}
 /// Detect available VRAM. On Apple Silicon, uses ~75% of system RAM
 /// (the rest is reserved for OS/apps on unified memory).
 /// Detect available memory for model loading, capped by max_vram_gb if set.
