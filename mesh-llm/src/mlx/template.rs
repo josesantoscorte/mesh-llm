@@ -340,7 +340,7 @@ fn reasoning_defaults(config: &Value) -> ReasoningDefaults {
             ..ReasoningDefaults::default()
         };
     }
-    if model_type == "glm" || architectures.iter().any(|value| value.contains("glm")) {
+    if model_type.starts_with("glm") || architectures.iter().any(|value| value.contains("glm")) {
         return ReasoningDefaults {
             enable_thinking: Some(false),
             ..ReasoningDefaults::default()

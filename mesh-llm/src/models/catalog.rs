@@ -1013,6 +1013,17 @@ mod tests {
     }
 
     #[test]
+    fn source_identity_is_exposed_for_glm4_mlx_catalog_entry() {
+        let model = find_model("GLM-4-9B-0414-MLX").unwrap();
+        assert_eq!(
+            model.source_repo(),
+            Some("mlx-community/GLM-4-9B-0414-4bit")
+        );
+        assert_eq!(model.source_revision(), Some("main"));
+        assert_eq!(model.source_file(), Some("model.safetensors.index.json"));
+    }
+
+    #[test]
     fn test_free_disk_space() {
         let path = std::env::temp_dir().join("test_file.gguf");
         let free = free_disk_space(&path);

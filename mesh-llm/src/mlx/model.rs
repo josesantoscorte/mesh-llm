@@ -36,6 +36,8 @@ pub struct ModelConfig {
     pub rms_norm_eps: f32,
     #[serde(default = "default_rope_theta")]
     pub rope_theta: f32,
+    #[serde(default)]
+    pub partial_rotary_factor: Option<f32>,
     #[allow(dead_code)]
     pub max_position_embeddings: i32,
     #[serde(default, deserialize_with = "deserialize_nullable_bool")]
@@ -479,8 +481,9 @@ fn apply_rope(
 // ── MLP ──
 
 pub struct MLP {
-    gate_proj: QuantizedLinear,
-    up_proj: QuantizedLinear,
+    gate_up_proj: Option<QuantizedLinear>,
+    gate_proj: Option<QuantizedLinear>,
+    up_proj: Option<QuantizedLinear>,
     down_proj: QuantizedLinear,
     activation: Activation,
 }
@@ -493,12 +496,32 @@ pub enum Activation {
 
 impl MLP {
     pub fn forward(&self, x: &Array) -> Result<Array> {
-        let gate = self.gate_proj.forward(x)?;
+        let (gate, up) = if let Some(gate_up_proj) = &self.gate_up_proj {
+            let gate_up = gate_up_proj.forward(x)?;
+            let hidden = gate_up.shape()[gate_up.shape().len() - 1] / 2;
+            let gate = gate_up.index((std::ops::RangeFull, std::ops::RangeFull, 0..hidden));
+            let up = gate_up.index((
+                std::ops::RangeFull,
+                std::ops::RangeFull,
+                hidden..(hidden * 2),
+            ));
+            (gate, up)
+        } else {
+            (
+                self.gate_proj
+                    .as_ref()
+                    .context("missing gate_proj for unfused MLP")?
+                    .forward(x)?,
+                self.up_proj
+                    .as_ref()
+                    .context("missing up_proj for unfused MLP")?
+                    .forward(x)?,
+            )
+        };
         let gate = match self.activation {
             Activation::Silu => &mlx_rs::ops::sigmoid(&gate)? * &gate,
             Activation::GeluApproximate => mlx_rs::nn::gelu_approximate(&gate)?,
         };
-        let up = self.up_proj.forward(x)?;
         self.down_proj.forward(&(&gate * &up))
     }
 }
@@ -1053,6 +1076,9 @@ impl MlxModel {
                         .and_then(|params| params.partial_rotary_factor)
                         .unwrap_or(1.0))
                 .round() as i32
+            } else if arch.is_glm4() {
+                ((layer_head_dim as f32) * config.partial_rotary_factor.unwrap_or(1.0)).round()
+                    as i32
             } else {
                 layer_head_dim
             };
@@ -1079,7 +1105,9 @@ impl MlxModel {
             } else {
                 1.0 / (layer_head_dim as f32).sqrt()
             };
-            let mlp_in_norm_key = if arch.is_gemma2() || arch.is_gemma3() || arch.is_gemma4() {
+            let mlp_in_norm_key = if arch.is_glm4() {
+                format!("{p}.post_attention_layernorm.weight")
+            } else if arch.is_gemma2() || arch.is_gemma3() || arch.is_gemma4() {
                 format!("{p}.pre_feedforward_layernorm.weight")
             } else {
                 format!("{p}.post_attention_layernorm.weight")
@@ -1124,8 +1152,18 @@ impl MlxModel {
                     kv_shared_source,
                 },
                 mlp: MLP {
-                    gate_proj: load_qlinear(&format!("{p}.mlp.gate_proj"))?,
-                    up_proj: load_qlinear(&format!("{p}.mlp.up_proj"))?,
+                    gate_up_proj: tensors
+                        .contains_key(&format!("{p}.mlp.gate_up_proj.weight"))
+                        .then(|| load_qlinear(&format!("{p}.mlp.gate_up_proj")))
+                        .transpose()?,
+                    gate_proj: tensors
+                        .contains_key(&format!("{p}.mlp.gate_proj.weight"))
+                        .then(|| load_qlinear(&format!("{p}.mlp.gate_proj")))
+                        .transpose()?,
+                    up_proj: tensors
+                        .contains_key(&format!("{p}.mlp.up_proj.weight"))
+                        .then(|| load_qlinear(&format!("{p}.mlp.up_proj")))
+                        .transpose()?,
                     down_proj: load_qlinear(&format!("{p}.mlp.down_proj"))?,
                     activation: activation,
                 },
@@ -1137,24 +1175,32 @@ impl MlxModel {
                     eps: config.rms_norm_eps,
                     add_unit_offset: arch.uses_gemma_norm_offset(),
                 },
-                attn_out_norm: (arch.is_gemma2() || arch.is_gemma3() || arch.is_gemma4())
-                    .then(|| -> Result<RMSNorm> {
-                        Ok(RMSNorm {
-                            weight: tensors
-                                .get(&format!("{p}.post_attention_layernorm.weight"))
-                                .cloned()
-                                .with_context(|| {
-                                    format!("missing {p}.post_attention_layernorm.weight")
-                                })?,
-                            eps: config.rms_norm_eps,
-                            add_unit_offset: arch.uses_gemma_norm_offset(),
-                        })
+                attn_out_norm: (arch.is_glm4()
+                    || arch.is_gemma2()
+                    || arch.is_gemma3()
+                    || arch.is_gemma4())
+                .then(|| -> Result<RMSNorm> {
+                    let key = if arch.is_glm4() {
+                        format!("{p}.post_self_attn_layernorm.weight")
+                    } else {
+                        format!("{p}.post_attention_layernorm.weight")
+                    };
+                    Ok(RMSNorm {
+                        weight: tensors
+                            .get(&key)
+                            .cloned()
+                            .with_context(|| format!("missing {key}"))?,
+                        eps: config.rms_norm_eps,
+                        add_unit_offset: arch.uses_gemma_norm_offset(),
                     })
-                    .transpose()?,
+                })
+                .transpose()?,
                 mlp_in_norm: RMSNorm {
                     weight: tensors.get(&mlp_in_norm_key).cloned().with_context(|| {
                         if arch.is_gemma2() || arch.is_gemma3() {
                             format!("missing {p}.pre_feedforward_layernorm.weight")
+                        } else if arch.is_glm4() {
+                            format!("missing {p}.post_attention_layernorm.weight")
                         } else {
                             format!("missing {p}.post_attention_layernorm.weight")
                         }
@@ -1162,20 +1208,26 @@ impl MlxModel {
                     eps: config.rms_norm_eps,
                     add_unit_offset: arch.uses_gemma_norm_offset(),
                 },
-                mlp_out_norm: (arch.is_gemma2() || arch.is_gemma3() || arch.is_gemma4())
-                    .then(|| -> Result<RMSNorm> {
-                        Ok(RMSNorm {
-                            weight: tensors
-                                .get(&format!("{p}.post_feedforward_layernorm.weight"))
-                                .cloned()
-                                .with_context(|| {
-                                    format!("missing {p}.post_feedforward_layernorm.weight")
-                                })?,
-                            eps: config.rms_norm_eps,
-                            add_unit_offset: arch.uses_gemma_norm_offset(),
-                        })
+                mlp_out_norm: (arch.is_glm4()
+                    || arch.is_gemma2()
+                    || arch.is_gemma3()
+                    || arch.is_gemma4())
+                .then(|| -> Result<RMSNorm> {
+                    let key = if arch.is_glm4() {
+                        format!("{p}.post_mlp_layernorm.weight")
+                    } else {
+                        format!("{p}.post_feedforward_layernorm.weight")
+                    };
+                    Ok(RMSNorm {
+                        weight: tensors
+                            .get(&key)
+                            .cloned()
+                            .with_context(|| format!("missing {key}"))?,
+                        eps: config.rms_norm_eps,
+                        add_unit_offset: arch.uses_gemma_norm_offset(),
                     })
-                    .transpose()?,
+                })
+                .transpose()?,
                 per_layer_input: arch
                     .is_gemma4()
                     .then(|| -> Result<PerLayerInputBlock> {
@@ -1421,12 +1473,17 @@ impl MlxModel {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ModelArchitecture {
     LlamaLike,
+    Glm4,
     Gemma2,
     Gemma3,
     Gemma4,
 }
 
 impl ModelArchitecture {
+    fn is_glm4(self) -> bool {
+        matches!(self, Self::Glm4)
+    }
+
     fn is_gemma2(self) -> bool {
         matches!(self, Self::Gemma2)
     }
@@ -1466,7 +1523,9 @@ fn model_architecture(config: &Value) -> ModelArchitecture {
         .unwrap_or_default()
         .to_ascii_lowercase();
 
-    if model_type.starts_with("gemma4") {
+    if model_type.starts_with("glm4") {
+        ModelArchitecture::Glm4
+    } else if model_type.starts_with("gemma4") {
         ModelArchitecture::Gemma4
     } else if model_type.starts_with("gemma2") {
         ModelArchitecture::Gemma2
@@ -1623,6 +1682,7 @@ fn config_supports_mlx(config: &Value) -> bool {
         matches!(
             name.as_str(),
             "llama"
+                | "glm4"
                 | "qwen2"
                 | "qwen3"
                 | "gemma2"
@@ -1630,6 +1690,7 @@ fn config_supports_mlx(config: &Value) -> bool {
                 | "gemma3_text"
                 | "gemma4"
                 | "gemma4_text"
+                | "glm4forcausallm"
                 | "llamaforcausallm"
                 | "qwen2forcausallm"
                 | "qwen3forcausallm"
@@ -1676,7 +1737,7 @@ fn ensure_supported_mlx_model(dir: &Path, config: &Value) -> Result<()> {
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "none".to_string());
     bail!(
-        "unsupported MLX model architecture in {} (model_type={}, architectures={}); supported MLX models currently cover Llama/Qwen/Gemma2/Gemma3/Gemma4-style safetensors checkpoints",
+        "unsupported MLX model architecture in {} (model_type={}, architectures={}); supported MLX models currently cover Llama/GLM4/Qwen/Gemma2/Gemma3/Gemma4-style safetensors checkpoints",
         dir.display(),
         model_type,
         architectures,
@@ -1782,6 +1843,10 @@ mod tests {
 
     #[test]
     fn config_supports_known_mlx_architectures() {
+        let glm4: Value = serde_json::json!({
+            "model_type": "glm4",
+            "architectures": ["Glm4ForCausalLM"]
+        });
         let qwen: Value = serde_json::json!({
             "model_type": "qwen2",
             "architectures": ["Qwen2ForCausalLM"]
@@ -1804,6 +1869,7 @@ mod tests {
             "text_config": {"model_type": "gemma4_text"}
         });
 
+        assert!(config_supports_mlx(&glm4));
         assert!(config_supports_mlx(&qwen));
         assert!(config_supports_mlx(&llama));
         assert!(config_supports_mlx(&gemma2));
@@ -1980,6 +2046,45 @@ mod tests {
         });
 
         assert_eq!(model_architecture(&config), ModelArchitecture::Gemma2);
+    }
+
+    #[test]
+    fn model_architecture_detects_glm4() {
+        let config = serde_json::json!({
+            "model_type": "glm4",
+            "architectures": ["Glm4ForCausalLM"]
+        });
+
+        assert_eq!(model_architecture(&config), ModelArchitecture::Glm4);
+    }
+
+    #[test]
+    fn glm4_config_parses_partial_rotary_factor() {
+        let config: ModelConfig = serde_json::from_value(serde_json::json!({
+            "model_type": "glm4",
+            "hidden_size": 4096,
+            "num_hidden_layers": 40,
+            "intermediate_size": 13696,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 2,
+            "head_dim": 128,
+            "vocab_size": 151552,
+            "rms_norm_eps": 0.00001,
+            "rope_theta": 10000.0,
+            "partial_rotary_factor": 0.5,
+            "max_position_embeddings": 32768,
+            "tie_word_embeddings": false,
+            "hidden_act": "silu",
+            "quantization": {
+                "group_size": 64,
+                "bits": 4
+            },
+            "eos_token_id": 151329
+        }))
+        .unwrap();
+
+        assert_eq!(config.partial_rotary_factor, Some(0.5));
+        assert_eq!(config.head_dim, Some(128));
     }
 
     #[test]

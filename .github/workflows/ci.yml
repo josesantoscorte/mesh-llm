@@ -323,6 +323,14 @@ jobs:
             expect_contains: blue
             forbid_contains: "{"
             thinking_mode: ""
+          - name: glm-4-9b
+            repo: mlx-community/GLM-4-9B-0414-4bit
+            template_source: tokenizer_config.json
+            cache_slug: mlx-community--GLM-4-9B-0414-4bit
+            prompt: Reply with exactly: blue
+            expect_contains: blue
+            forbid_contains: "{"
+            thinking_mode: ""
           - name: gemma-4-e4b
             repo: unsloth/gemma-4-E4B-it-UD-MLX-4bit
             template_source: chat_template.jinja

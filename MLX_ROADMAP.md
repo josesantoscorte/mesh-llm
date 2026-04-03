@@ -36,6 +36,7 @@ What the existing `mesh-llm` product surface does not currently expose as a firs
 
 These families are now in the supported native MLX runtime set:
 - Llama
+- GLM 4 dense
 - Qwen2
 - Qwen3
 - Gemma 2 text
@@ -50,7 +51,6 @@ Notes:
 ## Families Still Missing Runtime Support
 
 These families have template-level support or partial investigation, but not full runtime support yet:
-- GLM
 - Kimi
 - gpt-oss
 - LFM2
@@ -69,7 +69,7 @@ Remaining work:
 - harden around layer-type-specific attention behavior if new repos expose gaps
 - add more Gemma 4 catalog coverage once confidence is higher
 
-### GLM / Kimi / gpt-oss / LFM2
+### Kimi / gpt-oss / LFM2
 
 Remaining work for each family:
 - real loader/config support
@@ -169,7 +169,6 @@ Remaining work:
 ## MLX Runtime Engineering Tasks
 
 These are the main technical tasks still on the table:
-- family-specific loader/runtime support for GLM
 - family-specific loader/runtime support for Kimi
 - family-specific loader/runtime support for gpt-oss
 - family-specific loader/runtime support for LFM2
@@ -213,7 +212,6 @@ Recommended order:
    - distributed MLX serving from `#146`
 
 If family coverage is the priority after Gemma 2, the next order should be:
-- GLM
 - Kimi
 - gpt-oss
 - LFM2

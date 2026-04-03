@@ -590,6 +590,17 @@
     "mmproj": null
   },
   {
+    "name": "GLM-4-9B-0414-MLX",
+    "file": "model.safetensors.index.json",
+    "url": "https://huggingface.co/mlx-community/GLM-4-9B-0414-4bit/resolve/main/model.safetensors.index.json",
+    "size": "5.3GB",
+    "description": "GLM 4 9B dense instruct in native MLX format",
+    "draft": null,
+    "moe": null,
+    "extra_files": [],
+    "mmproj": null
+  },
+  {
     "name": "Gemma-4-E4B-it-MLX",
     "file": "model.safetensors.index.json",
     "url": "https://huggingface.co/unsloth/gemma-4-E4B-it-UD-MLX-4bit/resolve/main/model.safetensors.index.json",
