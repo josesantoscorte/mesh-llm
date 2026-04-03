@@ -1,21 +1,23 @@
 #!/usr/bin/env bash
 # ci-mlx-smoke-test.sh — start mesh-llm with a tiny MLX model on macOS,
-# run one inference request, then shut down.
+# run one inference request, verify template selection, then shut down.
 #
-# Usage: scripts/ci-mlx-smoke-test.sh <mesh-llm-binary> <mlx-model-dir>
+# Usage:
+#   scripts/ci-mlx-smoke-test.sh <mesh-llm-binary> <mlx-model-dir-or-repo> [expected-template-source]
 
 set -euo pipefail
 
 MESH_LLM="$1"
-MODEL_DIR="$2"
+MODEL_SPEC="$2"
+EXPECTED_TEMPLATE_SOURCE="${3:-}"
 API_PORT=9337
 CONSOLE_PORT=3131
-MAX_WAIT=180
+MAX_WAIT=300
 LOG=/tmp/mesh-llm-ci-mlx.log
 
 echo "=== CI MLX Smoke Test ==="
 echo "  mesh-llm:  $MESH_LLM"
-echo "  model dir: $MODEL_DIR"
+echo "  model:     $MODEL_SPEC"
 echo "  api port:  $API_PORT"
 echo "  os:        $(uname -s)"
 
@@ -29,18 +31,23 @@ if [ ! -f "$MESH_LLM" ]; then
     exit 1
 fi
 
-if [ ! -d "$MODEL_DIR" ]; then
-    echo "❌ Missing MLX model dir: $MODEL_DIR"
-    exit 1
-fi
-
 echo "Starting mesh-llm..."
-"$MESH_LLM" \
-    --mlx-file "$MODEL_DIR" \
-    --no-draft \
-    --port "$API_PORT" \
-    --console "$CONSOLE_PORT" \
-    > "$LOG" 2>&1 &
+if [ -d "$MODEL_SPEC" ]; then
+    RUST_LOG=info "$MESH_LLM" \
+        --mlx-file "$MODEL_SPEC" \
+        --no-draft \
+        --port "$API_PORT" \
+        --console "$CONSOLE_PORT" \
+        > "$LOG" 2>&1 &
+else
+    RUST_LOG=info "$MESH_LLM" \
+        --model "$MODEL_SPEC" \
+        --mlx \
+        --no-draft \
+        --port "$API_PORT" \
+        --console "$CONSOLE_PORT" \
+        > "$LOG" 2>&1 &
+fi
 MESH_PID=$!
 echo "  PID: $MESH_PID"
 
@@ -83,14 +90,25 @@ for i in $(seq 1 "$MAX_WAIT"); do
     sleep 1
 done
 
+if [ -n "$EXPECTED_TEMPLATE_SOURCE" ]; then
+    if ! grep -F "MLX prompt template: loaded HF template from $EXPECTED_TEMPLATE_SOURCE" "$LOG" >/dev/null 2>&1; then
+        echo "❌ Expected template source not found in log: $EXPECTED_TEMPLATE_SOURCE"
+        echo "--- Log tail ---"
+        tail -120 "$LOG" || true
+        exit 1
+    fi
+    echo "✅ Template source matched: $EXPECTED_TEMPLATE_SOURCE"
+fi
+
 echo "Testing /v1/chat/completions..."
 RESPONSE=$(curl -sf "http://localhost:${API_PORT}/v1/chat/completions" \
     -H "Content-Type: application/json" \
     -d '{
         "model": "any",
-        "messages": [{"role": "user", "content": "Say hello in exactly 3 words."}],
+        "messages": [{"role": "user", "content": "What is 2+2? Reply with one word only."}],
         "max_tokens": 32,
-        "temperature": 0
+        "temperature": 0,
+        "enable_thinking": false
     }' 2>&1)
 
 if [ $? -ne 0 ]; then
@@ -104,6 +122,13 @@ fi
 CONTENT=$(echo "$RESPONSE" | python3 -c "import sys,json; r=json.load(sys.stdin); print(r['choices'][0]['message']['content'])" 2>/dev/null || echo "")
 if [ -z "$CONTENT" ]; then
     echo "❌ Empty response from inference"
+    echo "Raw response: $RESPONSE"
+    exit 1
+fi
+
+FINISH_REASON=$(echo "$RESPONSE" | python3 -c "import sys,json; r=json.load(sys.stdin); print(r['choices'][0].get('finish_reason',''))" 2>/dev/null || echo "")
+if [ -z "$FINISH_REASON" ]; then
+    echo "❌ Missing finish_reason in response"
     echo "Raw response: $RESPONSE"
     exit 1
 fi
