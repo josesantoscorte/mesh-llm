@@ -11,6 +11,7 @@ pub enum PromptTemplate {
         special_tokens: SpecialTokens,
         source_file: String,
         behavior: crate::models::ModelPromptBehavior,
+        default_enable_thinking: Option<bool>,
         fallback: Box<PromptTemplate>,
     },
     ChatMl {
@@ -60,6 +61,7 @@ impl PromptTemplate {
                 special_tokens: read_special_tokens(dir),
                 source_file,
                 behavior,
+                default_enable_thinking: default_enable_thinking(config),
                 fallback: Box::new(fallback),
             };
         }
@@ -102,20 +104,23 @@ impl PromptTemplate {
             PromptTemplate::HuggingFace {
                 template,
                 special_tokens,
+                default_enable_thinking,
                 source_file,
                 fallback,
                 ..
-            } => match render_hf_template(template, special_tokens, req) {
-                Ok(prompt) => Ok(prompt),
-                Err(err) => {
-                    tracing::warn!(
+            } => {
+                match render_hf_template(template, special_tokens, *default_enable_thinking, req) {
+                    Ok(prompt) => Ok(prompt),
+                    Err(err) => {
+                        tracing::warn!(
                         "MLX prompt template: failed to render HF template from {}: {err}; falling back to {:?}",
                         source_file,
                         fallback.behavior().prompt_template
                     );
-                    fallback.render_request(req)
+                        fallback.render_request(req)
+                    }
                 }
-            },
+            }
             PromptTemplate::ChatMl {
                 default_system_prompt,
             } => {
@@ -178,6 +183,7 @@ fn heuristic_prompt_template(config: &Value) -> PromptTemplate {
 fn render_hf_template(
     template: &str,
     special_tokens: &SpecialTokens,
+    default_enable_thinking: Option<bool>,
     req: &Value,
 ) -> Result<String> {
     let mut env = build_hf_environment();
@@ -228,10 +234,22 @@ fn render_hf_template(
         ("keep_past_thinking", req.get("keep_past_thinking").cloned()),
         ("date_string", req.get("date_string").cloned()),
         ("reasoning_effort", req.get("reasoning_effort").cloned()),
-        ("enable_thinking", req.get("enable_thinking").cloned()),
     ] {
         if let Some(value) = value {
             ctx.insert(key.to_string(), value);
+        }
+    }
+    match req.get("enable_thinking").cloned() {
+        Some(value) => {
+            ctx.insert("enable_thinking".to_string(), value);
+        }
+        None => {
+            if let Some(default_enable_thinking) = default_enable_thinking {
+                ctx.insert(
+                    "enable_thinking".to_string(),
+                    Value::Bool(default_enable_thinking),
+                );
+            }
         }
     }
     if let Some(token) = &special_tokens.bos_token {
@@ -250,6 +268,28 @@ fn render_hf_template(
     let rendered = tmpl.render(Value::Object(ctx))?;
 
     Ok(rendered)
+}
+
+fn default_enable_thinking(config: &Value) -> Option<bool> {
+    let model_type = config
+        .get("model_type")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let architectures = config
+        .get("architectures")
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str())
+        .map(|value| value.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+
+    if model_type == "qwen3" || architectures.iter().any(|value| value.contains("qwen3")) {
+        return Some(false);
+    }
+
+    None
 }
 
 fn build_hf_environment<'a>() -> Environment<'a> {

@@ -276,16 +276,82 @@ fn detects_chatml_from_tokenizer_config() {
 
     let template = PromptTemplate::detect(&root, &serde_json::json!({"model_type":"qwen2"}));
     match template {
-        PromptTemplate::HuggingFace { fallback, .. } => {
+        PromptTemplate::HuggingFace {
+            fallback,
+            default_enable_thinking,
+            ..
+        } => {
             assert_eq!(
                 *fallback,
                 PromptTemplate::ChatMl {
                     default_system_prompt: Some("You are a helpful assistant.".to_string())
                 }
             );
+            assert_eq!(default_enable_thinking, None);
         }
         other => panic!("expected huggingface template, got {other:?}"),
     }
+}
+
+#[test]
+fn qwen3_templates_default_enable_thinking_to_false() {
+    let root = std::env::temp_dir().join(format!(
+        "mesh-llm-template-qwen3-thinking-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("tokenizer_config.json"),
+        serde_json::json!({
+            "chat_template": "{%- if add_generation_prompt %}{{- '<|im_start|>assistant\\n' }}{%- if enable_thinking is defined and enable_thinking is false %}{{- '<think>\\n\\n</think>\\n\\n' }}{%- endif %}{%- endif %}"
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let template = PromptTemplate::detect(
+        &root,
+        &serde_json::json!({"model_type":"qwen3","architectures":["Qwen3ForCausalLM"]}),
+    );
+    let prompt = template
+        .render_request(&json!({
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+
+    assert_eq!(prompt, "<|im_start|>assistant\n<think>\n\n</think>\n\n");
+}
+
+#[test]
+fn qwen3_templates_honor_explicit_enable_thinking_true() {
+    let root = std::env::temp_dir().join(format!(
+        "mesh-llm-template-qwen3-thinking-true-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("tokenizer_config.json"),
+        serde_json::json!({
+            "chat_template": "{%- if add_generation_prompt %}{{- '<|im_start|>assistant\\n' }}{%- if enable_thinking is defined and enable_thinking is false %}{{- '<think>\\n\\n</think>\\n\\n' }}{%- endif %}{%- endif %}"
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let template = PromptTemplate::detect(
+        &root,
+        &serde_json::json!({"model_type":"qwen3","architectures":["Qwen3ForCausalLM"]}),
+    );
+    let prompt = template
+        .render_request(&json!({
+            "messages": [{"role": "user", "content": "hello"}],
+            "enable_thinking": true
+        }))
+        .unwrap();
+
+    assert_eq!(prompt, "<|im_start|>assistant\n");
 }
 
 #[test]
@@ -498,7 +564,7 @@ fn real_hf_template_corpus_behaves_as_expected() {
         if fixture.expect_hf_render {
             validate_hf_template(&normalized)
                 .unwrap_or_else(|err| panic!("{} should compile: {err}", fixture.repo));
-            let prompt = render_hf_template(&normalized, &special_tokens, &req)
+            let prompt = render_hf_template(&normalized, &special_tokens, None, &req)
                 .unwrap_or_else(|err| panic!("{} should render via HF path: {err}", fixture.repo));
             assert!(
                 !prompt.trim().is_empty(),
@@ -507,7 +573,7 @@ fn real_hf_template_corpus_behaves_as_expected() {
             );
         } else {
             if validate_hf_template(&normalized).is_ok() {
-                render_hf_template(&normalized, &special_tokens, &req)
+                render_hf_template(&normalized, &special_tokens, None, &req)
                     .expect_err("fixture should still require fallback");
             }
 
