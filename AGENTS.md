@@ -151,6 +151,19 @@ Do not leave Rust compiler warnings behind in code you touched.
 - Fix or remove unused code, dead code, and other warnings introduced or surfaced by your change before committing.
 - Do not silence warnings with `#[allow(...)]` unless there is a clear reason and the developer has asked for that tradeoff.
 
+## Pull Requests
+
+Pull request titles and descriptions should be user-focused by default.
+
+- Title PRs around the user-visible change or capability, not the implementation detail.
+- Start the description with what the user can now do, see, or understand after the change.
+- Keep architectural refactors, internal state reshaping, and code-organization notes out of the opening summary unless they directly change user behavior.
+- If there are important architectural changes, add a separate `## Architecture` section.
+- If there are protocol or compatibility implications, add a separate `## Protocol` section that clearly calls out compatibility, migration, or breaking-change impact.
+- If the PR changes CLI behavior or touches user-facing CLI flows, include example commands and representative output in the PR description.
+- If the PR changes the UI, include at least one screenshot in the PR description.
+- Validation and screenshots should stay separate from the user-facing summary.
+
 ### Deploy to Remote
 
 ```bash
