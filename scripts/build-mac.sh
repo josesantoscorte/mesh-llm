@@ -45,8 +45,8 @@ configure_compiler_cache() {
 
 clone_or_update_llama() {
     if [[ ! -d "$LLAMA_DIR" ]]; then
-        echo "Cloning michaelneale/llama.cpp (rebase-upstream-master branch)..."
-        git clone -b rebase-upstream-master https://github.com/michaelneale/llama.cpp.git "$LLAMA_DIR"
+        echo "Cloning ndizazzo/llama.cpp (rebase-upstream-master branch)..."
+        git clone -b rebase-upstream-master https://github.com/ndizazzo/llama.cpp.git "$LLAMA_DIR"
         return
     fi
 

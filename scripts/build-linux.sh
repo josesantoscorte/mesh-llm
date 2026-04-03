@@ -237,9 +237,9 @@ case "$BACKEND" in
 esac
 
 if [[ ! -d "$LLAMA_DIR" ]]; then
-    echo "Cloning michaelneale/llama.cpp (rebase-upstream-master)..."
+    echo "Cloning ndizazzo/llama.cpp (rebase-upstream-master)..."
     git clone -b rebase-upstream-master \
-        https://github.com/michaelneale/llama.cpp.git "$LLAMA_DIR"
+        https://github.com/ndizazzo/llama.cpp.git "$LLAMA_DIR"
 else
     cd "$LLAMA_DIR"
     CURRENT_BRANCH=$(git branch --show-current)

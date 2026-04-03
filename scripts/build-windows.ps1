@@ -591,8 +591,8 @@ switch ($backendName) {
 
 Invoke-InRepo {
     if (-not (Test-Path $llamaDir)) {
-        Write-Host "Cloning michaelneale/llama.cpp (rebase-upstream-master branch)..."
-        Invoke-NativeCommand "git" @("clone", "-b", "rebase-upstream-master", "https://github.com/michaelneale/llama.cpp.git", $llamaDir)
+        Write-Host "Cloning ndizazzo/llama.cpp (rebase-upstream-master branch)..."
+        Invoke-NativeCommand "git" @("clone", "-b", "rebase-upstream-master", "https://github.com/ndizazzo/llama.cpp.git", $llamaDir)
     } else {
         Push-Location $llamaDir
         try {
