@@ -285,7 +285,7 @@ jobs:
             thinking_mode: ""
             expect_exact: blue
             prompt_suite_json: >-
-              [{"label":"alt-color","prompt":"Reply with exactly: green","expect_exact":"green"}]
+              [{"label":"alt-color","prompt":"Reply with exactly: green","expect_exact":"green"},{"label":"alt-red","prompt":"Reply with exactly: red","expect_exact":"red"}]
           - name: qwen3-0.6b
             repo: mlx-community/Qwen3-0.6B-4bit
             template_source: tokenizer_config.json
@@ -318,7 +318,7 @@ jobs:
             thinking_mode: ""
             expect_exact: ""
             prompt_suite_json: >-
-              [{"label":"exact-color","prompt":"Reply with exactly: blue","expect_contains":"blue","forbid_contains":"{"}]
+              [{"label":"exact-blue","prompt":"Reply with exactly: blue","expect_contains":"blue","forbid_contains":"{"},{"label":"exact-green","prompt":"Reply with exactly: green","expect_contains":"green","forbid_contains":"{"}]
           - name: gemma-3-1b
             repo: mlx-community/gemma-3-1b-it-qat-4bit
             template_source: ""
@@ -329,7 +329,7 @@ jobs:
             thinking_mode: ""
             expect_exact: blue
             prompt_suite_json: >-
-              [{"label":"alt-color","prompt":"Reply with exactly: green","expect_exact":"green"}]
+              [{"label":"alt-color","prompt":"Reply with exactly: green","expect_exact":"green"},{"label":"alt-red","prompt":"Reply with exactly: red","expect_exact":"red"}]
           - name: gemma-2-2b
             repo: mlx-community/gemma-2-2b-it-4bit
             template_source: tokenizer_config.json
@@ -340,7 +340,7 @@ jobs:
             thinking_mode: ""
             expect_exact: blue
             prompt_suite_json: >-
-              [{"label":"alt-color","prompt":"Reply with exactly: green","expect_exact":"green"}]
+              [{"label":"alt-color","prompt":"Reply with exactly: green","expect_exact":"green"},{"label":"alt-red","prompt":"Reply with exactly: red","expect_exact":"red"}]
           - name: glm-4-9b
             repo: mlx-community/GLM-4-9B-0414-4bit
             template_source: tokenizer_config.json
@@ -351,7 +351,7 @@ jobs:
             thinking_mode: ""
             expect_exact: blue
             prompt_suite_json: >-
-              [{"label":"alt-color","prompt":"Reply with exactly: green","expect_exact":"green"}]
+              [{"label":"alt-color","prompt":"Reply with exactly: green","expect_exact":"green"},{"label":"alt-red","prompt":"Reply with exactly: red","expect_exact":"red"}]
           - name: gemma-4-e4b
             repo: unsloth/gemma-4-E4B-it-UD-MLX-4bit
             template_source: chat_template.jinja
@@ -373,7 +373,7 @@ jobs:
             thinking_mode: ""
             expect_exact: blue
             prompt_suite_json: >-
-              [{"label":"alt-color","prompt":"Reply with exactly: green","expect_exact":"green"}]
+              [{"label":"alt-color","prompt":"Reply with exactly: green","expect_exact":"green"},{"label":"alt-red","prompt":"Reply with exactly: red","expect_exact":"red"}]
     steps:
       - uses: actions/checkout@v5
 
