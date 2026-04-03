@@ -279,7 +279,7 @@ jobs:
             repo: mlx-community/Qwen2.5-0.5B-Instruct-4bit
             template_source: tokenizer_config.json
             cache_slug: mlx-community--Qwen2.5-0.5B-Instruct-4bit
-            prompt: Reply with exactly: blue
+            prompt: "Reply with exactly: blue"
             expect_contains: blue
             forbid_contains: ""
             thinking_mode: ""
@@ -287,7 +287,7 @@ jobs:
             repo: mlx-community/Qwen3-0.6B-4bit
             template_source: tokenizer_config.json
             cache_slug: mlx-community--Qwen3-0.6B-4bit
-            prompt: Reply with exactly: blue
+            prompt: "Reply with exactly: blue"
             expect_contains: blue
             forbid_contains: ""
             thinking_mode: tagged
@@ -295,7 +295,7 @@ jobs:
             repo: mlx-community/JOSIE-IT1-Qwen3-0.6B-4bit
             template_source: chat_template.jinja
             cache_slug: mlx-community--JOSIE-IT1-Qwen3-0.6B-4bit
-            prompt: What is 2+2? Reply with one word only.
+            prompt: "What is 2+2? Reply with one word only."
             expect_contains: "4"
             forbid_contains: ""
             thinking_mode: multiline
@@ -303,7 +303,7 @@ jobs:
             repo: mlx-community/Llama-3.2-1B-Instruct-4bit
             template_source: tokenizer_config.json
             cache_slug: mlx-community--Llama-3.2-1B-Instruct-4bit
-            prompt: Say hi.
+            prompt: "Say hi."
             expect_contains: ""
             forbid_contains: ""
             thinking_mode: ""
@@ -311,7 +311,7 @@ jobs:
             repo: mlx-community/gemma-3-1b-it-qat-4bit
             template_source: ""
             cache_slug: mlx-community--gemma-3-1b-it-qat-4bit
-            prompt: Reply with exactly: blue
+            prompt: "Reply with exactly: blue"
             expect_contains: blue
             forbid_contains: ""
             thinking_mode: ""
@@ -319,7 +319,7 @@ jobs:
             repo: mlx-community/gemma-2-2b-it-4bit
             template_source: tokenizer_config.json
             cache_slug: mlx-community--gemma-2-2b-it-4bit
-            prompt: Reply with exactly: blue
+            prompt: "Reply with exactly: blue"
             expect_contains: blue
             forbid_contains: "{"
             thinking_mode: ""
@@ -327,7 +327,7 @@ jobs:
             repo: mlx-community/GLM-4-9B-0414-4bit
             template_source: tokenizer_config.json
             cache_slug: mlx-community--GLM-4-9B-0414-4bit
-            prompt: Reply with exactly: blue
+            prompt: "Reply with exactly: blue"
             expect_contains: blue
             forbid_contains: "{"
             thinking_mode: ""
@@ -335,7 +335,7 @@ jobs:
             repo: unsloth/gemma-4-E4B-it-UD-MLX-4bit
             template_source: chat_template.jinja
             cache_slug: unsloth--gemma-4-E4B-it-UD-MLX-4bit
-            prompt: Say the word blue.
+            prompt: "Say the word blue."
             expect_contains: Blue
             forbid_contains: "{"
             thinking_mode: ""
@@ -369,6 +369,125 @@ jobs:
             "${{ matrix.expect_contains }}" \
             "${{ matrix.forbid_contains }}" \
             "${{ matrix.thinking_mode }}"
+
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats || true
+
+  macos_gguf:
+    needs: changes
+    if: ${{ github.event_name == 'workflow_dispatch' || needs.changes.outputs.rust == 'true' }}
+    name: macOS GGUF (${{ matrix.name }})
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: qwen2.5-0.5b
+            url: https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf
+            file: qwen2.5-0.5b-instruct-q4_k_m.gguf
+            prompt: "Reply with exactly: blue"
+            expect_contains: blue
+            forbid_contains: ""
+          - name: qwen3-0.6b
+            url: https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf
+            file: Qwen3-0.6B-Q8_0.gguf
+            prompt: "Reply with exactly: blue"
+            expect_contains: blue
+            forbid_contains: ""
+          - name: qwen3-josie-0.6b
+            url: https://huggingface.co/mradermacher/JOSIE-IT1-Qwen3-0.6B-GGUF/resolve/main/JOSIE-IT1-Qwen3-0.6B.Q4_K_M.gguf
+            file: JOSIE-IT1-Qwen3-0.6B.Q4_K_M.gguf
+            prompt: "What is 2+2? Reply with one word only."
+            expect_contains: "4"
+            forbid_contains: ""
+          - name: llama-3.2-1b
+            url: https://huggingface.co/llmware/llama-3.2-1b-gguf/resolve/main/Llama-3.2-1B-Instruct-Q4_K_M.gguf
+            file: Llama-3.2-1B-Instruct-Q4_K_M.gguf
+            prompt: "Say hi."
+            expect_contains: ""
+            forbid_contains: ""
+          - name: gemma-3-1b
+            url: https://huggingface.co/ggml-org/gemma-3-1b-it-GGUF/resolve/main/gemma-3-1b-it-Q4_K_M.gguf
+            file: gemma-3-1b-it-Q4_K_M.gguf
+            prompt: "Reply with exactly: blue"
+            expect_contains: blue
+            forbid_contains: ""
+          - name: gemma-2-2b
+            url: https://huggingface.co/bartowski/gemma-2-2b-it-GGUF/resolve/main/gemma-2-2b-it-Q4_K_M.gguf
+            file: gemma-2-2b-it-Q4_K_M.gguf
+            prompt: "Reply with exactly: blue"
+            expect_contains: blue
+            forbid_contains: "{"
+          - name: glm-4-9b
+            url: https://huggingface.co/lmstudio-community/GLM-4-9B-0414-GGUF/resolve/main/GLM-4-9B-0414-Q4_K_M.gguf
+            file: GLM-4-9B-0414-Q4_K_M.gguf
+            prompt: "Reply with exactly: blue"
+            expect_contains: blue
+            forbid_contains: "{"
+          - name: gemma-4-e4b
+            url: https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q4_K_M.gguf
+            file: gemma-4-E4B-it-Q4_K_M.gguf
+            prompt: "Say the word blue."
+            expect_contains: Blue
+            forbid_contains: "{"
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: mozilla-actions/sccache-action@v0.0.9
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: mesh-llm
+
+      - name: Build mesh-llm
+        run: cargo build --release -p mesh-llm --bin mesh-llm
+
+      - name: Clone llama.cpp fork
+        run: git clone -b rebase-upstream-master --depth 1 https://github.com/michaelneale/llama.cpp.git llama.cpp
+
+      - name: Build llama.cpp (CPU + RPC)
+        run: |
+          CACHE_FLAGS=()
+          if command -v sccache >/dev/null 2>&1; then
+            CACHE_FLAGS+=(
+              -DCMAKE_C_COMPILER_LAUNCHER=sccache
+              -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+            )
+          fi
+          cmake -B llama.cpp/build -S llama.cpp \
+            -DGGML_METAL=OFF \
+            -DGGML_RPC=ON \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DLLAMA_OPENSSL=OFF \
+            "${CACHE_FLAGS[@]}"
+          cmake --build llama.cpp/build --config Release -j$(sysctl -n hw.ncpu) --target rpc-server llama-server
+
+      - name: Cache GGUF model
+        id: cache-gguf-model
+        uses: actions/cache@v5
+        with:
+          path: ~/.models/${{ matrix.file }}
+          key: gguf-model-${{ matrix.name }}
+
+      - name: Download GGUF model
+        if: steps.cache-gguf-model.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/.models
+          curl -fSL "${{ matrix.url }}" -o ~/.models/${{ matrix.file }}
+          ls -lh ~/.models/${{ matrix.file }}
+
+      - name: GGUF smoke test (real inference)
+        run: |
+          scripts/ci-gguf-smoke-test.sh \
+            target/release/mesh-llm \
+            llama.cpp/build/bin \
+            ~/.models/${{ matrix.file }} \
+            "${{ matrix.prompt }}" \
+            "${{ matrix.expect_contains }}" \
+            "${{ matrix.forbid_contains }}"
 
       - name: Show sccache stats
         if: always()
