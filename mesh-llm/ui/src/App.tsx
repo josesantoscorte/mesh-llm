@@ -383,14 +383,20 @@ function topologyNodeRole(node: Pick<TopologyNode, "client" | "host" | "serving"
   return "Idle";
 }
 
-function nodeRoleTone(role: string): 'good' | 'info' | 'neutral' {
-  if (role === 'Host') return 'good';
-  if (role === 'Worker' || role === 'Client') return 'info';
-  return 'neutral';
+function nodeRoleTone(role: string): "good" | "info" | "neutral" {
+  if (role === "Host") return "good";
+  if (role === "Worker" || role === "Client") return "info";
+  return "neutral";
 }
 
 function uniqueModels(...groups: Array<string[] | undefined>): string[] {
-  return [...new Set(groups.flatMap((group) => group ?? []).filter((model) => !!model && model !== '(idle)'))];
+  return [
+    ...new Set(
+      groups
+        .flatMap((group) => group ?? [])
+        .filter((model) => !!model && model !== "(idle)"),
+    ),
+  ];
 }
 
 function formatGpuMemory(bytes?: number | null) {
@@ -4055,16 +4061,7 @@ function TopologyFlowNode({ data }: NodeProps<TopologyFlowDiagramNode>) {
                 : isIntel
                   ? "#0071C5"
                   : undefined;
-            const model = gpu.name
-              .replace(/^NVIDIA GeForce\s+/i, "")
-              .replace(/^NVIDIA Quadro\s+/i, "")
-              .replace(/^NVIDIA\s+/i, "")
-              .replace(/^AMD Radeon\s+/i, "")
-              .replace(/^AMD\s+/i, "")
-              .replace(/^Intel Arc\s+/i, "")
-              .replace(/^Intel\s+/i, "")
-              .replace(/^Apple\s+/i, "")
-              .trim();
+            const model = trimGpuVendor(gpu.name);
             const vramGb = gpu.vram_bytes / (1024 * 1024 * 1024);
             const GpuIcon = data.info.isSoc ? Cpu : Gpu;
             return (
@@ -5156,7 +5153,7 @@ function NodeSidebar({
                           {modelExists ? (
                             <button
                               type="button"
-                              className="truncate text-left text-sm font-medium underline-offset-4 hover:text-foreground hover:underline"
+                              className="truncate rounded-sm text-left text-sm font-medium underline-offset-4 hover:text-foreground hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
                               onClick={() => onOpenModel(row.name)}
                               title={row.name}
                             >
