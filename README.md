@@ -20,6 +20,12 @@ If you want it to run as a per-user background service, see [Background service]
 
 The installer currently targets macOS and Linux release bundles. Windows is supported through source builds and published `.zip` release assets instead.
 
+Update an installed bundle with:
+
+```bash
+mesh-llm update
+```
+
 For non-interactive installs, set the flavor explicitly:
 
 ```bash
@@ -181,8 +187,10 @@ The two platforms handle launch args differently:
 `service.env` is optional and shared by both platforms. Use plain `KEY=value` lines, for example:
 
 ```text
-MESH_LLM_NO_SELF_UPDATE=1
+RUST_LOG=mesh_inference=debug
 ```
+
+If you want a service invocation to update itself before running, add `--auto-update` to the service args.
 
 If you edit the Linux unit manually, reload and restart it:
 
