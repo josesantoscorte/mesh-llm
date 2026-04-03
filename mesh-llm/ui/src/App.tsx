@@ -3058,6 +3058,10 @@ function DashboardPage({
   );
   const [isMeshOverviewFullscreen, setIsMeshOverviewFullscreen] = useState(false);
   const [selectedCatalogModel, setSelectedCatalogModel] = useState<MeshModel | null>(null);
+  const topologyDiagramNodes = useMemo(
+    () => topologyNodes.filter((node) => !node.client),
+    [topologyNodes],
+  );
   const filteredModels = useMemo(() => {
     const models = meshModels;
     return [...models]
@@ -3228,7 +3232,7 @@ function DashboardPage({
           />
           <StatCard
             title="Nodes"
-            value={`${topologyNodes.length}`}
+            value={`${topologyDiagramNodes.length}`}
             icon={<Network className="h-4 w-4" />}
             tooltip="Total nodes currently visible in topology."
           />
@@ -3266,7 +3270,7 @@ function DashboardPage({
               ) : (
                 <MeshTopologyDiagram
                   status={status}
-                  nodes={topologyNodes}
+                  nodes={topologyDiagramNodes}
                   selectedModel={selectedModel}
                   themeMode={themeMode}
                   fullscreen={false}
@@ -3451,7 +3455,7 @@ function DashboardPage({
                   <CardContent className="flex min-h-0 flex-1 p-0">
                     <MeshTopologyDiagram
                       status={status}
-                      nodes={topologyNodes}
+                      nodes={topologyDiagramNodes}
                       selectedModel={selectedModel}
                       themeMode={themeMode}
                       fullscreen
@@ -3806,8 +3810,11 @@ function MeshTopologyDiagram({
   heightClass?: string;
   containerStyle?: CSSProperties;
 }) {
-  if (!status || !nodes.length) {
+  if (!status) {
     return <EmptyPanel text="No topology data yet." />;
+  }
+  if (!nodes.length) {
+    return <EmptyPanel text="No host or worker nodes visible yet." />;
   }
 
   return (
@@ -3851,31 +3858,9 @@ function MeshTopologyFlow({
       !n.client && !!n.serving && (!focusModel || n.serving === focusModel),
   );
   const servingIds = new Set(serving.map((n) => n.id));
-  const clients = others.filter((n) => n.client);
   const workers = others.filter((n) => !n.client && !servingIds.has(n.id));
 
-  const total = nodes.length;
-  const nodeRadius =
-    total >= 500
-      ? 3.6
-      : total >= 280
-        ? 4.8
-        : total >= 160
-          ? 6.2
-          : total >= 90
-            ? 7.4
-            : total >= 50
-              ? 8.8
-              : 10.4;
-  const positioned = layoutTopologyNodes(
-    center,
-    serving,
-    workers,
-    clients,
-    nodeRadius,
-  );
-  const clientEdgeStride =
-    total > 320 ? 6 : total > 220 ? 4 : total > 120 ? 2 : 1;
+  const positioned = layoutTopologyNodes(center, serving, workers);
   const meshVramGb = nodes
     .filter((n) => !n.client)
     .reduce((sum, n) => sum + Math.max(0, n.vram), 0);
@@ -4042,18 +4027,13 @@ function MeshTopologyFlow({
   ]);
 
   const flowEdges = useMemo<Edge[]>(() => {
-    const outer = positioned.filter((p) => p.id !== center.id);
-    return outer
-      .filter(
-        (p, idx) => !(p.bucket === "client" && idx % clientEdgeStride !== 0),
-      )
+    return positioned
+      .filter((p) => p.id !== center.id)
       .map((p) => {
         const stroke =
           p.bucket === "serving"
             ? "rgba(34,197,94,0.35)"
-            : p.bucket === "worker"
-              ? "rgba(56,189,248,0.3)"
-              : "rgba(148,163,184,0.22)";
+            : "rgba(56,189,248,0.3)";
         return {
           id: `edge-${center.id}-${p.id}`,
           source: center.id,
@@ -4063,12 +4043,12 @@ function MeshTopologyFlow({
           animated: false,
           style: {
             stroke,
-            strokeWidth: p.bucket === "client" ? 1.8 : 2.4,
-            strokeDasharray: p.bucket === "client" ? "2 8" : "2 6",
+            strokeWidth: 2.4,
+            strokeDasharray: "2 6",
           },
         };
       });
-  }, [positioned, center.id, clientEdgeStride]);
+  }, [positioned, center.id]);
 
   return (
     <div
@@ -4125,146 +4105,109 @@ function MeshTopologyFlow({
   );
 }
 
+type TopologyRow = {
+  nodes: TopologyNode[];
+  bucket: PositionedTopologyNode["bucket"];
+};
+
 function layoutTopologyNodes(
   center: TopologyNode,
   serving: TopologyNode[],
   workers: TopologyNode[],
-  clients: TopologyNode[],
-  nodeRadius: number,
 ): PositionedTopologyNode[] {
+  const chunkRows = (
+    rowNodes: TopologyNode[],
+    bucket: TopologyRow["bucket"],
+    maxPerRow: number,
+  ): TopologyRow[] => {
+    if (!rowNodes.length) return [];
+    const rowCount = Math.ceil(rowNodes.length / maxPerRow);
+    const baseRowSize = Math.floor(rowNodes.length / rowCount);
+    const remainder = rowNodes.length % rowCount;
+    const rows: TopologyRow[] = [];
+    let offset = 0;
+    for (let i = 0; i < rowCount; i += 1) {
+      const rowSize = baseRowSize + (i < remainder ? 1 : 0);
+      rows.push({
+        nodes: rowNodes.slice(offset, offset + rowSize),
+        bucket,
+      });
+      offset += rowSize;
+    }
+    return rows;
+  };
+
   const placeRow = (
-    row: TopologyNode[],
-    bucket: PositionedTopologyNode["bucket"],
+    row: TopologyRow,
     y: number,
     horizontalSpacing: number,
     positioned: PositionedTopologyNode[],
   ) => {
-    const startX = -((row.length - 1) * horizontalSpacing) / 2;
-    row.forEach((node, index) => {
+    const startX = -((row.nodes.length - 1) * horizontalSpacing) / 2;
+    row.nodes.forEach((node, index) => {
       positioned.push({
         ...node,
-        bucket,
+        bucket: row.bucket,
         x: startX + index * horizontalSpacing,
         y,
       });
     });
   };
 
-  const all: Array<PositionedTopologyNode> = [
-    ...serving.map((n) => ({ ...n, bucket: "serving" as const, x: 0, y: 0 })),
-    ...workers.map((n) => ({ ...n, bucket: "worker" as const, x: 0, y: 0 })),
-    ...clients.map((n) => ({ ...n, bucket: "client" as const, x: 0, y: 0 })),
-  ];
-
   const positioned: PositionedTopologyNode[] = [
     { ...center, x: 0, y: 0, bucket: "center" },
   ];
-  const peerCount = all.length;
+  const peerCount = serving.length + workers.length;
   if (peerCount === 0) return positioned;
 
-  if (peerCount <= 6) {
-    const horizontalSpacing = 270;
-    const bandOffset = 215;
-    const rowStep = 118;
-    const topRows: Array<{
-      nodes: TopologyNode[];
-      bucket: PositionedTopologyNode["bucket"];
-    }> = [];
-    const bottomRows: Array<{
-      nodes: TopologyNode[];
-      bucket: PositionedTopologyNode["bucket"];
-    }> = [];
+  const maxPerRow =
+    peerCount <= 4 ? 2 : peerCount <= 8 ? 3 : peerCount <= 14 ? 4 : 5;
+  const topRows = chunkRows(serving, "serving", maxPerRow);
+  const bottomRows = chunkRows(workers, "worker", maxPerRow);
 
-    if (serving.length) {
-      topRows.push({ nodes: serving, bucket: "serving" });
-    }
-
-    if (workers.length) {
-      if (serving.length === 0) {
-        topRows.push({ nodes: workers, bucket: "worker" });
-      } else {
-        bottomRows.push({ nodes: workers, bucket: "worker" });
-      }
-    }
-
-    if (clients.length) {
-      bottomRows.push({ nodes: clients, bucket: "client" });
-    }
-
-    topRows.forEach((row, index) => {
-      const distanceFromCenter =
-        bandOffset + (topRows.length - index - 1) * rowStep;
-      placeRow(
-        row.nodes,
-        row.bucket,
-        -distanceFromCenter,
-        horizontalSpacing,
-        positioned,
-      );
-    });
-
+  if (topRows.length === 0) {
+    const redistributedTop: TopologyRow[] = [];
+    const redistributedBottom: TopologyRow[] = [];
     bottomRows.forEach((row, index) => {
-      const distanceFromCenter = bandOffset + index * rowStep;
-      placeRow(
-        row.nodes,
-        row.bucket,
-        distanceFromCenter,
-        horizontalSpacing,
-        positioned,
-      );
+      (index % 2 === 0 ? redistributedTop : redistributedBottom).push(row);
     });
-
-    return positioned;
-  }
-
-  // Small meshes get a larger first ring so the graph uses the available canvas.
-  const baseRadius =
-    peerCount <= 3
-      ? 190
-      : peerCount <= 6
-        ? 220
-        : peerCount <= 10
-          ? 250
-          : Math.max(200, nodeRadius * 9 + 96);
-  const ringSpacing =
-    peerCount <= 10 ? 120 : Math.max(102, nodeRadius * 7 + 58);
-  const minArcLength = Math.max(110, nodeRadius * 7 + 54);
-
-  if (peerCount <= 10) {
-    for (let i = 0; i < peerCount; i += 1) {
-      const angle = -Math.PI / 2 + (2 * Math.PI * i) / peerCount;
-      const node = all[i];
-      positioned.push({
-        ...node,
-        x: Math.cos(angle) * baseRadius,
-        y: Math.sin(angle) * baseRadius,
-      });
+    topRows.push(...redistributedTop);
+    bottomRows.splice(0, bottomRows.length, ...redistributedBottom);
+  } else {
+    while (bottomRows.length > topRows.length + 1) {
+      const row = bottomRows.pop();
+      if (!row) break;
+      topRows.push(row);
     }
-    return positioned;
+    while (topRows.length > bottomRows.length + 1) {
+      const row = topRows.pop();
+      if (!row) break;
+      bottomRows.push(row);
+    }
   }
 
-  let offset = 0;
-  let ring = 0;
-  while (offset < peerCount) {
-    const radius = baseRadius + ring * ringSpacing;
-    const capacity = Math.max(
-      8,
-      Math.floor((2 * Math.PI * radius) / minArcLength),
+  const horizontalSpacing =
+    peerCount <= 3 ? 324 : peerCount <= 8 ? 292 : peerCount <= 14 ? 274 : 262;
+  const bandOffset = peerCount <= 3 ? 232 : 216;
+  const rowStep = 204;
+
+  topRows.forEach((row, index) => {
+    placeRow(
+      row,
+      -(bandOffset + index * rowStep),
+      horizontalSpacing,
+      positioned,
     );
-    const take = Math.min(capacity, peerCount - offset);
-    const phase = ring % 2 === 0 ? 0 : Math.PI / Math.max(6, take);
-    for (let i = 0; i < take; i += 1) {
-      const angle = -Math.PI / 2 + phase + (2 * Math.PI * i) / take;
-      const node = all[offset + i];
-      positioned.push({
-        ...node,
-        x: Math.cos(angle) * radius,
-        y: Math.sin(angle) * radius,
-      });
-    }
-    offset += take;
-    ring += 1;
-  }
+  });
+
+  bottomRows.forEach((row, index) => {
+    placeRow(
+      row,
+      bandOffset + index * rowStep,
+      horizontalSpacing,
+      positioned,
+    );
+  });
 
   return positioned;
 }
