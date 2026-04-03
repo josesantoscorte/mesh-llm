@@ -5003,7 +5003,7 @@ function NodeSidebar({
                             <button
                               type="button"
                               className="truncate text-left text-sm font-medium underline-offset-4 hover:text-foreground hover:underline"
-                              onClick={() => onOpenModel(row.name, node.id)}
+                              onClick={() => onOpenModel(row.name)}
                               title={row.name}
                             >
                               {shortName(modelDisplayName(meshModelByName[row.name]) || row.name)}
