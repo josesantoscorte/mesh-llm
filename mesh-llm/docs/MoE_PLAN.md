@@ -40,13 +40,60 @@ All core phases are complete and integrated into mesh-llm.
 - Qwen3-30B-A3B: local quality validation, 87/128 experts per node = excellent.
 - GLM-4.7-Flash-Q4_K_M: MoE auto-detected (64 experts, top-4), fits locally → solo mode, no split. If split, mesh-llm now prefers cached or freshly computed analysis over the sequential fallback.
 
+## Planned Next Step: Leader-Planned Auto MoE
+
+The next MoE iteration should remove user-facing split-planning knobs and make placement fully automatic.
+
+Planned behavior:
+
+- **Leader computes one plan per exact model identity.**
+  - participating nodes
+  - shard count
+  - ranking source
+  - overlap and redundancy
+  - whether a full-coverage fallback replica is feasible
+- **Followers advertise facts, not policies.**
+  - model identity present or not
+  - available VRAM / RAM
+  - health and stability
+  - bandwidth / RTT when available
+- **No mixed per-node MoE strategies.**
+  One deployment gets one plan. Nodes either participate in that plan or sit out.
+- **`auto` is the default runtime behavior.**
+  The system should pick solo, split, or split-with-redundancy based on current resources without requiring flags such as grouping or overlap mode.
+
+### Failure and Recovery Policy
+
+The deployment objective is to keep serving as much as possible while avoiding topology flapping.
+
+- **Fail down quickly when an active shard is unusable.**
+  A shard request failure is stronger evidence than a heartbeat miss and should trigger prompt reconfiguration across survivors.
+- **Do not blindly retry on another partial shard.**
+  Partial shards do not generally contain interchangeable expert sets.
+- **Retry directly only to full-coverage targets.**
+  If another node has the full expert set for the same exact model identity, it is a valid failover target.
+- **Recover up cautiously.**
+  When a lost node reappears, re-admit it to mesh membership first, then keep it out of active MoE placement until it has stayed healthy for a short stability window.
+- **Use extra capacity for resilience when available.**
+  If the cluster has spare memory, the leader may choose extra overlap, replicated hot experts, or a full-coverage fallback replica instead of maximizing packing efficiency.
+
+### Planned Result
+
+This should give mesh-llm the following MoE behavior:
+
+- `A + B -> A` quickly when `B` disappears
+- `A + B + C -> A + B` quickly when `C` disappears
+- stable serving on the reduced topology instead of waiting for manual restart
+- cautious expansion back to larger splits only after the recovered node proves healthy
+- optional direct failover to a full-coverage replica when one exists
+
 ## What's NOT Implemented
 
 ### No probe-based session placement (planned)
 The current design uses hash routing — sessions are assigned to nodes deterministically. The original plan proposed fan-out probes where each node scores "how well does my shard match this prompt" and the best node gets the session. This was unnecessary for the 2-node case with sufficient overlap (68%+) — both nodes produce equivalent quality. Probing becomes important with more nodes, less overlap, or sharper expert specialization. With scale testing on larger models coming soon, this is next on the list.
 
-### No lazy `moe-analyze` for unknown models
-Phase 4 in TODO. Unknown MoE models use the 50% shared core fallback with sequential expert IDs. Running `moe-analyze` automatically on first deploy (2-5 min of sample inference to compute proper rankings) is planned but not implemented. You can run it manually and the cached ranking will be picked up.
+### No leader-planned redundancy yet
+Current split planning is still more static than the intended design above. The leader does not yet compute an automatic redundancy plan from cluster resources, and the request path does not yet prefer a full-coverage fallback target when one exists.
 
 ### No scale testing on large models
 Phase 5 in TODO. Mixtral 8×22B (~80GB) and Qwen3-235B-A22B (~130GB) are the real targets where expert sharding provides value (models that don't fit on one machine). Not tested yet.

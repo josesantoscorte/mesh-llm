@@ -510,6 +510,10 @@ pub async fn route_to_target(
 ) -> bool {
     let mut tcp_stream = tcp_stream;
     tracing::info!("API proxy: routing to target {target:?}");
+    let moe_remote_id = match &target {
+        election::InferenceTarget::MoeRemote(host_id) => Some(*host_id),
+        _ => None,
+    };
     match target {
         election::InferenceTarget::Local(port) | election::InferenceTarget::MoeLocal(port) => {
             match TcpStream::connect(format!("127.0.0.1:{port}")).await {
@@ -546,6 +550,9 @@ pub async fn route_to_target(
                             "API proxy: failed to forward buffered request to host {}: {e}",
                             host_id.fmt_short()
                         );
+                        if let Some(moe_host_id) = moe_remote_id {
+                            node.handle_peer_death(moe_host_id).await;
+                        }
                         let _ = send_503(tcp_stream).await;
                         return false;
                     }
@@ -568,6 +575,9 @@ pub async fn route_to_target(
                         "API proxy: can't tunnel to host {}: {e}",
                         host_id.fmt_short()
                     );
+                    if let Some(moe_host_id) = moe_remote_id {
+                        node.handle_peer_death(moe_host_id).await;
+                    }
                     let _ = send_503(tcp_stream).await;
                     false
                 }

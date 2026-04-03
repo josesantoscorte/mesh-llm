@@ -510,6 +510,125 @@ fn import_remote_moe_rankings(descriptors: &[ServedModelDescriptor]) -> bool {
     imported
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HeartbeatFailurePolicy {
+    allow_recent_inbound_grace: bool,
+    failure_threshold: u32,
+}
+
+fn descriptors_share_exact_moe_identity(
+    local: &[ServedModelDescriptor],
+    remote: &[ServedModelDescriptor],
+) -> bool {
+    local.iter().any(|local_descriptor| {
+        local_descriptor
+            .topology
+            .as_ref()
+            .and_then(|topology| topology.moe.as_ref())
+            .is_some()
+            && remote.iter().any(|remote_descriptor| {
+                remote_descriptor
+                    .topology
+                    .as_ref()
+                    .and_then(|topology| topology.moe.as_ref())
+                    .is_some()
+                    && identities_match_exact(
+                        &local_descriptor.identity,
+                        &remote_descriptor.identity,
+                    )
+            })
+    })
+}
+
+fn heartbeat_failure_policy_for_peer(
+    local_descriptors: &[ServedModelDescriptor],
+    peer: &PeerInfo,
+) -> HeartbeatFailurePolicy {
+    if descriptors_share_exact_moe_identity(local_descriptors, &peer.served_model_descriptors) {
+        HeartbeatFailurePolicy {
+            allow_recent_inbound_grace: false,
+            failure_threshold: 1,
+        }
+    } else {
+        HeartbeatFailurePolicy {
+            allow_recent_inbound_grace: true,
+            failure_threshold: 2,
+        }
+    }
+}
+
+const MOE_RECOVERY_PROBATION_SECS: u64 = 30;
+
+fn moe_recovery_ready_at(
+    recovered_at: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> bool {
+    recovered_at
+        .map(|recovered_at| {
+            now.duration_since(recovered_at).as_secs() >= MOE_RECOVERY_PROBATION_SECS
+        })
+        .unwrap_or(true)
+}
+
+fn descriptors_share_exact_moe_identity_for_model(
+    local: &[ServedModelDescriptor],
+    remote: &[ServedModelDescriptor],
+    model_name: &str,
+) -> Option<bool> {
+    let local_moe: Vec<&ServedModelDescriptor> = local
+        .iter()
+        .filter(|descriptor| {
+            descriptor.identity.model_name == model_name
+                && descriptor
+                    .topology
+                    .as_ref()
+                    .and_then(|topology| topology.moe.as_ref())
+                    .is_some()
+        })
+        .collect();
+    let remote_moe: Vec<&ServedModelDescriptor> = remote
+        .iter()
+        .filter(|descriptor| {
+            descriptor.identity.model_name == model_name
+                && descriptor
+                    .topology
+                    .as_ref()
+                    .and_then(|topology| topology.moe.as_ref())
+                    .is_some()
+        })
+        .collect();
+    if local_moe.is_empty() || remote_moe.is_empty() {
+        return None;
+    }
+    Some(local_moe.iter().any(|local_descriptor| {
+        remote_moe.iter().any(|remote_descriptor| {
+            identities_match_exact(&local_descriptor.identity, &remote_descriptor.identity)
+        })
+    }))
+}
+
+pub(crate) fn peer_is_eligible_for_active_moe(
+    local_descriptors: &[ServedModelDescriptor],
+    peer: &PeerInfo,
+    model_name: &str,
+) -> bool {
+    if !peer.is_assigned_model(model_name) || matches!(peer.role, NodeRole::Client) {
+        return false;
+    }
+
+    let identity_matches = descriptors_share_exact_moe_identity_for_model(
+        local_descriptors,
+        &peer.served_model_descriptors,
+        model_name,
+    )
+    .unwrap_or(true);
+    if !identity_matches {
+        return false;
+    }
+
+    moe_recovery_ready_at(peer.moe_recovered_at, std::time::Instant::now())
+}
+
 fn parse_hf_ref_parts(input: &str) -> Option<(String, Option<String>, String)> {
     let parts: Vec<&str> = input.splitn(3, '/').collect();
     if parts.len() != 3 {
@@ -864,6 +983,9 @@ pub struct PeerInfo {
     /// Last time we directly communicated with this peer (gossip, heartbeat, tunnel).
     /// Peers not seen in PEER_STALE_SECS are pruned from gossip and eventually removed.
     pub last_seen: std::time::Instant,
+    /// When this peer returned after being considered dead. MoE scale-up should
+    /// wait briefly before treating the peer as eligible again.
+    pub moe_recovered_at: Option<std::time::Instant>,
     /// mesh-llm version (e.g. "0.23.0")
     pub version: Option<String>,
     /// GPU name/model (e.g. "NVIDIA A100", "Apple M4 Max")
@@ -902,6 +1024,7 @@ impl PeerInfo {
             available_models: ann.available_models.clone(),
             requested_models: ann.requested_models.clone(),
             last_seen: std::time::Instant::now(),
+            moe_recovered_at: None,
             version: ann.version.clone(),
             gpu_name: ann.gpu_name.clone(),
             hostname: ann.hostname.clone(),
@@ -933,6 +1056,10 @@ impl PeerInfo {
         } else {
             self.is_assigned_model(model)
         }
+    }
+
+    pub fn moe_recovery_ready(&self) -> bool {
+        moe_recovery_ready_at(self.moe_recovered_at, std::time::Instant::now())
     }
 }
 
@@ -1512,6 +1639,16 @@ impl Node {
         })
     }
 
+    #[cfg(test)]
+    pub async fn insert_test_peer(&self, peer: PeerInfo) {
+        self.state.lock().await.peers.insert(peer.id, peer);
+    }
+
+    #[cfg(test)]
+    pub async fn has_test_peer(&self, id: EndpointId) -> bool {
+        self.state.lock().await.peers.contains_key(&id)
+    }
+
     pub fn invite_token(&self) -> String {
         let mut addr = self.endpoint.addr();
         // Inject STUN-discovered public address if relay STUN didn't provide one.
@@ -1634,6 +1771,10 @@ impl Node {
 
     pub async fn set_served_model_descriptors(&self, descriptors: Vec<ServedModelDescriptor>) {
         *self.served_model_descriptors.lock().await = descriptors;
+    }
+
+    pub async fn served_model_descriptors(&self) -> Vec<ServedModelDescriptor> {
+        self.served_model_descriptors.lock().await.clone()
     }
 
     pub async fn serving_models(&self) -> Vec<String> {
@@ -2097,17 +2238,30 @@ impl Node {
                         }
                         fail_counts.remove(&peer_id);
                     } else {
+                        let (recently_seen, failure_policy) = {
+                            let state = node.state.lock().await;
+                            let peer = state.peers.get(&peer_id).cloned();
+                            drop(state);
+                            let local_descriptors =
+                                node.served_model_descriptors.lock().await.clone();
+                            let policy = peer
+                                .as_ref()
+                                .map(|peer| {
+                                    heartbeat_failure_policy_for_peer(&local_descriptors, peer)
+                                })
+                                .unwrap_or(HeartbeatFailurePolicy {
+                                    allow_recent_inbound_grace: true,
+                                    failure_threshold: 2,
+                                });
+                            let recently_seen = peer
+                                .as_ref()
+                                .map(|peer| peer.last_seen.elapsed().as_secs() < PEER_STALE_SECS)
+                                .unwrap_or(false);
+                            (recently_seen, policy)
+                        };
                         // Check if peer has contacted US recently (inbound gossip).
                         // If so, peer is alive — we just can't reach them outbound (NAT).
-                        let recently_seen = {
-                            let state = node.state.lock().await;
-                            state
-                                .peers
-                                .get(&peer_id)
-                                .map(|p| p.last_seen.elapsed().as_secs() < PEER_STALE_SECS)
-                                .unwrap_or(false)
-                        };
-                        if recently_seen {
+                        if recently_seen && failure_policy.allow_recent_inbound_grace {
                             // Peer is alive via inbound, don't count as failure
                             if fail_counts.contains_key(&peer_id) {
                                 eprintln!("💚 Heartbeat: {} outbound failed but seen recently (inbound alive)", peer_id.fmt_short());
@@ -2116,19 +2270,25 @@ impl Node {
                         } else {
                             let count = fail_counts.entry(peer_id).or_default();
                             *count += 1;
-                            if *count >= 2 {
-                                // Only add to dead_peers on confirmed death (2 strikes),
-                                // not on first timeout — a single timeout shouldn't block
-                                // incoming gossip from an otherwise-alive peer.
+                            if *count >= failure_policy.failure_threshold {
+                                // Generic peers require 2 misses so a single timeout doesn't
+                                // evict an otherwise-alive inbound-only peer. Shared MoE peers
+                                // are stricter: one missed heartbeat should trigger re-election.
                                 node.state.lock().await.dead_peers.insert(peer_id);
-                                eprintln!("💔 Heartbeat: {} unreachable ({} failures), removing + broadcasting death", peer_id.fmt_short(), count);
+                                eprintln!(
+                                    "💔 Heartbeat: {} unreachable ({} failure{}), removing + broadcasting death",
+                                    peer_id.fmt_short(),
+                                    count,
+                                    if *count == 1 { "" } else { "s" }
+                                );
                                 fail_counts.remove(&peer_id);
                                 node.handle_peer_death(peer_id).await;
                             } else {
                                 eprintln!(
-                                    "💛 Heartbeat: {} unreachable ({}/2), will retry",
+                                    "💛 Heartbeat: {} unreachable ({}/{}), will retry",
                                     peer_id.fmt_short(),
-                                    count
+                                    count,
+                                    failure_policy.failure_threshold
                                 );
                             }
                         }
@@ -3948,9 +4108,11 @@ impl Node {
         if id == self.endpoint.id() {
             return;
         }
+        let now = std::time::Instant::now();
         // If this peer was previously dead, clear it — add_peer is only called
         // after a successful gossip exchange, which is proof of life.
-        if state.dead_peers.remove(&id) {
+        let recovered = state.dead_peers.remove(&id);
+        if recovered {
             eprintln!(
                 "🔄 Peer {} back from the dead (successful gossip)",
                 id.fmt_short()
@@ -3986,7 +4148,10 @@ impl Node {
             existing.hosted_models_known = ann.hosted_models.is_some();
             existing.available_models.clear();
             existing.requested_models = ann.requested_models.clone();
-            existing.last_seen = std::time::Instant::now();
+            existing.last_seen = now;
+            if recovered {
+                existing.moe_recovered_at = Some(now);
+            }
             existing.served_model_descriptors = ann.served_model_descriptors.clone();
             if ann.version.is_some() {
                 existing.version = ann.version.clone();
@@ -4043,7 +4208,10 @@ impl Node {
             ann.available_models,
             state.peers.len() + 1
         );
-        let peer = PeerInfo::from_announcement(id, addr, ann);
+        let mut peer = PeerInfo::from_announcement(id, addr, ann);
+        if recovered {
+            peer.moe_recovered_at = Some(now);
+        }
         state.peers.insert(id, peer.clone());
         let count = state.peers.len();
         drop(state);
@@ -5038,6 +5206,7 @@ mod tests {
             available_models: vec![],
             requested_models: vec![],
             last_seen: std::time::Instant::now(),
+            moe_recovered_at: None,
             version: None,
             gpu_name: None,
             hostname: None,
@@ -5049,6 +5218,123 @@ mod tests {
             available_model_sizes: HashMap::new(),
             served_model_descriptors: vec![],
         }
+    }
+
+    fn make_test_moe_descriptor(model_name: &str, identity_hash: &str) -> ServedModelDescriptor {
+        ServedModelDescriptor {
+            identity: ServedModelIdentity {
+                model_name: model_name.to_string(),
+                is_primary: true,
+                source_kind: ModelSourceKind::HuggingFace,
+                canonical_ref: Some(format!("hf://{identity_hash}")),
+                repository: Some("Qwen".to_string()),
+                revision: Some("main".to_string()),
+                artifact: Some(format!("{model_name}.gguf")),
+                local_file_name: Some(format!("{model_name}.gguf")),
+                identity_hash: Some(identity_hash.to_string()),
+            },
+            capabilities: crate::models::ModelCapabilities {
+                moe: true,
+                ..Default::default()
+            },
+            topology: Some(crate::models::ModelTopology {
+                moe: Some(crate::models::ModelMoeInfo {
+                    expert_count: 512,
+                    used_expert_count: 10,
+                    min_experts_per_node: Some(160),
+                    source: Some("test".to_string()),
+                    ranking_source: None,
+                    ranking_origin: None,
+                    ranking: Vec::new(),
+                    ranking_prompt_count: None,
+                    ranking_tokens: None,
+                    ranking_layer_scope: None,
+                }),
+            }),
+        }
+    }
+
+    fn make_test_endpoint_id(seed: u8) -> EndpointId {
+        let mut bytes = [0u8; 32];
+        bytes[0] = seed;
+        EndpointId::from(SecretKey::from_bytes(&bytes).public())
+    }
+
+    #[test]
+    fn shared_exact_moe_identity_disables_recent_inbound_grace() {
+        let mut peer = make_test_peer_info(make_test_endpoint_id(7));
+        peer.served_model_descriptors = vec![make_test_moe_descriptor(
+            "Qwen3-Coder-Next-Q4_K_M",
+            "same-model",
+        )];
+        let local_descriptors = vec![make_test_moe_descriptor(
+            "Qwen3-Coder-Next-Q4_K_M",
+            "same-model",
+        )];
+
+        let policy = heartbeat_failure_policy_for_peer(&local_descriptors, &peer);
+
+        assert_eq!(
+            policy,
+            HeartbeatFailurePolicy {
+                allow_recent_inbound_grace: false,
+                failure_threshold: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn non_matching_or_non_moe_peers_keep_default_heartbeat_grace() {
+        let mut peer = make_test_peer_info(make_test_endpoint_id(8));
+        peer.served_model_descriptors = vec![make_test_moe_descriptor(
+            "Qwen3-Coder-Next-Q4_K_M",
+            "remote-model",
+        )];
+        let local_descriptors = vec![make_test_moe_descriptor(
+            "Qwen3-Coder-Next-Q4_K_M",
+            "local-model",
+        )];
+
+        let policy = heartbeat_failure_policy_for_peer(&local_descriptors, &peer);
+
+        assert_eq!(
+            policy,
+            HeartbeatFailurePolicy {
+                allow_recent_inbound_grace: true,
+                failure_threshold: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn recovered_moe_peer_stays_out_of_active_placement_until_probation_expires() {
+        let mut peer = make_test_peer_info(make_test_endpoint_id(9));
+        peer.serving_models = vec!["Qwen3-Coder-Next-Q4_K_M".to_string()];
+        peer.served_model_descriptors = vec![make_test_moe_descriptor(
+            "Qwen3-Coder-Next-Q4_K_M",
+            "same-model",
+        )];
+        let local_descriptors = vec![make_test_moe_descriptor(
+            "Qwen3-Coder-Next-Q4_K_M",
+            "same-model",
+        )];
+
+        peer.moe_recovered_at = Some(std::time::Instant::now());
+        assert!(!peer_is_eligible_for_active_moe(
+            &local_descriptors,
+            &peer,
+            "Qwen3-Coder-Next-Q4_K_M"
+        ));
+
+        peer.moe_recovered_at = Some(
+            std::time::Instant::now()
+                - std::time::Duration::from_secs(MOE_RECOVERY_PROBATION_SECS + 1),
+        );
+        assert!(peer_is_eligible_for_active_moe(
+            &local_descriptors,
+            &peer,
+            "Qwen3-Coder-Next-Q4_K_M"
+        ));
     }
 
     #[test]
@@ -7232,6 +7518,7 @@ mod tests {
             available_models: vec![],
             requested_models: vec![],
             last_seen: std::time::Instant::now(),
+            moe_recovered_at: None,
             version: None,
             gpu_name: None,
             hostname: None,

@@ -1443,15 +1443,35 @@ async fn moe_election_loop(
             let _ = refresh_auto_moe_config_from_cache(&model_name, &model, &mut moe_cfg);
         }
 
-        // Count how many nodes (including us) are serving this model
+        // Count how many healthy nodes (including us) are eligible for this exact MoE deployment.
         let peers = node.peers().await;
-        let model_peers: Vec<mesh::PeerInfo> = peers
+        let local_descriptors = node.served_model_descriptors().await;
+        let all_model_peers: Vec<mesh::PeerInfo> = peers
             .iter()
             .filter(|p| p.is_assigned_model(&model_name))
             .filter(|p| !matches!(p.role, NodeRole::Client))
             .cloned()
             .collect();
+        let model_peers: Vec<mesh::PeerInfo> = all_model_peers
+            .into_iter()
+            .filter(|peer| {
+                mesh::peer_is_eligible_for_active_moe(&local_descriptors, peer, &model_name)
+            })
+            .collect();
+        let recovering_peer_count = peers
+            .iter()
+            .filter(|p| p.is_assigned_model(&model_name))
+            .filter(|p| !matches!(p.role, NodeRole::Client))
+            .filter(|peer| !peer.moe_recovery_ready())
+            .count();
         let n_nodes = model_peers.len() + 1; // +1 for us
+
+        if recovering_peer_count > 0 {
+            eprintln!(
+                "🧩 [{model_name}] Holding {} recovered peer(s) out of active MoE placement until stable",
+                recovering_peer_count
+            );
+        }
 
         // Determine our shard index: sort all node IDs, find our position
         let my_id = node.id();
@@ -2174,6 +2194,60 @@ mod tests {
         match &moe.nodes[idx_a] {
             InferenceTarget::MoeLocal(port) => assert_eq!(*port, 9999),
             other => panic!("Expected MoeLocal(9999), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_build_moe_targets_reconfigures_when_third_node_drops() {
+        let id_a = make_id(1);
+        let id_b = make_id(2);
+        let id_c = make_id(3);
+
+        let (sorted_three, _) = moe_shard_index(id_a, &[id_b, id_c]);
+        let targets_three = build_moe_targets(&sorted_three, id_a, 8080, "m");
+        let moe_three = targets_three.moe.as_ref().unwrap();
+        assert_eq!(moe_three.nodes.len(), 3);
+        assert!(moe_three
+            .nodes
+            .iter()
+            .any(|target| matches!(target, InferenceTarget::MoeRemote(id) if *id == id_c)));
+
+        let (sorted_two, _) = moe_shard_index(id_a, &[id_b]);
+        let targets_two = build_moe_targets(&sorted_two, id_a, 8080, "m");
+        let moe_two = targets_two.moe.as_ref().unwrap();
+        assert_eq!(moe_two.nodes.len(), 2);
+        assert!(!moe_two
+            .nodes
+            .iter()
+            .any(|target| matches!(target, InferenceTarget::MoeRemote(id) if *id == id_c)));
+
+        // The survivor should still route locally, but only across the 2 remaining shards.
+        assert!(matches!(
+            targets_two.get("m"),
+            InferenceTarget::MoeLocal(8080)
+        ));
+    }
+
+    #[test]
+    fn test_build_moe_targets_collapse_to_single_node_after_peer_loss() {
+        let id_a = make_id(1);
+        let id_b = make_id(2);
+
+        let (sorted_two, _) = moe_shard_index(id_a, &[id_b]);
+        let targets_two = build_moe_targets(&sorted_two, id_a, 8080, "m");
+        let moe_two = targets_two.moe.as_ref().unwrap();
+        assert_eq!(moe_two.nodes.len(), 2);
+
+        let targets_one = build_moe_targets(&[id_a], id_a, 8080, "m");
+        let moe_one = targets_one.moe.as_ref().unwrap();
+        assert_eq!(moe_one.nodes.len(), 1);
+        assert!(matches!(moe_one.nodes[0], InferenceTarget::MoeLocal(8080)));
+
+        for i in 0..20 {
+            match targets_one.get_moe_target(&format!("after-drop-{i}")) {
+                Some(InferenceTarget::MoeLocal(8080)) => {}
+                other => panic!("Expected MoeLocal(8080) after collapse, got {:?}", other),
+            }
         }
     }
 

@@ -264,6 +264,56 @@ curl localhost:3131/api/discover # Nostr meshes (current mesh marked by mesh_id)
 - Dead peer won't be re-added by gossip (dead_peers set)
 - Console updates automatically
 
+## MoE Smoke Tests
+
+These are the minimum smoke tests for leader-planned MoE recovery. They should be kept green as the runtime changes.
+
+### 11a. Two-node MoE split collapses to one survivor
+
+```bash
+# node A
+mesh-llm --model Qwen3-Coder-Next-Q4_K_M --auto --no-self-update
+
+# node B
+mesh-llm --model Qwen3-Coder-Next-Q4_K_M --auto --no-self-update --split --join <TOKEN>
+```
+
+- Verify the two-node split comes up and `/v1/chat/completions` works.
+- Kill one node with `kill -9`.
+- The survivor should stop counting the dead shard in the active MoE set.
+- The survivor should reconfigure to a one-node topology and serving should recover without manual restart.
+
+### 11b. Three-node MoE split shrinks to two survivors
+
+- Start a three-node split on the same exact MoE model identity.
+- Kill one shard node.
+- The remaining two nodes should re-elect on `n_nodes = 2`.
+- The dead shard should disappear from the active MoE target map.
+- Serving should recover on the two-node topology without killing the survivors.
+
+### 11c. Recovered node does not cause immediate flap
+
+- Start a two-node or three-node MoE split.
+- Kill one shard node and wait for the deployment to fail down.
+- Restart the dead node.
+- Verify the node reappears in mesh membership.
+- Verify the deployment does **not** immediately expand back up on the first healthy signal.
+- Verify expansion only happens after the configured recovery stability window.
+
+### 11d. Full-coverage fallback replica
+
+- Start a split deployment where one additional node can serve the full expert set for the same exact model identity.
+- Kill an active shard.
+- Verify request routing can fail over to the full-coverage target instead of blindly retrying a different partial shard.
+- Verify the cluster still re-plans the split afterward if that remains the best topology.
+
+### 11e. Flaky network does not churn the MoE topology
+
+- Run a two-node or three-node MoE split.
+- Inject transient packet loss or briefly interrupt control traffic without killing the process.
+- Verify the deployment does not oscillate between `N` and `N-1` on a single blip.
+- Verify serving stays available when the shard remains reachable for inference.
+
 ### 12. Node rejoin
 
 - Kill a node, restart it with `--join <token>`
