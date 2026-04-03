@@ -542,16 +542,19 @@ fn should_relay_moe_analyze_warning(line: &str) -> bool {
 
 #[derive(Default)]
 struct MoeAnalyzeProgressState {
+    current_prompt: usize,
     total_prompts: Option<usize>,
-    last_prompt: Option<usize>,
+    done: bool,
 }
 
-fn render_moe_analysis_progress(
+fn format_moe_analysis_progress_line(
     model_name: &str,
     mode: &str,
+    spinner: &str,
     current: usize,
     total: Option<usize>,
-) {
+    elapsed: std::time::Duration,
+) -> String {
     let progress = match total {
         Some(total) if total > 0 => format!(
             "{:>5.1}%  {}/{}",
@@ -560,19 +563,54 @@ fn render_moe_analysis_progress(
             total
         ),
         Some(total) => format!("       0/{}", total),
-        None => format!("       {}", current),
+        None => "starting".to_string(),
     };
-    eprint!(
-        "\r🧩 [{}] {:<17} {}",
+    format!(
+        "🧩 [{}] {:<17} {}  {:>3}s",
         model_name,
         format!("MoE {mode}"),
-        progress
-    );
-    let _ = std::io::stderr().flush();
+        format!("{spinner} {progress}"),
+        elapsed.as_secs()
+    )
 }
 
-fn finish_moe_analysis_progress() {
-    eprintln!();
+fn spawn_moe_analysis_spinner(
+    model_name: String,
+    mode: &'static str,
+    progress: Arc<Mutex<MoeAnalyzeProgressState>>,
+    started: std::time::Instant,
+) -> thread::JoinHandle<()> {
+    const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    thread::spawn(move || {
+        let mut frame_idx = 0usize;
+        loop {
+            let (current, total, done) = progress
+                .lock()
+                .map(|state| (state.current_prompt, state.total_prompts, state.done))
+                .unwrap_or((0, None, true));
+            let spinner = if done {
+                "✓"
+            } else {
+                FRAMES[frame_idx % FRAMES.len()]
+            };
+            let line = format_moe_analysis_progress_line(
+                &model_name,
+                mode,
+                spinner,
+                current,
+                total,
+                started.elapsed(),
+            );
+            eprint!("\r\x1b[2K{line}");
+            let _ = std::io::stderr().flush();
+            if done {
+                eprintln!();
+                break;
+            }
+            frame_idx += 1;
+            thread::sleep(std::time::Duration::from_millis(125));
+        }
+    })
 }
 
 fn parse_moe_analyze_prompt_total(line: &str) -> Option<usize> {
@@ -602,31 +640,17 @@ fn spawn_moe_analyze_log_relay<R: std::io::Read + Send + 'static>(
                 if let Ok(mut state) = progress.lock() {
                     state.total_prompts = Some(total);
                 }
-                render_moe_analysis_progress(&model_name, "full-analyze", 0, Some(total));
                 continue;
             }
             if let Some((current, total)) = parse_moe_analyze_prompt_progress(&line) {
-                let mut should_emit = true;
                 if let Ok(mut state) = progress.lock() {
                     state.total_prompts = Some(total);
-                    if state.last_prompt == Some(current) {
-                        should_emit = false;
-                    } else {
-                        state.last_prompt = Some(current);
-                    }
-                }
-                if should_emit {
-                    render_moe_analysis_progress(
-                        &model_name,
-                        "full-analyze",
-                        current.saturating_sub(1),
-                        Some(total),
-                    );
+                    state.current_prompt = current.saturating_sub(1);
                 }
                 continue;
             }
             if should_relay_moe_analyze_warning(&line) {
-                eprint!("\r");
+                eprint!("\r\x1b[2K");
                 eprintln!("  [{model_name}] {line}");
             }
         }
@@ -664,6 +688,12 @@ fn ensure_full_analyze_ranking(
         cached_path.display()
     );
     let progress = Arc::new(Mutex::new(MoeAnalyzeProgressState::default()));
+    let spinner = spawn_moe_analysis_spinner(
+        model_name.to_string(),
+        "full-analyze",
+        Arc::clone(&progress),
+        started,
+    );
     let mut child = Command::new(&analyze_bin)
         .args([
             "-m",
@@ -694,10 +724,13 @@ fn ensure_full_analyze_ranking(
     if let Some(handle) = stderr_relay {
         let _ = handle.join();
     }
-    if let Some(total) = progress.lock().ok().and_then(|state| state.total_prompts) {
-        render_moe_analysis_progress(model_name, "full-analyze", total, Some(total));
-        finish_moe_analysis_progress();
+    if let Ok(mut state) = progress.lock() {
+        if let Some(total) = state.total_prompts {
+            state.current_prompt = total;
+        }
+        state.done = true;
     }
+    let _ = spinner.join();
     anyhow::ensure!(status.success(), "llama-moe-analyze exited with {status}");
     let ranking = moe::load_cached_ranking(cached_path).ok_or_else(|| {
         anyhow::anyhow!(
@@ -804,7 +837,17 @@ fn run_micro_analyze_ranking(
             moe::MoeMicroLayerScope::First => "first",
         }
     );
-    render_moe_analysis_progress(model_name, "micro-analyze", 0, Some(prompt_count));
+    let progress = Arc::new(Mutex::new(MoeAnalyzeProgressState {
+        current_prompt: 0,
+        total_prompts: Some(prompt_count),
+        done: false,
+    }));
+    let spinner = spawn_moe_analysis_spinner(
+        model_name.to_string(),
+        "micro-analyze",
+        Arc::clone(&progress),
+        started,
+    );
 
     for (idx, prompt) in prompts.iter().take(prompt_count).enumerate() {
         let output_path = tmp_dir.join(format!("prompt-{idx}.csv"));
@@ -828,7 +871,10 @@ fn run_micro_analyze_ranking(
         }
         let output = command.output()?;
         if !output.status.success() {
-            finish_moe_analysis_progress();
+            if let Ok(mut state) = progress.lock() {
+                state.done = true;
+            }
+            let _ = spinner.join();
             let stderr = String::from_utf8_lossy(&output.stderr);
             let stdout = String::from_utf8_lossy(&output.stdout);
             let mut details = stderr
@@ -853,9 +899,15 @@ fn run_micro_analyze_ranking(
         for row in load_analyze_mass_rows(&output_path)? {
             *mass_by_expert.entry(row.expert_id).or_insert(0.0) += row.gate_mass;
         }
-        render_moe_analysis_progress(model_name, "micro-analyze", idx + 1, Some(prompt_count));
+        if let Ok(mut state) = progress.lock() {
+            state.current_prompt = idx + 1;
+        }
     }
-    finish_moe_analysis_progress();
+    if let Ok(mut state) = progress.lock() {
+        state.current_prompt = prompt_count;
+        state.done = true;
+    }
+    let _ = spinner.join();
 
     let mut rows = mass_by_expert.into_iter().collect::<Vec<_>>();
     rows.sort_by(|a, b| {
