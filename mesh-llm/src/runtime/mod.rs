@@ -1225,7 +1225,6 @@ async fn run_auto(
             plugin_manager.clone(),
             affinity_router.clone(),
         );
-        cs.set_primary_backend("llama".into()).await;
         cs.set_runtime_control(control_tx.clone()).await;
         cs.set_nostr_relays(nostr_relays(&cli.nostr_relay)).await;
         cs.set_nostr_discovery(cli.nostr_discovery).await;
@@ -1339,9 +1338,11 @@ async fn run_auto(
                                 &context_node,
                                 &model_name,
                                 Some(process.context_length),
+                                Some(&process.backend),
                             )
                             .await;
                             if let Some(cs) = console_state {
+                                cs.set_primary_backend(process.backend.clone()).await;
                                 cs.upsert_local_process(local_process_payload(
                                     &model_name,
                                     &process.backend,
@@ -1352,8 +1353,10 @@ async fn run_auto(
                             }
                         }
                         None => {
-                            set_advertised_model_context(&context_node, &model_name, None).await;
+                            set_advertised_model_context(&context_node, &model_name, None, None)
+                                .await;
                             if let Some(cs) = console_state {
+                                cs.clear_primary_backend().await;
                                 cs.remove_local_process(&model_name).await;
                             }
                         }
@@ -1439,6 +1442,7 @@ async fn run_auto(
                                         &context_node,
                                         &model_name,
                                         Some(process.context_length),
+                                        Some(&process.backend),
                                     )
                                     .await;
                                     if let Some(cs) = console_state {
@@ -1452,8 +1456,13 @@ async fn run_auto(
                                     }
                                 }
                                 None => {
-                                    set_advertised_model_context(&context_node, &model_name, None)
-                                        .await;
+                                    set_advertised_model_context(
+                                        &context_node,
+                                        &model_name,
+                                        None,
+                                        None,
+                                    )
+                                    .await;
                                     if let Some(cs) = console_state {
                                         cs.remove_local_process(&model_name).await;
                                     }
@@ -1549,6 +1558,7 @@ async fn run_auto(
                                 &node,
                                 &loaded_name,
                                 Some(handle.context_length),
+                                Some(&handle.backend),
                             )
                             .await;
                             advertise_model_ready(&node, &primary_model_name, &loaded_name).await;

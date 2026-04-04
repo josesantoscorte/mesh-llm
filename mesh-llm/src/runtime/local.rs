@@ -119,8 +119,9 @@ pub(super) async fn set_advertised_model_context(
     node: &mesh::Node,
     model_name: &str,
     context_length: Option<u32>,
+    backend: Option<&str>,
 ) {
-    node.set_model_runtime_context_length(model_name, context_length)
+    node.set_model_runtime_context_length(model_name, context_length, backend)
         .await;
     node.regossip().await;
 }

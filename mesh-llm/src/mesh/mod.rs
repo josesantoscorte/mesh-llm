@@ -90,6 +90,8 @@ pub struct ModelRuntimeDescriptor {
     pub identity_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_length: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
     pub ready: bool,
 }
 
@@ -1597,6 +1599,7 @@ impl Node {
         &self,
         model_name: &str,
         context_length: Option<u32>,
+        backend: Option<&str>,
     ) {
         let identity_hash = self
             .served_model_descriptors
@@ -1613,12 +1616,16 @@ impl Node {
             {
                 runtime.identity_hash = identity_hash.or_else(|| runtime.identity_hash.clone());
                 runtime.context_length = Some(context_length);
+                runtime.backend = backend
+                    .map(str::to_string)
+                    .or_else(|| runtime.backend.clone());
                 runtime.ready = true;
             } else {
                 runtimes.push(ModelRuntimeDescriptor {
                     model_name: model_name.to_string(),
                     identity_hash,
                     context_length: Some(context_length),
+                    backend: backend.map(str::to_string),
                     ready: true,
                 });
             }
@@ -5375,6 +5382,7 @@ mod tests {
                 model_name: "Qwen3-8B-Q4_K_M".to_string(),
                 identity_hash: Some("sha256:abc123".into()),
                 context_length: Some(32768),
+                backend: Some("llama".into()),
                 ready: true,
             }],
         };
@@ -5428,6 +5436,14 @@ mod tests {
             Some(32768),
             "proto_ann_to_local must preserve served model runtime context length"
         );
+        assert_eq!(
+            roundtripped
+                .served_model_runtime
+                .first()
+                .and_then(|runtime| runtime.backend.as_deref()),
+            Some("llama"),
+            "proto_ann_to_local must preserve served model runtime backend"
+        );
 
         let frame = build_gossip_frame(&[local_ann], peer_id);
         assert_eq!(frame.sender_id, peer_id_bytes);
@@ -5458,6 +5474,14 @@ mod tests {
             Some(32768),
             "build_gossip_frame must preserve served model runtime context length"
         );
+        assert_eq!(
+            wire_pa
+                .served_model_runtime
+                .first()
+                .and_then(|runtime| runtime.backend.as_deref()),
+            Some("llama"),
+            "build_gossip_frame must preserve served model runtime backend"
+        );
         let (_, final_local) =
             proto_ann_to_local(wire_pa).expect("final proto_ann_to_local must succeed");
         assert!(final_local.available_model_metadata.is_empty());
@@ -5469,6 +5493,13 @@ mod tests {
                 .first()
                 .and_then(ModelRuntimeDescriptor::advertised_context_length),
             Some(32768)
+        );
+        assert_eq!(
+            final_local
+                .served_model_runtime
+                .first()
+                .and_then(|runtime| runtime.backend.as_deref()),
+            Some("llama")
         );
     }
 
