@@ -493,11 +493,20 @@ pub fn find_mmproj_path(model_name: &str, model_path: &Path) -> Option<PathBuf> 
         return Some(path);
     }
 
+    // The legacy flat ~/.models/ directory mixes models from completely different
+    // families in a single directory.  Filename-based heuristics are not reliable
+    // enough there, so we skip the sibling scan entirely for that layout.
+    // (Catalog-based lookup above still works for known vision models.)
+    if model_path.starts_with(legacy_models_dir()) {
+        return None;
+    }
+
     // Scan the model's parent directory for a matching mmproj file.
+    // This is safe for the HF hub cache because each model lives in its own
+    // isolated snapshot subdirectory alongside only its companion files.
+    //
     // The mmproj filename must contain both "mmproj" AND a model-name component
-    // that matches the model being loaded. This prevents picking up unrelated
-    // mmproj files that happen to sit in the same directory (common in the
-    // legacy ~/.models flat dir).
+    // that matches the model being loaded.
     //
     // Supported naming patterns:
     //   <model>-mmproj[-<quant>].gguf   e.g. Qwen3.5-0.8B-mmproj-BF16.gguf
@@ -725,9 +734,12 @@ mod tests {
     }
 
     #[test]
-    fn mmproj_path_ignores_unrelated_mmproj_in_flat_dir() {
-        // Reproduces the bug: a flat directory like ~/.models/ contains models
-        // from different families. An unrelated mmproj should not be picked up.
+    #[serial]
+    fn mmproj_path_skips_scan_inside_legacy_dir() {
+        // Models inside ~/.models/ must never trigger the sibling scan, even
+        // when a matching-named mmproj file sits right beside them.  The flat
+        // directory mixes models from many families and reliable matching is
+        // impossible, so we bail out early for that layout.
         let temp = std::env::temp_dir().join(format!(
             "mesh-llm-mmproj-test-{}",
             std::time::SystemTime::now()
@@ -735,14 +747,28 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        std::fs::create_dir_all(&temp).unwrap();
-        let model = temp.join("Hermes-2-Pro-Mistral-7B-Q4_K_M.gguf");
-        let unrelated_mmproj = temp.join("Qwen3.5-0.8B-mmproj-BF16.gguf");
+        let fake_home = temp.clone();
+        let legacy = fake_home.join(".models");
+        std::fs::create_dir_all(&legacy).unwrap();
+
+        // Place a non-vision model and a stray unrelated mmproj in the flat dir.
+        let model = legacy.join("Hermes-2-Pro-Mistral-7B-Q4_K_M.gguf");
+        let unrelated_mmproj = legacy.join("Qwen3.5-0.8B-mmproj-BF16.gguf");
         std::fs::write(&model, b"model").unwrap();
         std::fs::write(&unrelated_mmproj, b"mmproj").unwrap();
 
+        let prev_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", &fake_home);
+
+        // Sibling scan is skipped entirely for the legacy dir → no mmproj returned.
         assert!(find_mmproj_path("Hermes-2-Pro-Mistral-7B-Q4_K_M", &model).is_none());
 
+        // Also verify that even a correctly-named matching mmproj is ignored.
+        let matching_mmproj = legacy.join("Hermes-2-Pro-Mistral-7B-mmproj-BF16.gguf");
+        std::fs::write(&matching_mmproj, b"mmproj").unwrap();
+        assert!(find_mmproj_path("Hermes-2-Pro-Mistral-7B-Q4_K_M", &model).is_none());
+
+        restore_env("HOME", prev_home);
         let _ = std::fs::remove_dir_all(&temp);
     }
 
