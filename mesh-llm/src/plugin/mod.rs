@@ -192,6 +192,8 @@ struct PluginManagerInner {
     rpc_bridge: Arc<Mutex<Option<Arc<dyn PluginRpcBridge>>>>,
     #[cfg(test)]
     bridged_plugins: BTreeSet<String>,
+    #[cfg(test)]
+    test_endpoints: Arc<Mutex<Vec<PluginEndpointSummary>>>,
 }
 
 impl PluginManager {
@@ -268,6 +270,8 @@ impl PluginManager {
                 rpc_bridge,
                 #[cfg(test)]
                 bridged_plugins: BTreeSet::new(),
+                #[cfg(test)]
+                test_endpoints: Arc::new(Mutex::new(Vec::new())),
             }),
         };
         manager.start_supervisor();
@@ -286,6 +290,7 @@ impl PluginManager {
                     .iter()
                     .map(|name| (*name).to_string())
                     .collect(),
+                test_endpoints: Arc::new(Mutex::new(Vec::new())),
             }),
         }
     }
@@ -302,6 +307,18 @@ impl PluginManager {
     }
 
     pub async fn endpoints(&self) -> Result<Vec<PluginEndpointSummary>> {
+        #[cfg(test)]
+        if self.inner.plugins.is_empty() && self.inner.inactive.is_empty() {
+            let mut endpoints = self.inner.test_endpoints.lock().await.clone();
+            endpoints.sort_by(|a, b| {
+                a.plugin_name
+                    .cmp(&b.plugin_name)
+                    .then_with(|| a.endpoint_id.cmp(&b.endpoint_id))
+            });
+            if !endpoints.is_empty() {
+                return Ok(endpoints);
+            }
+        }
         let summaries = self.list().await;
         let endpoint_health = self.inner.endpoint_health.lock().await.clone();
         let mut endpoints = Vec::new();
@@ -340,6 +357,11 @@ impl PluginManager {
                 .then_with(|| a.endpoint_id.cmp(&b.endpoint_id))
         });
         Ok(endpoints)
+    }
+
+    #[cfg(test)]
+    pub async fn set_test_endpoints(&self, endpoints: Vec<PluginEndpointSummary>) {
+        *self.inner.test_endpoints.lock().await = endpoints;
     }
 
     pub async fn is_enabled(&self, name: &str) -> bool {
