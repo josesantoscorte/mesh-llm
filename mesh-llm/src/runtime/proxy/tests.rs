@@ -948,6 +948,7 @@ data: [DONE]
     stream.write_all(request.as_bytes()).await.unwrap();
     stream.shutdown().await.unwrap();
 
+    let started_at = tokio::time::Instant::now();
     let first = read_until_contains(
         &mut stream,
         br#"event: response.output_text.delta
@@ -955,18 +956,20 @@ data: {"#,
         Duration::from_secs(2),
     )
     .await;
+    let first_elapsed = started_at.elapsed();
     let first_text = String::from_utf8_lossy(&first);
     assert!(first_text.contains("HTTP/1.1 200 OK"));
     assert!(first_text.contains("Content-Type: text/event-stream"));
     assert!(first_text.contains("event: response.created"));
     assert!(first_text.contains("event: response.output_text.delta"));
     assert!(first_text.contains(r#""delta":"one""#));
-    assert!(tokio::time::timeout(Duration::from_millis(200), async {
-        let mut probe = [0u8; 64];
-        stream.read(&mut probe).await
-    })
-    .await
-    .is_err());
+    assert!(
+        first_elapsed < Duration::from_millis(900),
+        "first translated delta arrived too late: {first_elapsed:?}"
+    );
+    assert!(!first_text.contains(r#""delta":"two""#));
+    assert!(!first_text.contains("event: response.output_text.done"));
+    assert!(!first_text.contains("event: response.completed"));
 
     let mut rest = Vec::new();
     stream.read_to_end(&mut rest).await.unwrap();
