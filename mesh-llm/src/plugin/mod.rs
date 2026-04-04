@@ -456,13 +456,13 @@ mod tests {
     #[test]
     fn blackboard_can_be_disabled() {
         let config = MeshConfig {
-            self_update: None,
             plugins: vec![PluginConfigEntry {
                 name: BLACKBOARD_PLUGIN_ID.into(),
                 enabled: Some(false),
                 command: None,
                 args: Vec::new(),
             }],
+            ..MeshConfig::default()
         };
         let resolved = resolve_plugins(&config, private_host_mode()).unwrap();
         assert_eq!(resolved.externals.len(), 1);
@@ -473,13 +473,13 @@ mod tests {
     #[test]
     fn blobstore_can_be_disabled() {
         let config = MeshConfig {
-            self_update: None,
             plugins: vec![PluginConfigEntry {
                 name: BLOBSTORE_PLUGIN_ID.into(),
                 enabled: Some(false),
                 command: None,
                 args: Vec::new(),
             }],
+            ..MeshConfig::default()
         };
         let resolved = resolve_plugins(&config, private_host_mode()).unwrap();
         assert_eq!(resolved.externals.len(), 1);
@@ -505,13 +505,13 @@ mod tests {
     #[test]
     fn resolves_external_plugin() {
         let config = MeshConfig {
-            self_update: None,
             plugins: vec![PluginConfigEntry {
                 name: "demo".into(),
                 enabled: Some(true),
                 command: Some("/tmp/demo".into()),
                 args: vec!["--flag".into()],
             }],
+            ..MeshConfig::default()
         };
         let resolved = resolve_plugins(&config, private_host_mode()).unwrap();
         assert_eq!(resolved.externals.len(), 3);
