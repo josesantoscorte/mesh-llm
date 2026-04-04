@@ -1941,6 +1941,7 @@ async fn moe_election_loop(
                         .with_ctx_size_override(ctx_size_override);
                 let selected_provider = provider::select_local_endpoint_provider(&request);
                 match selected_provider
+                    .provider()
                     .start_endpoint(&bin_dir, binary_flavor, &request)
                     .await
                 {
@@ -2078,6 +2079,7 @@ async fn moe_election_loop(
             .with_ctx_size_override(ctx_size_override);
             let selected_provider = provider::select_local_endpoint_provider(&request);
             match selected_provider
+                .provider()
                 .start_endpoint(&bin_dir, binary_flavor, &request)
                 .await
             {
