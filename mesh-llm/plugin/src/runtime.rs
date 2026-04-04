@@ -114,6 +114,8 @@ impl PluginMetadata {
 type InitializeFuture<'a> = Pin<Box<dyn Future<Output = PluginResult<()>> + Send + 'a>>;
 type InitFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
 type HealthFuture<'a> = Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>>;
+type OpenStreamFuture<'a> =
+    Pin<Box<dyn Future<Output = PluginResult<Option<proto::OpenStreamResponse>>> + Send + 'a>>;
 type SubscribeFuture<'a> = Pin<Box<dyn Future<Output = PluginResult<()>> + Send + 'a>>;
 type SetLogLevelFuture<'a> = Pin<Box<dyn Future<Output = PluginResult<()>> + Send + 'a>>;
 
@@ -162,6 +164,35 @@ type BulkHandler = Arc<
 >;
 type MeshEventHandler = Arc<
     dyn for<'a, 'ctx> Fn(proto::MeshEvent, &'a mut PluginContext<'ctx>) -> InitFuture<'a>
+        + Send
+        + Sync,
+>;
+type OpenStreamHandler = Arc<
+    dyn for<'a, 'ctx> Fn(
+            proto::OpenStreamRequest,
+            &'a mut PluginContext<'ctx>,
+        ) -> OpenStreamFuture<'a>
+        + Send
+        + Sync,
+>;
+type CancelStreamHandler = Arc<
+    dyn for<'a, 'ctx> Fn(
+            proto::CancelStreamNotification,
+            &'a mut PluginContext<'ctx>,
+        ) -> InitFuture<'a>
+        + Send
+        + Sync,
+>;
+type CloseStreamHandler = Arc<
+    dyn for<'a, 'ctx> Fn(
+            proto::CloseStreamNotification,
+            &'a mut PluginContext<'ctx>,
+        ) -> InitFuture<'a>
+        + Send
+        + Sync,
+>;
+type StreamErrorHandler = Arc<
+    dyn for<'a, 'ctx> Fn(proto::StreamError, &'a mut PluginContext<'ctx>) -> InitFuture<'a>
         + Send
         + Sync,
 >;
@@ -492,6 +523,38 @@ pub trait Plugin: Send {
         Ok(())
     }
 
+    async fn open_stream(
+        &mut self,
+        _request: proto::OpenStreamRequest,
+        _context: &mut PluginContext<'_>,
+    ) -> PluginResult<Option<proto::OpenStreamResponse>> {
+        Ok(None)
+    }
+
+    async fn on_cancel_stream(
+        &mut self,
+        _notification: proto::CancelStreamNotification,
+        _context: &mut PluginContext<'_>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    async fn on_close_stream(
+        &mut self,
+        _notification: proto::CloseStreamNotification,
+        _context: &mut PluginContext<'_>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    async fn on_stream_error(
+        &mut self,
+        _error: proto::StreamError,
+        _context: &mut PluginContext<'_>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     async fn on_host_error(
         &mut self,
         error: proto::ErrorResponse,
@@ -517,6 +580,10 @@ pub struct SimplePlugin {
     channel_handler: Option<ChannelHandler>,
     bulk_handler: Option<BulkHandler>,
     mesh_event_handler: Option<MeshEventHandler>,
+    open_stream_handler: Option<OpenStreamHandler>,
+    cancel_stream_handler: Option<CancelStreamHandler>,
+    close_stream_handler: Option<CloseStreamHandler>,
+    stream_error_handler: Option<StreamErrorHandler>,
 }
 
 impl SimplePlugin {
@@ -537,6 +604,10 @@ impl SimplePlugin {
             channel_handler: None,
             bulk_handler: None,
             mesh_event_handler: None,
+            open_stream_handler: None,
+            cancel_stream_handler: None,
+            close_stream_handler: None,
+            stream_error_handler: None,
         }
     }
 
@@ -673,6 +744,59 @@ impl SimplePlugin {
             + 'static,
     {
         self.mesh_event_handler = Some(Arc::new(handler));
+        self
+    }
+
+    pub fn on_open_stream<F>(mut self, handler: F) -> Self
+    where
+        F: for<'a, 'ctx> Fn(
+                proto::OpenStreamRequest,
+                &'a mut PluginContext<'ctx>,
+            ) -> OpenStreamFuture<'a>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.open_stream_handler = Some(Arc::new(handler));
+        self
+    }
+
+    pub fn on_cancel_stream<F>(mut self, handler: F) -> Self
+    where
+        F: for<'a, 'ctx> Fn(
+                proto::CancelStreamNotification,
+                &'a mut PluginContext<'ctx>,
+            ) -> InitFuture<'a>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.cancel_stream_handler = Some(Arc::new(handler));
+        self
+    }
+
+    pub fn on_close_stream<F>(mut self, handler: F) -> Self
+    where
+        F: for<'a, 'ctx> Fn(
+                proto::CloseStreamNotification,
+                &'a mut PluginContext<'ctx>,
+            ) -> InitFuture<'a>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.close_stream_handler = Some(Arc::new(handler));
+        self
+    }
+
+    pub fn on_stream_error<F>(mut self, handler: F) -> Self
+    where
+        F: for<'a, 'ctx> Fn(proto::StreamError, &'a mut PluginContext<'ctx>) -> InitFuture<'a>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.stream_error_handler = Some(Arc::new(handler));
         self
     }
 }
@@ -940,6 +1064,50 @@ impl Plugin for SimplePlugin {
             None => Ok(()),
         }
     }
+
+    async fn open_stream(
+        &mut self,
+        request: proto::OpenStreamRequest,
+        context: &mut PluginContext<'_>,
+    ) -> PluginResult<Option<proto::OpenStreamResponse>> {
+        match &self.open_stream_handler {
+            Some(handler) => handler(request, context).await,
+            None => Ok(None),
+        }
+    }
+
+    async fn on_cancel_stream(
+        &mut self,
+        notification: proto::CancelStreamNotification,
+        context: &mut PluginContext<'_>,
+    ) -> Result<()> {
+        match &self.cancel_stream_handler {
+            Some(handler) => handler(notification, context).await,
+            None => Ok(()),
+        }
+    }
+
+    async fn on_close_stream(
+        &mut self,
+        notification: proto::CloseStreamNotification,
+        context: &mut PluginContext<'_>,
+    ) -> Result<()> {
+        match &self.close_stream_handler {
+            Some(handler) => handler(notification, context).await,
+            None => Ok(()),
+        }
+    }
+
+    async fn on_stream_error(
+        &mut self,
+        error: proto::StreamError,
+        context: &mut PluginContext<'_>,
+    ) -> Result<()> {
+        match &self.stream_error_handler {
+            Some(handler) => handler(error, context).await,
+            None => Ok(()),
+        }
+    }
 }
 
 pub struct PluginRuntime;
@@ -1089,6 +1257,59 @@ impl PluginRuntime {
                         plugin_id: &plugin_id,
                     };
                     plugin.on_mesh_event(event, &mut context).await?;
+                }
+                Some(proto::envelope::Payload::OpenStreamRequest(request)) => {
+                    let payload = {
+                        let mut context = PluginContext {
+                            stream: &mut stream,
+                            plugin_id: &plugin_id,
+                        };
+                        match plugin.open_stream(request, &mut context).await {
+                            Ok(Some(response)) => {
+                                proto::envelope::Payload::OpenStreamResponse(response)
+                            }
+                            Ok(None) => proto::envelope::Payload::ErrorResponse(
+                                PluginError::method_not_found(
+                                    "Unsupported stream control message 'open_stream'",
+                                )
+                                .into_error_response(),
+                            ),
+                            Err(err) => {
+                                proto::envelope::Payload::ErrorResponse(err.into_error_response())
+                            }
+                        }
+                    };
+                    write_envelope(
+                        &mut stream,
+                        &proto::Envelope {
+                            protocol_version: PROTOCOL_VERSION,
+                            plugin_id: plugin_id.clone(),
+                            request_id,
+                            payload: Some(payload),
+                        },
+                    )
+                    .await?;
+                }
+                Some(proto::envelope::Payload::CancelStreamNotification(notification)) => {
+                    let mut context = PluginContext {
+                        stream: &mut stream,
+                        plugin_id: &plugin_id,
+                    };
+                    plugin.on_cancel_stream(notification, &mut context).await?;
+                }
+                Some(proto::envelope::Payload::CloseStreamNotification(notification)) => {
+                    let mut context = PluginContext {
+                        stream: &mut stream,
+                        plugin_id: &plugin_id,
+                    };
+                    plugin.on_close_stream(notification, &mut context).await?;
+                }
+                Some(proto::envelope::Payload::StreamError(error)) => {
+                    let mut context = PluginContext {
+                        stream: &mut stream,
+                        plugin_id: &plugin_id,
+                    };
+                    plugin.on_stream_error(error, &mut context).await?;
                 }
                 Some(proto::envelope::Payload::ErrorResponse(error)) => {
                     let mut context = PluginContext {

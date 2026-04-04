@@ -365,6 +365,28 @@ impl PluginManager {
         infos
     }
 
+    pub async fn manifest(&self, plugin_name: &str) -> Result<Option<proto::PluginManifest>> {
+        if self.is_test_bridge_enabled(plugin_name) {
+            bail!(
+                "Plugin '{}' does not expose a manifest in bridge mode",
+                plugin_name
+            );
+        }
+        if let Some(summary) = self.inner.inactive.get(plugin_name) {
+            bail!(
+                "Plugin '{}' is disabled: {}",
+                plugin_name,
+                summary.error.as_deref().unwrap_or("unavailable")
+            );
+        }
+        let plugin = self
+            .inner
+            .plugins
+            .get(plugin_name)
+            .with_context(|| format!("Unknown plugin '{plugin_name}'"))?;
+        plugin.manifest().await
+    }
+
     pub async fn set_rpc_bridge(&self, bridge: Option<Arc<dyn PluginRpcBridge>>) {
         *self.inner.rpc_bridge.lock().await = bridge;
     }
@@ -402,6 +424,110 @@ impl PluginManager {
             plugin.send_mesh_event(event.clone()).await?;
         }
         Ok(())
+    }
+
+    pub async fn open_stream(
+        &self,
+        plugin_name: &str,
+        request: proto::OpenStreamRequest,
+    ) -> Result<proto::OpenStreamResponse> {
+        if self.is_test_bridge_enabled(plugin_name) {
+            bail!(
+                "Plugin '{}' does not support stream control in bridge mode",
+                plugin_name
+            );
+        }
+        if let Some(summary) = self.inner.inactive.get(plugin_name) {
+            bail!(
+                "Plugin '{}' is disabled: {}",
+                plugin_name,
+                summary.error.as_deref().unwrap_or("unavailable")
+            );
+        }
+        let plugin = self
+            .inner
+            .plugins
+            .get(plugin_name)
+            .with_context(|| format!("Unknown plugin '{plugin_name}'"))?;
+        plugin.open_stream(request).await
+    }
+
+    pub async fn cancel_stream(
+        &self,
+        plugin_name: &str,
+        notification: proto::CancelStreamNotification,
+    ) -> Result<()> {
+        if self.is_test_bridge_enabled(plugin_name) {
+            bail!(
+                "Plugin '{}' does not support stream control in bridge mode",
+                plugin_name
+            );
+        }
+        if let Some(summary) = self.inner.inactive.get(plugin_name) {
+            bail!(
+                "Plugin '{}' is disabled: {}",
+                plugin_name,
+                summary.error.as_deref().unwrap_or("unavailable")
+            );
+        }
+        let plugin = self
+            .inner
+            .plugins
+            .get(plugin_name)
+            .with_context(|| format!("Unknown plugin '{plugin_name}'"))?;
+        plugin.cancel_stream(notification).await
+    }
+
+    pub async fn close_stream(
+        &self,
+        plugin_name: &str,
+        notification: proto::CloseStreamNotification,
+    ) -> Result<()> {
+        if self.is_test_bridge_enabled(plugin_name) {
+            bail!(
+                "Plugin '{}' does not support stream control in bridge mode",
+                plugin_name
+            );
+        }
+        if let Some(summary) = self.inner.inactive.get(plugin_name) {
+            bail!(
+                "Plugin '{}' is disabled: {}",
+                plugin_name,
+                summary.error.as_deref().unwrap_or("unavailable")
+            );
+        }
+        let plugin = self
+            .inner
+            .plugins
+            .get(plugin_name)
+            .with_context(|| format!("Unknown plugin '{plugin_name}'"))?;
+        plugin.close_stream(notification).await
+    }
+
+    pub async fn report_stream_error(
+        &self,
+        plugin_name: &str,
+        error: proto::StreamError,
+    ) -> Result<()> {
+        if self.is_test_bridge_enabled(plugin_name) {
+            bail!(
+                "Plugin '{}' does not support stream control in bridge mode",
+                plugin_name
+            );
+        }
+        if let Some(summary) = self.inner.inactive.get(plugin_name) {
+            bail!(
+                "Plugin '{}' is disabled: {}",
+                plugin_name,
+                summary.error.as_deref().unwrap_or("unavailable")
+            );
+        }
+        let plugin = self
+            .inner
+            .plugins
+            .get(plugin_name)
+            .with_context(|| format!("Unknown plugin '{plugin_name}'"))?;
+        plugin.report_stream_error(error).await
     }
 
     fn start_supervisor(&self) {

@@ -381,6 +381,25 @@ impl ExternalPlugin {
         Ok(self.manifest.lock().await.clone())
     }
 
+    pub(crate) async fn open_stream(
+        &self,
+        request: proto::OpenStreamRequest,
+    ) -> Result<proto::OpenStreamResponse> {
+        let response = self
+            .request(proto::envelope::Payload::OpenStreamRequest(request))
+            .await?;
+        match response.payload {
+            Some(proto::envelope::Payload::OpenStreamResponse(resp)) => Ok(resp),
+            Some(proto::envelope::Payload::ErrorResponse(err)) => {
+                Err(plugin_error(&self.spec.name, "open_stream", &err))
+            }
+            _ => bail!(
+                "Plugin '{}' returned an unexpected payload for 'open_stream'",
+                self.spec.name
+            ),
+        }
+    }
+
     pub(crate) async fn list_tools(&self) -> Result<Vec<ToolSummary>> {
         let info = self.server_info().await?;
         if info.capabilities.tools.is_none() {
@@ -490,6 +509,36 @@ impl ExternalPlugin {
     pub(crate) async fn send_mesh_event(&self, event: proto::MeshEvent) -> Result<()> {
         self.send_unsolicited(proto::envelope::Payload::MeshEvent(event), "mesh events")
             .await
+    }
+
+    pub(crate) async fn cancel_stream(
+        &self,
+        notification: proto::CancelStreamNotification,
+    ) -> Result<()> {
+        self.send_unsolicited(
+            proto::envelope::Payload::CancelStreamNotification(notification),
+            "stream cancellation notifications",
+        )
+        .await
+    }
+
+    pub(crate) async fn close_stream(
+        &self,
+        notification: proto::CloseStreamNotification,
+    ) -> Result<()> {
+        self.send_unsolicited(
+            proto::envelope::Payload::CloseStreamNotification(notification),
+            "stream close notifications",
+        )
+        .await
+    }
+
+    pub(crate) async fn report_stream_error(&self, error: proto::StreamError) -> Result<()> {
+        self.send_unsolicited(
+            proto::envelope::Payload::StreamError(error),
+            "stream errors",
+        )
+        .await
     }
 
     async fn request(&self, payload: proto::envelope::Payload) -> Result<proto::Envelope> {
