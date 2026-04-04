@@ -485,12 +485,28 @@ def preflight_models(
         "status": "running",
         "total_models": len(required_refs),
         "completed_models": 0,
+        "current_backend": None,
+        "current_model_ref": None,
+        "failed_backend": None,
+        "failed_model_ref": None,
+        "failure": None,
         "items": [],
     }
     write_json(out_path, state)
 
     for backend, model_ref in required_refs:
-        local_path = download_model_ref(model_ref, backend)
+        state["current_backend"] = backend
+        state["current_model_ref"] = model_ref
+        write_json(out_path, state)
+        try:
+            local_path = download_model_ref(model_ref, backend)
+        except Exception as exc:
+            state["status"] = "failed"
+            state["failed_backend"] = backend
+            state["failed_model_ref"] = model_ref
+            state["failure"] = str(exc)
+            write_json(out_path, state)
+            raise
         resolved[(backend, model_ref)] = local_path
         state["items"].append(
             {
@@ -503,6 +519,8 @@ def preflight_models(
         write_json(out_path, state)
 
     state["status"] = "completed"
+    state["current_backend"] = None
+    state["current_model_ref"] = None
     write_json(out_path, state)
     return resolved
 
