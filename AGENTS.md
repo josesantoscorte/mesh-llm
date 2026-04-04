@@ -140,6 +140,28 @@ For changes in `mesh-llm/ui/`, use components and compose interfaces consistentl
 
 Read `mesh-llm/docs/TESTING.md` before running tests. It has all test scenarios, remote deploy instructions, and cleanup commands.
 
+## Validation Baselines
+
+If the bundled `llama.cpp` source, branch pin, or effective build commit changes,
+rerun the checked-in validation matrix and compare the new results to the
+checked-in baseline data under `testdata/validation/` before treating the new
+build as equivalent.
+
+At minimum, rerun the canonical GGUF side:
+
+```bash
+python3 scripts/run-validation-matrix.py --backend gguf --skip-build --stamp <stamp>
+```
+
+Review:
+
+- `MLX_VALIDATION_RESULTS/<stamp>/exact-baseline-comparison.tsv`
+- `MLX_VALIDATION_RESULTS/<stamp>/behavior-baseline-comparison.tsv`
+- `MLX_VALIDATION_RESULTS/<stamp>/parity-vs-canonical-baseline.tsv`
+
+Do not silently assume `llama.cpp` changes preserve serving behavior, even when
+the Rust code is unchanged.
+
 ## Command Concurrency
 
 Do not run Rust build, test, or format commands in parallel in the same worktree.

@@ -62,6 +62,7 @@ See `tests/test_reasoning_compat.sh` for the contract tests validating this beha
 
 ## MLX / GGUF Parity
 - [ ] **CI strategy for parity matrix**: Decide how the reproducible GGUF vs MLX parity suite and behavior suite should run in CI (PR vs nightly vs manual, artifact retention, model scope, and machine requirements) so local validation can become repeatable regression coverage.
+- [ ] **Comparable backend performance runs**: Add a sequential GGUF-vs-MLX performance mode for machines that support both backends, run the same prompts three times per backend to expose KV-cache effects, and compare the live results without checking them into any baseline.
 
 ## Smart Router
 - Design: [MULTI_MODAL.md](docs/MULTI_MODAL.md)

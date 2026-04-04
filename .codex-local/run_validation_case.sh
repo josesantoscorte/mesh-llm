@@ -11,12 +11,11 @@ BACKEND="$1"
 CASE_ID="$2"
 shift 2
 
-ROOT="${VALIDATION_RESULTS_ROOT:-$PWD/MLX_VALIDATION_RESULTS}"
+ROOT="${VALIDATION_RESULTS_ROOT:-/Users/jdumay/.codex/worktrees/e497/mesh-llm/MLX_VALIDATION_RESULTS}"
 STAMP="${VALIDATION_RESULTS_STAMP:-$(date +%Y%m%d-%H%M%S)}"
 CASE_DIR="$ROOT/$STAMP/$CASE_ID"
 
 mkdir -p "$CASE_DIR"
-export VALIDATION_CASE_DIR="$CASE_DIR"
 
 printf '%s\n' "$BACKEND" > "$CASE_DIR/backend.txt"
 printf '%s\n' "$CASE_ID" > "$CASE_DIR/case.txt"

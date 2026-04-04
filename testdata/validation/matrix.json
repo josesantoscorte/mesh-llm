@@ -15,6 +15,53 @@
           "label": "alt-red",
           "prompt": "Reply with exactly: red",
           "expect_exact": "red"
+        },
+        {
+          "label": "capital-france",
+          "prompt": "What is the capital of France? Reply with one word.",
+          "expect_contains_ci": "Paris"
+        },
+        {
+          "label": "primary-colors",
+          "prompt": "List the RGB primary colors using only comma-separated words.",
+          "max_tokens": 24,
+          "expect_contains_all_ci": [
+            "red",
+            "green",
+            "blue"
+          ]
+        },
+        {
+          "label": "two-plus-two",
+          "prompt": "What is 2 + 2? Reply with digits only.",
+          "max_tokens": 8,
+          "expect_contains_ci": "4"
+        },
+        {
+          "label": "largest-planet",
+          "prompt": "Name the largest planet in the Solar System. Reply with one word.",
+          "expect_contains_ci": "Jupiter"
+        },
+        {
+          "label": "breathing-gas",
+          "prompt": "What gas do humans need to breathe to survive? Reply with one word.",
+          "max_tokens": 12,
+          "expect_contains_ci": "oxygen"
+        },
+        {
+          "label": "opposite-hot",
+          "prompt": "What is the opposite of hot? Reply with one word.",
+          "expect_contains_ci": "cold"
+        },
+        {
+          "label": "banana-color",
+          "prompt": "What color is a ripe banana? Reply with one word.",
+          "expect_contains_ci": "yellow"
+        },
+        {
+          "label": "after-monday",
+          "prompt": "What day comes after Monday? Reply with one word.",
+          "expect_contains_ci": "Tuesday"
         }
       ]
     },

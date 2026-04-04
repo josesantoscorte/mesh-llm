@@ -16,6 +16,22 @@ for the GGUF and MLX backends.
   - `GGUF` is the canonical baseline.
   - `MLX` baselines are tracked secondarily for backend self-consistency.
 
+## Runtime artifacts
+
+Each validation run writes local artifacts under `MLX_VALIDATION_RESULTS/<stamp>/`.
+
+For exact runs, each case directory now includes:
+
+- `stdout.log`, `stderr.log`, `mesh.log`
+- `chat/<label>.json`
+  - the prompt text
+  - the exact request payload
+  - the raw response payload
+  - parsed content and finish reason
+  - the expectations applied to that prompt
+- `models/v1-models.json`
+  - the raw `/v1/models` response captured at the end of the case
+
 ## Strategy
 
 The validation system has two suites:

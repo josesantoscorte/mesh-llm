@@ -22,6 +22,10 @@ Outputs:
 - raw logs per case:
   - `MLX_VALIDATION_RESULTS/<stamp>/exact/<case-id>/`
   - `MLX_VALIDATION_RESULTS/<stamp>/behavior/<case-id>/`
+- per-prompt raw request/response artifacts for exact runs:
+  - `MLX_VALIDATION_RESULTS/<stamp>/exact/<case-id>/chat/<label>.json`
+- raw `/v1/models` payload for exact runs:
+  - `MLX_VALIDATION_RESULTS/<stamp>/exact/<case-id>/models/v1-models.json`
 
 Useful options:
 
