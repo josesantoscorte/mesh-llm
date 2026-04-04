@@ -80,6 +80,7 @@ pub struct FeedRequest {
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 pub struct SearchRequest {
+    #[serde(alias = "q")]
     pub query: String,
     #[serde(default)]
     pub since: u64,

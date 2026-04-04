@@ -437,7 +437,18 @@ fn query_arguments(path: &str) -> Map<String, Value> {
         return args;
     };
     for (key, value) in form_urlencoded::parse(query.as_bytes()) {
-        args.insert(key.into_owned(), Value::String(value.into_owned()));
+        let json_value = if value == "true" {
+            Value::Bool(true)
+        } else if value == "false" {
+            Value::Bool(false)
+        } else if let Ok(n) = value.parse::<i64>() {
+            Value::Number(n.into())
+        } else if let Ok(f) = value.parse::<f64>() {
+            Value::Number(serde_json::Number::from_f64(f).unwrap_or(0i64.into()))
+        } else {
+            Value::String(value.into_owned())
+        };
+        args.insert(key.into_owned(), json_value);
     }
     args
 }
@@ -463,7 +474,7 @@ mod tests {
     fn query_arguments_decode_values() {
         let args = query_arguments("/api/plugins/demo/http/feed?name=hello%20world&limit=10");
         assert_eq!(args.get("name"), Some(&Value::String("hello world".into())));
-        assert_eq!(args.get("limit"), Some(&Value::String("10".into())));
+        assert_eq!(args.get("limit"), Some(&Value::Number(10.into())));
     }
 
     #[test]

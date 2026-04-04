@@ -124,8 +124,8 @@ impl plugin::PluginRpcBridge for BlobstoreTestBridge {
                 let request: mesh_llm_plugin::ToolCallRequest = serde_json::from_str(&params_json)
                     .map_err(|err| Self::error_response(err.to_string()))?;
                 let result_json = match request.name.as_str() {
-                    plugin::blobstore::PUT_REQUEST_OBJECT_TOOL => {
-                        let request: plugin::blobstore::PutRequestObjectRequest =
+                    crate::plugins::blobstore::PUT_REQUEST_OBJECT_TOOL => {
+                        let request: crate::plugins::blobstore::PutRequestObjectRequest =
                             serde_json::from_value(request.arguments)
                                 .map_err(|err| Self::error_response(err.to_string()))?;
                         let response = store
@@ -136,8 +136,8 @@ impl plugin::PluginRpcBridge for BlobstoreTestBridge {
                         serde_json::to_string(&rmcp::model::CallToolResult::structured(value))
                             .map_err(|err| Self::error_response(err.to_string()))?
                     }
-                    plugin::blobstore::GET_REQUEST_OBJECT_TOOL => {
-                        let request: plugin::blobstore::GetRequestObjectRequest =
+                    crate::plugins::blobstore::GET_REQUEST_OBJECT_TOOL => {
+                        let request: crate::plugins::blobstore::GetRequestObjectRequest =
                             serde_json::from_value(request.arguments)
                                 .map_err(|err| Self::error_response(err.to_string()))?;
                         let response = store
@@ -148,9 +148,9 @@ impl plugin::PluginRpcBridge for BlobstoreTestBridge {
                         serde_json::to_string(&rmcp::model::CallToolResult::structured(value))
                             .map_err(|err| Self::error_response(err.to_string()))?
                     }
-                    plugin::blobstore::COMPLETE_REQUEST_TOOL
-                    | plugin::blobstore::ABORT_REQUEST_TOOL => {
-                        let request: plugin::blobstore::FinishRequestRequest =
+                    crate::plugins::blobstore::COMPLETE_REQUEST_TOOL
+                    | crate::plugins::blobstore::ABORT_REQUEST_TOOL => {
+                        let request: crate::plugins::blobstore::FinishRequestRequest =
                             serde_json::from_value(request.arguments)
                                 .map_err(|err| Self::error_response(err.to_string()))?;
                         let response = store
@@ -172,8 +172,8 @@ impl plugin::PluginRpcBridge for BlobstoreTestBridge {
             }
 
             let result_json = match method.as_str() {
-                plugin::blobstore::PUT_REQUEST_OBJECT_METHOD => {
-                    let request: plugin::blobstore::PutRequestObjectRequest =
+                crate::plugins::blobstore::PUT_REQUEST_OBJECT_METHOD => {
+                    let request: crate::plugins::blobstore::PutRequestObjectRequest =
                         serde_json::from_str(&params_json)
                             .map_err(|err| Self::error_response(err.to_string()))?;
                     let response = store
@@ -182,8 +182,8 @@ impl plugin::PluginRpcBridge for BlobstoreTestBridge {
                     serde_json::to_string(&response)
                         .map_err(|err| Self::error_response(err.to_string()))?
                 }
-                plugin::blobstore::GET_REQUEST_OBJECT_METHOD => {
-                    let request: plugin::blobstore::GetRequestObjectRequest =
+                crate::plugins::blobstore::GET_REQUEST_OBJECT_METHOD => {
+                    let request: crate::plugins::blobstore::GetRequestObjectRequest =
                         serde_json::from_str(&params_json)
                             .map_err(|err| Self::error_response(err.to_string()))?;
                     let response = store
@@ -192,8 +192,8 @@ impl plugin::PluginRpcBridge for BlobstoreTestBridge {
                     serde_json::to_string(&response)
                         .map_err(|err| Self::error_response(err.to_string()))?
                 }
-                plugin::blobstore::COMPLETE_REQUEST_METHOD => {
-                    let request: plugin::blobstore::FinishRequestRequest =
+                crate::plugins::blobstore::COMPLETE_REQUEST_METHOD => {
+                    let request: crate::plugins::blobstore::FinishRequestRequest =
                         serde_json::from_str(&params_json)
                             .map_err(|err| Self::error_response(err.to_string()))?;
                     let response = store
@@ -202,8 +202,8 @@ impl plugin::PluginRpcBridge for BlobstoreTestBridge {
                     serde_json::to_string(&response)
                         .map_err(|err| Self::error_response(err.to_string()))?
                 }
-                plugin::blobstore::ABORT_REQUEST_METHOD => {
-                    let request: plugin::blobstore::FinishRequestRequest =
+                crate::plugins::blobstore::ABORT_REQUEST_METHOD => {
+                    let request: crate::plugins::blobstore::FinishRequestRequest =
                         serde_json::from_str(&params_json)
                             .map_err(|err| Self::error_response(err.to_string()))?;
                     let response = store
@@ -574,9 +574,9 @@ async fn test_api_proxy_integration_chunked_body() {
 #[tokio::test]
 async fn test_api_proxy_rewrites_image_blob_url_to_data_url() {
     let (plugin_manager, blobstore_root) = start_blobstore_plugin_manager().await;
-    let put = plugin::blobstore::put_request_object(
+    let put = crate::plugins::blobstore::put_request_object(
         &plugin_manager,
-        plugin::blobstore::PutRequestObjectRequest {
+        crate::plugins::blobstore::PutRequestObjectRequest {
             request_id: "req-image-smoke".into(),
             mime_type: "image/png".into(),
             file_name: Some("smoke.png".into()),
@@ -622,9 +622,9 @@ async fn test_api_proxy_rewrites_image_blob_url_to_data_url() {
     assert!(response.starts_with("HTTP/1.1 200 OK"));
     assert!(raw.contains("data:image/png;base64,aGVsbG8="));
     assert!(!raw.contains(&format!("mesh://blob/{client_id}/{}", put.token)));
-    assert!(plugin::blobstore::get_request_object(
+    assert!(crate::plugins::blobstore::get_request_object(
         &plugin_manager,
-        plugin::blobstore::GetRequestObjectRequest {
+        crate::plugins::blobstore::GetRequestObjectRequest {
             token: put.token.clone(),
             request_id: Some("req-image-smoke".into()),
         },
@@ -642,9 +642,9 @@ async fn test_blobstore_helper_resolves_object_store_capability() {
     let (plugin_manager, blobstore_root) =
         start_blobstore_plugin_manager_for("alt-store", vec!["object-store.v1".into()]).await;
 
-    let response = plugin::blobstore::put_request_object(
+    let response = crate::plugins::blobstore::put_request_object(
         &plugin_manager,
-        plugin::blobstore::PutRequestObjectRequest {
+        crate::plugins::blobstore::PutRequestObjectRequest {
             request_id: "req-capability".into(),
             mime_type: "text/plain".into(),
             file_name: Some("note.txt".into()),
@@ -795,9 +795,9 @@ async fn test_api_proxy_lemonade_integration_when_enabled() {
 #[tokio::test]
 async fn test_api_proxy_rewrites_audio_blob_url_to_data_url() {
     let (plugin_manager, blobstore_root) = start_blobstore_plugin_manager().await;
-    let put = plugin::blobstore::put_request_object(
+    let put = crate::plugins::blobstore::put_request_object(
         &plugin_manager,
-        plugin::blobstore::PutRequestObjectRequest {
+        crate::plugins::blobstore::PutRequestObjectRequest {
             request_id: "req-audio-smoke".into(),
             mime_type: "audio/wav".into(),
             file_name: Some("smoke.wav".into()),
@@ -843,9 +843,9 @@ async fn test_api_proxy_rewrites_audio_blob_url_to_data_url() {
     assert!(response.starts_with("HTTP/1.1 200 OK"));
     assert!(raw.contains("data:audio/wav;base64,UklGRg=="));
     assert!(!raw.contains(&format!("mesh://blob/{client_id}/{}", put.token)));
-    assert!(plugin::blobstore::get_request_object(
+    assert!(crate::plugins::blobstore::get_request_object(
         &plugin_manager,
-        plugin::blobstore::GetRequestObjectRequest {
+        crate::plugins::blobstore::GetRequestObjectRequest {
             token: put.token.clone(),
             request_id: Some("req-audio-smoke".into()),
         },
@@ -861,9 +861,9 @@ async fn test_api_proxy_rewrites_audio_blob_url_to_data_url() {
 #[tokio::test]
 async fn test_api_proxy_rewrites_input_audio_blob_url_to_inline_audio() {
     let (plugin_manager, blobstore_root) = start_blobstore_plugin_manager().await;
-    let put = plugin::blobstore::put_request_object(
+    let put = crate::plugins::blobstore::put_request_object(
         &plugin_manager,
-        plugin::blobstore::PutRequestObjectRequest {
+        crate::plugins::blobstore::PutRequestObjectRequest {
             request_id: "req-input-audio-smoke".into(),
             mime_type: "audio/wav".into(),
             file_name: Some("smoke.wav".into()),
@@ -912,9 +912,9 @@ async fn test_api_proxy_rewrites_input_audio_blob_url_to_inline_audio() {
     assert!(raw.contains(r#""format":"wav""#));
     assert!(raw.contains(r#""mime_type":"audio/wav""#));
     assert!(!raw.contains(&format!("mesh://blob/{client_id}/{}", put.token)));
-    assert!(plugin::blobstore::get_request_object(
+    assert!(crate::plugins::blobstore::get_request_object(
         &plugin_manager,
-        plugin::blobstore::GetRequestObjectRequest {
+        crate::plugins::blobstore::GetRequestObjectRequest {
             token: put.token.clone(),
             request_id: Some("req-input-audio-smoke".into()),
         },
@@ -930,9 +930,9 @@ async fn test_api_proxy_rewrites_input_audio_blob_url_to_inline_audio() {
 #[tokio::test]
 async fn test_api_proxy_translates_responses_image_request() {
     let (plugin_manager, blobstore_root) = start_blobstore_plugin_manager().await;
-    let put = plugin::blobstore::put_request_object(
+    let put = crate::plugins::blobstore::put_request_object(
         &plugin_manager,
-        plugin::blobstore::PutRequestObjectRequest {
+        crate::plugins::blobstore::PutRequestObjectRequest {
             request_id: "req-responses-image".into(),
             mime_type: "image/png".into(),
             file_name: Some("smoke.png".into()),
@@ -1008,9 +1008,9 @@ async fn test_api_proxy_translates_responses_image_request() {
 #[tokio::test]
 async fn test_api_proxy_translates_responses_audio_request() {
     let (plugin_manager, blobstore_root) = start_blobstore_plugin_manager().await;
-    let put = plugin::blobstore::put_request_object(
+    let put = crate::plugins::blobstore::put_request_object(
         &plugin_manager,
-        plugin::blobstore::PutRequestObjectRequest {
+        crate::plugins::blobstore::PutRequestObjectRequest {
             request_id: "req-responses-audio".into(),
             mime_type: "audio/wav".into(),
             file_name: Some("smoke.wav".into()),

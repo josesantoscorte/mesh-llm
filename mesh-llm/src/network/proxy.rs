@@ -842,7 +842,7 @@ async fn resolve_request_object_references(
     };
 
     let mut request_ids = Vec::new();
-    let mut blob_cache: HashMap<String, plugin::blobstore::GetRequestObjectResponse> =
+    let mut blob_cache: HashMap<String, crate::plugins::blobstore::GetRequestObjectResponse> =
         HashMap::new();
     for message in messages.iter_mut() {
         let Some(blocks) = message
@@ -858,9 +858,9 @@ async fn resolve_request_object_references(
             let blob = if let Some(cached) = blob_cache.get(&token) {
                 cached.clone()
             } else {
-                let fetched = plugin::blobstore::get_request_object(
+                let fetched = crate::plugins::blobstore::get_request_object(
                     plugin_manager,
-                    plugin::blobstore::GetRequestObjectRequest {
+                    crate::plugins::blobstore::GetRequestObjectRequest {
                         token: token.clone(),
                         request_id: request_id.clone(),
                     },
@@ -932,9 +932,9 @@ pub async fn release_request_objects(node: &mesh::Node, request_ids: &[String]) 
         return;
     };
     for request_id in request_ids {
-        if let Err(err) = plugin::blobstore::complete_request(
+        if let Err(err) = crate::plugins::blobstore::complete_request(
             &plugin_manager,
-            plugin::blobstore::FinishRequestRequest {
+            crate::plugins::blobstore::FinishRequestRequest {
                 request_id: request_id.clone(),
             },
         )

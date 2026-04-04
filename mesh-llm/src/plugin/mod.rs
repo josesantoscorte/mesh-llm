@@ -1,4 +1,3 @@
-pub mod blobstore;
 mod config;
 pub(crate) mod mcp;
 mod runtime;

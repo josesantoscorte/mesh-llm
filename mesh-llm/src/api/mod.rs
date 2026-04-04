@@ -1018,7 +1018,7 @@ mod tests {
     use super::*;
     use crate::api::status::decode_runtime_model_path;
     use crate::plugin;
-    use crate::plugins::{blackboard, blobstore::BlobStore};
+    use crate::plugins::{blackboard, blobstore};
     use mesh_llm_plugin::MeshVisibility;
     use rmcp::model::ErrorCode;
     use serde_json::json;
@@ -1325,7 +1325,7 @@ mod tests {
     #[derive(Clone)]
     struct BlobstoreApiTestBridge {
         plugin_name: String,
-        store: BlobStore,
+        store: blobstore::BlobStore,
     }
 
     #[derive(Clone)]
@@ -1380,8 +1380,8 @@ mod tests {
                 let request: mesh_llm_plugin::ToolCallRequest = serde_json::from_str(&params_json)
                     .map_err(|err| Self::error_response(err.to_string()))?;
                 let result_json = match request.name.as_str() {
-                    plugin::blobstore::PUT_REQUEST_OBJECT_TOOL => {
-                        let request: plugin::blobstore::PutRequestObjectRequest =
+                    blobstore::PUT_REQUEST_OBJECT_TOOL => {
+                        let request: blobstore::PutRequestObjectRequest =
                             serde_json::from_value(request.arguments)
                                 .map_err(|err| Self::error_response(err.to_string()))?;
                         let response = store
@@ -1393,9 +1393,8 @@ mod tests {
                         ))
                         .map_err(|err| Self::error_response(err.to_string()))?
                     }
-                    plugin::blobstore::COMPLETE_REQUEST_TOOL
-                    | plugin::blobstore::ABORT_REQUEST_TOOL => {
-                        let request: plugin::blobstore::FinishRequestRequest =
+                    blobstore::COMPLETE_REQUEST_TOOL | blobstore::ABORT_REQUEST_TOOL => {
+                        let request: blobstore::FinishRequestRequest =
                             serde_json::from_value(request.arguments)
                                 .map_err(|err| Self::error_response(err.to_string()))?;
                         let response = store
@@ -1535,7 +1534,7 @@ mod tests {
         let root = temp_blobstore_root("blobstore");
         let bridge = BlobstoreApiTestBridge {
             plugin_name: plugin_name.into(),
-            store: BlobStore::new(root.clone()),
+            store: blobstore::BlobStore::new(root.clone()),
         };
         let plugin_manager =
             plugin::PluginManager::for_test_bridge(&[plugin_name], Arc::new(bridge));
@@ -1543,7 +1542,7 @@ mod tests {
         manifests.insert(
             plugin_name.to_string(),
             mesh_llm_plugin::plugin_manifest![mesh_llm_plugin::capability(
-                plugin::blobstore::OBJECT_STORE_CAPABILITY
+                blobstore::OBJECT_STORE_CAPABILITY
             ),],
         );
         plugin_manager
@@ -1563,9 +1562,12 @@ mod tests {
         let mut manifests = HashMap::new();
         manifests.insert(
             plugin_name.to_string(),
-            mesh_llm_plugin::plugin_manifest![mesh_llm_plugin::capability(
-                plugin::BLACKBOARD_CAPABILITY
-            ),],
+            mesh_llm_plugin::plugin_manifest![
+                mesh_llm_plugin::capability(plugin::BLACKBOARD_CAPABILITY),
+                mesh_llm_plugin::http_get("/feed", "feed"),
+                mesh_llm_plugin::http_get("/search", "search"),
+                mesh_llm_plugin::http_post("/post", "post"),
+            ],
         );
         plugin_manager
             .set_test_manifests(manifests.into_iter().collect())

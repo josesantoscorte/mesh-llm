@@ -2,7 +2,7 @@ use super::super::{
     http::{respond_error, respond_json},
     MeshApi,
 };
-use crate::plugin::blobstore::{
+use crate::plugins::blobstore::{
     abort_request, complete_request, object_store_available, put_request_object,
     FinishRequestRequest, PutRequestObjectRequest,
 };
