@@ -460,6 +460,26 @@ pub fn find_model_path(stem: &str) -> PathBuf {
     canonical_dir.join(&filename)
 }
 
+/// Strip common GGUF quantization suffixes from a lowercased stem.
+/// e.g. "qwen3vl-2b-instruct-q4_k_m" → "qwen3vl-2b-instruct"
+fn strip_quant_suffix(stem: &str) -> &str {
+    // Quant suffixes are typically the last hyphen-separated component:
+    // Q4_K_M, Q8_0, BF16, F16, F32, IQ4_NL, etc.
+    if let Some(pos) = stem.rfind('-') {
+        let suffix = &stem[pos + 1..];
+        // Starts with 'q', 'iq', 'f', or 'bf' followed by a digit → quant suffix
+        let is_quant = suffix.starts_with("q")
+            || suffix.starts_with("iq")
+            || suffix.starts_with("f16")
+            || suffix.starts_with("f32")
+            || suffix.starts_with("bf16");
+        if is_quant {
+            return &stem[..pos];
+        }
+    }
+    stem
+}
+
 pub fn find_mmproj_path(model_name: &str, model_path: &Path) -> Option<PathBuf> {
     if let Some(path) = crate::models::catalog::MODEL_CATALOG
         .iter()
@@ -474,16 +494,22 @@ pub fn find_mmproj_path(model_name: &str, model_path: &Path) -> Option<PathBuf> 
     }
 
     // Scan the model's parent directory for a matching mmproj file.
-    // The mmproj filename must contain both "mmproj" AND a prefix that matches
-    // the model name (e.g. "Qwen3.5-0.8B-mmproj-BF16.gguf" matches model
-    // "Qwen3.5-0.8B" but not "Hermes-2-Pro-Mistral-7B"). This prevents
-    // picking up unrelated mmproj files that happen to sit in the same directory
-    // (common in the legacy ~/.models flat dir).
+    // The mmproj filename must contain both "mmproj" AND a model-name component
+    // that matches the model being loaded. This prevents picking up unrelated
+    // mmproj files that happen to sit in the same directory (common in the
+    // legacy ~/.models flat dir).
+    //
+    // Supported naming patterns:
+    //   <model>-mmproj[-<quant>].gguf   e.g. Qwen3.5-0.8B-mmproj-BF16.gguf
+    //   mmproj-<model>[-<quant>].gguf   e.g. mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf
     let parent = model_path.parent()?;
     let model_stem = model_path
         .file_stem()
         .and_then(|s| s.to_str())
         .map(|s| s.to_ascii_lowercase())?;
+    // Strip the quant suffix from the model stem to get the base model name
+    // e.g. "qwen3vl-2b-instruct-q4_k_m" → "qwen3vl-2b-instruct"
+    let model_base = strip_quant_suffix(&model_stem);
     let mut candidates = std::fs::read_dir(parent)
         .ok()?
         .filter_map(Result::ok)
@@ -498,17 +524,28 @@ pub fn find_mmproj_path(model_name: &str, model_path: &Path) -> Option<PathBuf> 
                     if !lower.contains("mmproj") {
                         return false;
                     }
-                    // Extract the base model name from the mmproj filename
-                    // (everything before "-mmproj" or "_mmproj").
-                    let base = lower
+                    // Try pattern: <model>-mmproj... (model name before mmproj)
+                    if let Some((prefix, _)) = lower
                         .split_once("-mmproj")
                         .or_else(|| lower.split_once("_mmproj"))
-                        .map(|(prefix, _)| prefix)
-                        .unwrap_or(&lower);
-                    // The model stem must start with the mmproj's base name
-                    // so "hermes-2-pro-mistral-7b-q4_k_m" won't match
-                    // "qwen3.5-0.8b" but "qwen3.5-0.8b-q4_k_m" will.
-                    model_stem.starts_with(base)
+                    {
+                        if model_base.starts_with(prefix) || model_stem.starts_with(prefix) {
+                            return true;
+                        }
+                    }
+                    // Try pattern: mmproj-<model>... (model name after mmproj)
+                    if let Some(after) = lower
+                        .strip_prefix("mmproj-")
+                        .or_else(|| lower.strip_prefix("mmproj_"))
+                    {
+                        let mmproj_model_base = strip_quant_suffix(after);
+                        if model_base.starts_with(mmproj_model_base)
+                            || mmproj_model_base.starts_with(model_base)
+                        {
+                            return true;
+                        }
+                    }
+                    false
                 })
                 .unwrap_or(false)
         });
