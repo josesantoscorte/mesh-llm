@@ -120,7 +120,7 @@ async fn wait_for_peer_moe_ranking(
     stop_rx: &mut watch::Receiver<bool>,
     timeout: std::time::Duration,
 ) {
-    if moe::best_shared_ranking_artifact(model_path).is_some() {
+    if provider::best_shared_moe_ranking_artifact_for_model(model_path, None).is_some() {
         return;
     }
 
@@ -146,7 +146,9 @@ async fn wait_for_peer_moe_ranking(
                 if res.is_err() {
                     return;
                 }
-                if let Some(artifact) = moe::best_shared_ranking_artifact(model_path) {
+                if let Some(artifact) =
+                    provider::best_shared_moe_ranking_artifact_for_model(model_path, None)
+                {
                     eprintln!(
                         "  Using imported peer MoE ranking mode={} origin={}",
                         artifact.kind.label(),
@@ -751,7 +753,7 @@ pub async fn election_loop(
             if matches!(
                 moe_runtime_options.ranking_strategy,
                 moe::MoeRankingStrategy::Auto
-            ) && moe::best_shared_ranking_artifact(&model).is_none()
+            ) && provider::best_shared_moe_ranking_artifact_for_model(&model, None).is_none()
             {
                 wait_for_peer_moe_ranking(
                     &model_name,

@@ -1524,6 +1524,7 @@ async fn find_free_port() -> anyhow::Result<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Seek, Write};
     use std::sync::{Mutex, OnceLock};
 
     #[derive(Clone, Copy, Debug, Default)]
@@ -1572,6 +1573,11 @@ mod tests {
     fn provider_registry_test_lock() -> &'static Mutex<()> {
         static TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         TEST_LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn write_gguf_string(file: &mut std::fs::File, value: &str) {
+        file.write_all(&(value.len() as u64).to_le_bytes()).unwrap();
+        file.write_all(value.as_bytes()).unwrap();
     }
 
     fn test_local_descriptor() -> InferenceProviderDescriptor {
@@ -1732,5 +1738,81 @@ mod tests {
         assert!(selection.is_none());
 
         clear_registered_providers_for_tests();
+    }
+
+    #[test]
+    fn builtin_llama_selection_resolves_heuristic_ranking_via_provider() {
+        let _guard = provider_registry_test_lock()
+            .lock()
+            .expect("provider registry test lock poisoned");
+        clear_registered_providers_for_tests();
+
+        let dir = std::env::temp_dir().join(format!(
+            "mesh-llm-provider-heuristic-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("heuristic.gguf");
+
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(b"GGUF").unwrap();
+        file.write_all(&3u32.to_le_bytes()).unwrap();
+        file.write_all(&1i64.to_le_bytes()).unwrap();
+        file.write_all(&3i64.to_le_bytes()).unwrap();
+
+        write_gguf_string(&mut file, "general.alignment");
+        file.write_all(&4u32.to_le_bytes()).unwrap();
+        file.write_all(&32u32.to_le_bytes()).unwrap();
+
+        write_gguf_string(&mut file, "qwen.expert_count");
+        file.write_all(&4u32.to_le_bytes()).unwrap();
+        file.write_all(&4u32.to_le_bytes()).unwrap();
+
+        write_gguf_string(&mut file, "qwen.expert_used_count");
+        file.write_all(&4u32.to_le_bytes()).unwrap();
+        file.write_all(&2u32.to_le_bytes()).unwrap();
+
+        write_gguf_string(&mut file, "blk.0.ffn_gate_inp.weight");
+        file.write_all(&2u32.to_le_bytes()).unwrap();
+        file.write_all(&2i64.to_le_bytes()).unwrap();
+        file.write_all(&4i64.to_le_bytes()).unwrap();
+        file.write_all(&0u32.to_le_bytes()).unwrap();
+        file.write_all(&0u64.to_le_bytes()).unwrap();
+
+        let meta_end = file.stream_position().unwrap();
+        let aligned = ((meta_end + 31) / 32) * 32;
+        if aligned > meta_end {
+            file.write_all(&vec![0u8; (aligned - meta_end) as usize])
+                .unwrap();
+        }
+
+        let values = [3.0f32, 4.0, 0.0, 1.0, 1.0, 1.0, 2.0, 0.0];
+        for value in values {
+            file.write_all(&value.to_le_bytes()).unwrap();
+        }
+        drop(file);
+
+        let (ranking, source, origin) = resolve_heuristic_ranking_for_model(
+            &path,
+            4,
+            crate::inference::moe::HeuristicScoreMethod::MeanL2,
+            None,
+        )
+        .unwrap();
+        assert_eq!(ranking, vec![0, 3, 2, 1]);
+        assert_eq!(source, "heuristic-heuristic");
+        assert_eq!(origin, "local-heuristic");
+
+        let (_, _, cached_origin) = resolve_heuristic_ranking_for_model(
+            &path,
+            4,
+            crate::inference::moe::HeuristicScoreMethod::MeanL2,
+            None,
+        )
+        .unwrap();
+        assert_eq!(cached_origin, "local-heuristic-cache");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
