@@ -200,6 +200,33 @@ pub fn gguf_metadata_cache_path(path: &Path) -> Option<PathBuf> {
     Some(model_metadata_cache_dir().join(format!("{digest:x}.json")))
 }
 
+pub(crate) fn direct_hf_cache_root_gguf_paths(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !(file_type.is_file() || file_type.is_symlink()) {
+            continue;
+        }
+        if path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("gguf"))
+            != Some(true)
+        {
+            continue;
+        }
+        out.push(path);
+    }
+    out.sort();
+    out
+}
+
 fn cache_scanned_file_path(
     cache_root: &Path,
     repo: &hf_hub::cache::CachedRepo,
@@ -245,6 +272,11 @@ fn push_model_name(
 fn scan_hf_cache_models(names: &mut Vec<String>, seen: &mut HashSet<String>, min_size_bytes: u64) {
     let cache = huggingface_hub_cache();
     let cache_root = cache.path().clone();
+
+    for path in direct_hf_cache_root_gguf_paths(&cache_root) {
+        push_model_name(&path, names, seen, min_size_bytes);
+    }
+
     let Ok(cache_info) = CacheInfo::scan_dir(Some(cache.path())) else {
         return;
     };
@@ -678,6 +710,36 @@ mod tests {
 
         restore_env("HOME", prev_home);
         let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    #[serial]
+    fn scan_installed_models_includes_direct_hf_cache_root_files() {
+        let prev_hub_cache = std::env::var_os("HF_HUB_CACHE");
+        let prev_hf_home = std::env::var_os("HF_HOME");
+        let prev_xdg = std::env::var_os("XDG_CACHE_HOME");
+
+        let temp = std::env::temp_dir().join(format!(
+            "mesh-llm-direct-cache-root-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp).unwrap();
+        std::fs::write(temp.join("Direct-Root-Q4_K_M.gguf"), b"gguf").unwrap();
+
+        std::env::set_var("HF_HUB_CACHE", &temp);
+        std::env::remove_var("HF_HOME");
+        std::env::remove_var("XDG_CACHE_HOME");
+
+        let installed = scan_installed_models();
+        assert!(installed.iter().any(|name| name == "Direct-Root-Q4_K_M"));
+
+        let _ = std::fs::remove_dir_all(&temp);
+        restore_env("HF_HUB_CACHE", prev_hub_cache);
+        restore_env("HF_HOME", prev_hf_home);
+        restore_env("XDG_CACHE_HOME", prev_xdg);
     }
 
     fn restore_env(key: &str, value: Option<std::ffi::OsString>) {
