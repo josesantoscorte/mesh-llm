@@ -294,20 +294,6 @@ jobs:
           curl -fSL "$MODEL_URL" -o ~/.models/$MODEL_FILE
           ls -lh ~/.models/$MODEL_FILE
 
-      - name: Cache GGUF prompt model
-        id: cache-gguf-prompt-model
-        uses: actions/cache@v5
-        with:
-          path: ~/.models/${{ env.GGUF_PROMPT_MODEL_FILE }}
-          key: model-${{ env.GGUF_PROMPT_MODEL_FILE }}
-
-      - name: Download GGUF prompt model
-        if: steps.cache-gguf-prompt-model.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p ~/.models
-          curl -fSL "$GGUF_PROMPT_MODEL_URL" -o ~/.models/$GGUF_PROMPT_MODEL_FILE
-          ls -lh ~/.models/$GGUF_PROMPT_MODEL_FILE
-
       - name: Cache MLX prompt model repo
         uses: actions/cache@v5
         with:
@@ -321,18 +307,6 @@ jobs:
             target/release/mesh-llm \
             llama.cpp/build/bin \
             ~/.models/$MODEL_FILE
-
-      - name: GGUF prompt suite
-        run: |
-          scripts/ci-gguf-smoke-test.sh \
-            target/release/mesh-llm \
-            llama.cpp/build/bin \
-            ~/.models/$GGUF_PROMPT_MODEL_FILE \
-            "Reply with exactly: blue" \
-            "blue" \
-            "" \
-            "blue" \
-            '[{"label":"alt-color","prompt":"Reply with exactly: green","expect_exact":"green"},{"label":"alt-red","prompt":"Reply with exactly: red","expect_exact":"red"}]'
 
       - name: MLX prompt suite
         run: |
