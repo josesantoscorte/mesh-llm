@@ -10,6 +10,30 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::process::Command;
 
+/// llama.cpp split mode for distributing tensors across devices.
+///
+/// - `Layer` (default): each device gets a contiguous range of layers.
+///   Works over RPC (network) and local multi-GPU.
+/// - `Row`: weight matrices are sharded across devices (true tensor parallelism).
+///   Only works for local multi-GPU (CUDA, ROCm) — NOT over RPC.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)] // Layer is available for explicit CLI override
+pub enum SplitMode {
+    /// Pipeline parallelism — split by layers (default, works everywhere).
+    Layer,
+    /// Tensor parallelism — split weight rows across local GPUs.
+    Row,
+}
+
+impl SplitMode {
+    fn as_arg(self) -> &'static str {
+        match self {
+            SplitMode::Layer => "layer",
+            SplitMode::Row => "row",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum BinaryFlavor {
     Cpu,
@@ -221,6 +245,7 @@ pub struct ModelLaunchSpec<'a> {
     pub http_port: u16,
     pub tunnel_ports: &'a [u16],
     pub tensor_split: Option<&'a str>,
+    pub split_mode: Option<SplitMode>,
     pub draft: Option<&'a Path>,
     pub draft_max: u16,
     pub model_bytes: u64,
@@ -592,6 +617,7 @@ pub async fn start_llama_server(
     let http_port = spec.http_port;
     let tunnel_ports = spec.tunnel_ports;
     let tensor_split = spec.tensor_split;
+    let split_mode = spec.split_mode;
     let draft = spec.draft;
     let draft_max = spec.draft_max;
     let model_bytes = spec.model_bytes;
@@ -724,6 +750,11 @@ pub async fn start_llama_server(
     if let Some(ts) = tensor_split {
         args.push("--tensor-split".to_string());
         args.push(ts.to_string());
+    }
+    if let Some(mode) = split_mode {
+        args.push("--split-mode".to_string());
+        args.push(mode.as_arg().to_string());
+        tracing::info!("Split mode: {} (tensor parallelism across local GPUs)", mode.as_arg());
     }
     let local_device = resolve_device_for_binary(&llama_server.path, llama_server.flavor, None)?;
     if let Some(draft_path) = draft {

@@ -9,12 +9,37 @@ use crate::inference::{launch, moe};
 use crate::mesh;
 use crate::models;
 use crate::network::tunnel;
+use crate::system::hardware;
+use launch::{BinaryFlavor, SplitMode};
 use mesh::NodeRole;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::watch;
+
+/// Returns `Some(SplitMode::Row)` when the local machine has multiple GPUs and
+/// the llama.cpp backend supports row-level tensor parallelism (CUDA, ROCm).
+///
+/// Row split shards weight matrices across local GPUs so all GPUs are active on
+/// every token — faster than layer (pipeline) split where GPUs take turns.
+/// This does NOT work over RPC (network) — only for GPUs on the same machine.
+fn local_multi_gpu_split_mode(flavor: Option<BinaryFlavor>) -> Option<SplitMode> {
+    let supports_row = matches!(flavor, Some(BinaryFlavor::Cuda) | Some(BinaryFlavor::Rocm));
+    if !supports_row {
+        return None;
+    }
+    let hw = hardware::query(&[hardware::Metric::GpuCount]);
+    if hw.gpu_count > 1 {
+        tracing::info!(
+            "Local multi-GPU detected ({} GPUs) — using row split for tensor parallelism",
+            hw.gpu_count
+        );
+        Some(SplitMode::Row)
+    } else {
+        None
+    }
+}
 
 /// Calculate total model size, summing all split files if present.
 /// Split files follow the pattern: name-00001-of-00004.gguf
@@ -786,6 +811,7 @@ async fn moe_election_loop(
                         http_port: llama_port,
                         tunnel_ports: &[],
                         tensor_split: None,
+                        split_mode: local_multi_gpu_split_mode(binary_flavor),
                         draft: None,
                         draft_max: 0,
                         model_bytes: mb,
@@ -905,6 +931,7 @@ async fn moe_election_loop(
                     http_port: llama_port,
                     tunnel_ports: &[],
                     tensor_split: None,
+                    split_mode: local_multi_gpu_split_mode(binary_flavor),
                     draft: None,
                     draft_max: 0,
                     model_bytes: shard_bytes,
@@ -1259,6 +1286,13 @@ async fn start_llama(
             http_port: llama_port,
             tunnel_ports: &rpc_ports,
             tensor_split: split.as_deref(),
+            // Row split only works for local multi-GPU — not over RPC.
+            // When we have RPC workers, llama.cpp uses layer (pipeline) split.
+            split_mode: if rpc_ports.is_empty() {
+                local_multi_gpu_split_mode(binary_flavor)
+            } else {
+                None
+            },
             draft,
             draft_max,
             model_bytes,

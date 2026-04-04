@@ -181,6 +181,7 @@ pub(super) async fn start_runtime_local_model(
             http_port: port,
             tunnel_ports: &[],
             tensor_split: None,
+            split_mode: None,
             draft: None,
             draft_max: 0,
             model_bytes,
