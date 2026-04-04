@@ -450,7 +450,7 @@ jobs:
       - name: MLX smoke test (real inference)
         run: |
           scripts/ci-mlx-smoke-test.sh \
-            target/release/mesh-llm \
+            macos-binaries/mesh-llm \
             "${{ matrix.repo }}" \
             "${{ matrix.template_source }}" \
             "${{ matrix.prompt }}" \
@@ -463,7 +463,7 @@ jobs:
         if: ${{ matrix.name == 'qwen3-0.6b' }}
         run: |
           scripts/ci-mlx-smoke-test.sh \
-            target/release/mesh-llm \
+            macos-binaries/mesh-llm \
             "${{ env.MLX_PROMPT_MODEL_REPO }}" \
             "tokenizer_config.json" \
             "Reply with exactly: blue" \
@@ -536,11 +536,11 @@ jobs:
       - name: Download Linux GGUF smoke binaries
         uses: actions/download-artifact@v4
         with:
-          name: linux-gguf-smoke-bins
+          name: linux-binaries
           path: ci-artifacts
 
       - name: Extract Linux GGUF smoke binaries
-        run: tar -xzf ci-artifacts/linux-gguf-smoke-bins.tgz
+        run: tar -xzf ci-artifacts/linux-binaries.tgz
 
       - name: Cache GGUF model
         id: cache-gguf-model
@@ -559,8 +559,8 @@ jobs:
       - name: GGUF smoke test (real inference)
         run: |
           scripts/ci-gguf-smoke-test.sh \
-            target/release/mesh-llm \
-            llama.cpp/build/bin \
+            linux-binaries/mesh-llm \
+            linux-binaries \
             ~/.models/${{ matrix.file }} \
             "${{ matrix.prompt }}" \
             "${{ matrix.expect_contains }}" \
