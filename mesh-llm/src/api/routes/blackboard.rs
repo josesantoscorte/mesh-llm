@@ -1,5 +1,6 @@
 use super::super::{http::respond_error, MeshApi};
 use crate::plugin;
+use serde_json::json;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
@@ -29,34 +30,18 @@ async fn handle_feed(stream: &mut TcpStream, state: &MeshApi, path: &str) -> any
     }
 
     let params = query_params(path);
-    let request = crate::blackboard::FeedRequest {
-        from: params
-            .iter()
-            .find(|(k, _)| *k == "from")
-            .map(|(_, v)| (*v).to_string()),
-        limit: params
-            .iter()
-            .find(|(k, _)| *k == "limit")
-            .and_then(|(_, v)| v.parse().ok())
-            .unwrap_or(20),
-        since: params
-            .iter()
-            .find(|(k, _)| *k == "since")
-            .and_then(|(_, v)| v.parse().ok())
-            .unwrap_or(0),
-    };
+    let args = json!({
+        "from": params.iter().find(|(k, _)| *k == "from").map(|(_, v)| v.to_string()),
+        "limit": params.iter().find(|(k, _)| *k == "limit").and_then(|(_, v)| v.parse::<usize>().ok()).unwrap_or(20usize),
+        "since": params.iter().find(|(k, _)| *k == "since").and_then(|(_, v)| v.parse::<u64>().ok()).unwrap_or(0u64),
+    })
+    .to_string();
     match plugin_manager
-        .call_tool_by_capability(
-            plugin::BLACKBOARD_CAPABILITY,
-            "feed",
-            &serde_json::to_string(&request)?,
-        )
+        .call_tool_by_capability(plugin::BLACKBOARD_CAPABILITY, "feed", &args)
         .await
     {
         Ok(result) if !result.is_error => {
-            let items: Vec<crate::blackboard::BlackboardItem> =
-                serde_json::from_str(&result.content_json).unwrap_or_default();
-            let json = serde_json::to_string(&items).unwrap_or_else(|_| "[]".into());
+            let json = &result.content_json;
             let resp = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
                 json.len(),
@@ -85,35 +70,18 @@ async fn handle_search(stream: &mut TcpStream, state: &MeshApi, path: &str) -> a
     }
 
     let params = query_params(path);
-    let request = crate::blackboard::SearchRequest {
-        query: params
-            .iter()
-            .find(|(k, _)| *k == "q")
-            .map(|(_, v)| (*v).replace('+', " ").replace("%20", " "))
-            .unwrap_or_default(),
-        limit: params
-            .iter()
-            .find(|(k, _)| *k == "limit")
-            .and_then(|(_, v)| v.parse().ok())
-            .unwrap_or(20),
-        since: params
-            .iter()
-            .find(|(k, _)| *k == "since")
-            .and_then(|(_, v)| v.parse().ok())
-            .unwrap_or(0),
-    };
+    let args = json!({
+        "query": params.iter().find(|(k, _)| *k == "q").map(|(_, v)| v.replace('+', " ").replace("%20", " ")).unwrap_or_default(),
+        "limit": params.iter().find(|(k, _)| *k == "limit").and_then(|(_, v)| v.parse::<usize>().ok()).unwrap_or(20usize),
+        "since": params.iter().find(|(k, _)| *k == "since").and_then(|(_, v)| v.parse::<u64>().ok()).unwrap_or(0u64),
+    })
+    .to_string();
     match plugin_manager
-        .call_tool_by_capability(
-            plugin::BLACKBOARD_CAPABILITY,
-            "search",
-            &serde_json::to_string(&request)?,
-        )
+        .call_tool_by_capability(plugin::BLACKBOARD_CAPABILITY, "search", &args)
         .await
     {
         Ok(result) if !result.is_error => {
-            let items: Vec<crate::blackboard::BlackboardItem> =
-                serde_json::from_str(&result.content_json).unwrap_or_default();
-            let json = serde_json::to_string(&items).unwrap_or_else(|_| "[]".into());
+            let json = &result.content_json;
             let resp = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
                 json.len(),
@@ -151,17 +119,14 @@ async fn handle_post(stream: &mut TcpStream, state: &MeshApi, body: &str) -> any
             if text.is_empty() {
                 respond_error(stream, 400, "Missing 'text' field").await?;
             } else {
-                let request = crate::blackboard::PostRequest {
-                    text,
-                    from: node.display_name().await,
-                    peer_id: node.id().fmt_short().to_string(),
-                };
+                let args = json!({
+                    "text": text,
+                    "from": node.display_name().await,
+                    "peer_id": node.id().fmt_short().to_string(),
+                })
+                .to_string();
                 match plugin_manager
-                    .call_tool_by_capability(
-                        plugin::BLACKBOARD_CAPABILITY,
-                        "post",
-                        &serde_json::to_string(&request)?,
-                    )
+                    .call_tool_by_capability(plugin::BLACKBOARD_CAPABILITY, "post", &args)
                     .await
                 {
                     Ok(result) if !result.is_error => {
