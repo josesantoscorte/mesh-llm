@@ -596,9 +596,9 @@ impl Collector for TegraCollector {
             }
         }
 
-        if (metrics.contains(&Metric::GpuName)
+        if metrics.contains(&Metric::GpuName)
             || metrics.contains(&Metric::GpuCount)
-            || metrics.contains(&Metric::VramBytes))
+            || metrics.contains(&Metric::VramBytes)
         {
             if let (Some(name), Some(vram_bytes)) = (tegra_name, tegra_vram) {
                 survey.gpus = vec![GpuFacts {

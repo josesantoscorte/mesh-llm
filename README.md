@@ -264,6 +264,60 @@ Each entry in the `nodes` array has a `node_id` field. Use the same short node I
 
 Config is loaded and projected at startup as temporary inert scaffolding for future mesh-config activation. Today it is used for validation and local-node projection only; it does not yet auto-apply models, change election, alter routing, launch processes, or retain a long-lived runtime config state beyond startup. This temporary behavior will be expanded in a later change, so the startup wiring should remain in place.
 
+### When fully activated (planned)
+
+Once the config is fully wired up, the workflow will be:
+
+1. **Find your node IDs.** Run `curl -s http://localhost:3131/api/status | jq .node_id` on each machine (or read it from the web console). The value is the short ID shown in the UI, for example `abc12345`.
+
+2. **Write your `~/.mesh-llm/mesh.toml`** on the machine that owns the config (or distribute an identical copy to all nodes):
+
+   ```toml
+   version = 1
+
+   [[nodes]]
+   node_id = "abc12345"            # worker-1
+   placement_mode = "pooled"       # share the GPU pool across all models on this node
+
+   [[nodes.models]]
+   name = "Qwen2.5-7B"
+   ctx_size = 8192
+
+   [[nodes]]
+   node_id = "def67890"            # worker-2
+   placement_mode = "separate"     # each model fragment targets its own GPU ordinal
+
+   [[nodes.models]]
+   name = "Qwen3-30B-A3B-Q4_K_M"
+   split = { start = 0, end = 21, total = 33 }
+   gpu_index = 0
+
+   [[nodes.models]]
+   name = "Qwen3-30B-A3B-Q4_K_M"
+   split = { start = 21, end = 33, total = 33 }
+   gpu_index = 1
+   ```
+
+3. **Start each node as usual** — no extra flags needed if the file is at the default path:
+
+   ```bash
+   mesh-llm --auto
+   ```
+
+   Or point to a custom path:
+
+   ```bash
+   mesh-llm --auto --mesh-config /etc/mesh/my-mesh.toml
+   MESH_LLM_MESH_CONFIG=/etc/mesh/my-mesh.toml mesh-llm --auto
+   ```
+
+4. **What the runtime will do (once activated):**
+   - Load models listed under the local node's `node_id` automatically, honouring `ctx_size`, `path`, and `moe_experts`.
+   - Use `placement_mode` to decide whether models share a single GPU pool (`pooled`) or each targets a specific GPU ordinal (`separate`).
+   - Pass the `split` range to the layer-split launch path for dense multi-GPU models.
+   - The `split`, `gpu_index`, and `model_key` fields are authored-config metadata only; they are stripped before being handed to launch logic (the runtime projection only carries `name`, `path`, `ctx_size`, and `moe_experts`).
+   - No config field changes election or gossip — model routing and peer discovery continue to work as they do today.
+
 ## Web console
 
 ```bash

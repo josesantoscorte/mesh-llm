@@ -299,3 +299,14 @@ The `nodes` field is a TOML array of tables (`[[nodes]]`). Each entry carries `n
 Config is loaded at startup and projected to a `NodeConfig` for the local node. The runtime projection includes `node_id`, `hostname`, and a `models` list of `ModelAssignment { name, path, ctx_size, moe_experts }`. Fields dropped from the runtime view: `split`, `placement_mode`, `gpu_index`, and `model_key`.
 
 **Runtime hydration is inert: no automatic behavior changes.** Loading the config does not auto-apply models, change election, alter routing, or launch processes. This startup hydration path is temporary scaffolding for future config-backed runtime behavior: today it validates and projects the local node view during startup, but it does not yet retain a long-lived `LocalMeshConfigState` for later runtime use. This temporary behavior will be expanded in a later change, so the hydration wiring is intentionally present even though it is not fully activated yet.
+
+### Network Protocol Impact
+
+The `mesh.toml` config system is **local-only**. It is not broadcast over the gossip channel and does not appear on the wire. No existing peer or relay needs to be updated to interoperate with a node that uses a mesh config file.
+
+The companion `GpuFacts` consolidation in this PR (replacing the flat `gpu_name: Option<String>`, `gpu_count: u8`, and `gpu_vram: Vec<u64>` fields on `HardwareSurvey` with a structured `gpus: Vec<GpuFacts>`) is an **internal refactor only**. The gossip wire format is unchanged:
+
+- `gpu_name` is still projected as a single summarised string via `HardwareSurvey::gpu_name_summary()` (semantically identical to the previous `summarize_gpu_name(per_gpu_names(&hw))` call).
+- `gpu_vram` is still a comma-separated list of per-GPU VRAM byte counts.
+
+No bumping of the gossip schema version is required. Older and newer nodes continue to interoperate without modification.
