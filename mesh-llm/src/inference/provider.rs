@@ -560,8 +560,6 @@ pub struct PluginManagedEndpointProvider {
     provider_id: String,
     plugin_name: String,
     endpoint_id: String,
-    protocol: Option<String>,
-    address: Option<String>,
     plugin_manager: crate::plugin::PluginManager,
 }
 
@@ -570,31 +568,14 @@ impl PluginManagedEndpointProvider {
         provider_id: impl Into<String>,
         plugin_name: impl Into<String>,
         endpoint_id: impl Into<String>,
-        protocol: Option<String>,
-        address: Option<String>,
         plugin_manager: crate::plugin::PluginManager,
     ) -> Self {
         Self {
             provider_id: provider_id.into(),
             plugin_name: plugin_name.into(),
             endpoint_id: endpoint_id.into(),
-            protocol,
-            address,
             plugin_manager,
         }
-    }
-
-    fn unsupported_launch_error(&self) -> anyhow::Error {
-        let protocol = self.protocol.as_deref().unwrap_or("unknown");
-        let address = self.address.as_deref().unwrap_or("<unadvertised>");
-        anyhow::anyhow!(
-            "Plugin-managed inference provider '{}' (plugin '{}' endpoint '{}' protocol '{}' address '{}') is registered for selection but runtime launch is not wired yet",
-            self.provider_id,
-            self.plugin_name,
-            self.endpoint_id,
-            protocol,
-            address
-        )
     }
 }
 
@@ -633,9 +614,19 @@ impl InferenceProvider for PluginManagedEndpointProvider {
         &'a self,
         _bin_dir: &'a Path,
         _binary_flavor: Option<crate::inference::launch::BinaryFlavor>,
-        _request: &'a InferenceWorkerRequest,
+        request: &'a InferenceWorkerRequest,
     ) -> ProviderFuture<'a, u16> {
-        Box::pin(async move { Err(self.unsupported_launch_error()) })
+        Box::pin(async move {
+            let response = self
+                .plugin_manager
+                .ensure_managed_inference_worker(
+                    &self.plugin_name,
+                    request.model_path.as_deref(),
+                    request.device_hint.as_deref(),
+                )
+                .await?;
+            Ok(response.port)
+        })
     }
 }
 

@@ -620,6 +620,64 @@ impl PluginManager {
             .await
     }
 
+    pub async fn ensure_managed_inference_worker(
+        &self,
+        plugin_name: &str,
+        model_path: Option<&std::path::Path>,
+        device_hint: Option<&str>,
+    ) -> Result<mesh_llm_plugin::EnsureInferenceWorkerResponse> {
+        #[cfg(test)]
+        if self.inner.plugins.is_empty() && self.inner.bridged_plugins.contains(plugin_name) {
+            let bridge = self
+                .inner
+                .rpc_bridge
+                .lock()
+                .await
+                .clone()
+                .context("No active test RPC bridge")?;
+            let params_json =
+                serde_json::to_string(&mesh_llm_plugin::EnsureInferenceWorkerRequest {
+                    model_path: model_path.map(|path| path.display().to_string()),
+                    device_hint: device_hint.map(str::to_string),
+                })?;
+            let result = bridge
+                .handle_request(
+                    plugin_name.to_string(),
+                    "inference/ensure_worker".into(),
+                    params_json,
+                )
+                .await
+                .map_err(|err| {
+                    self::support::plugin_error(plugin_name, "inference/ensure_worker", &err)
+                })?;
+            return serde_json::from_str(&result.result_json).with_context(|| {
+                format!("Decode ensure worker result from test plugin '{plugin_name}'")
+            });
+        }
+
+        if let Some(summary) = self.inner.inactive.get(plugin_name) {
+            bail!(
+                "Plugin '{}' is disabled: {}",
+                plugin_name,
+                summary.error.as_deref().unwrap_or("unavailable")
+            );
+        }
+        let plugin = self
+            .inner
+            .plugins
+            .get(plugin_name)
+            .with_context(|| format!("Unknown plugin '{plugin_name}'"))?;
+        plugin
+            .mcp_request(
+                "inference/ensure_worker",
+                mesh_llm_plugin::EnsureInferenceWorkerRequest {
+                    model_path: model_path.map(|path| path.display().to_string()),
+                    device_hint: device_hint.map(str::to_string),
+                },
+            )
+            .await
+    }
+
     pub async fn capability_providers(&self) -> Result<Vec<PluginCapabilityProvider>> {
         let summaries = self.list().await;
         let endpoint_health = self.inner.endpoint_health.lock().await.clone();
@@ -1545,6 +1603,17 @@ mod tests {
                             .unwrap(),
                         })
                     }
+                    "inference/ensure_worker" => {
+                        let request: mesh_llm_plugin::EnsureInferenceWorkerRequest =
+                            serde_json::from_str(&params_json).unwrap();
+                        assert_eq!(request.device_hint.as_deref(), Some("cuda:0"));
+                        Ok(RpcResult {
+                            result_json: serde_json::to_string(
+                                &mesh_llm_plugin::EnsureInferenceWorkerResponse { port: 19091 },
+                            )
+                            .unwrap(),
+                        })
+                    }
                     _ => Ok(RpcResult {
                         result_json: "{}".into(),
                     }),
@@ -2048,8 +2117,6 @@ mod tests {
                         provider_id,
                         endpoint.plugin_name,
                         endpoint.endpoint_id,
-                        endpoint.protocol,
-                        endpoint.address,
                         plugin_manager.clone(),
                     )) as Arc<dyn provider::InferenceProvider>,
                 )
@@ -2075,8 +2142,6 @@ mod tests {
             "plugin.mlx.local-mlx",
             "mlx",
             "local-mlx",
-            Some("openai_compatible".into()),
-            Some("http://127.0.0.1:8091/v1".into()),
             plugin_manager,
         );
 
@@ -2091,5 +2156,30 @@ mod tests {
 
         assert_eq!(process.listen_port, 8123);
         assert_eq!(process.context_length, 32768);
+    }
+
+    #[tokio::test]
+    async fn plugin_managed_provider_can_ensure_worker_via_plugin_rpc() {
+        let plugin_manager =
+            PluginManager::for_test_bridge(&["mlx"], Arc::new(EnsureEndpointTestBridge));
+        let provider = provider::PluginManagedEndpointProvider::new(
+            "plugin.mlx.local-mlx",
+            "mlx",
+            "local-mlx",
+            plugin_manager,
+        );
+
+        let port = provider
+            .start_worker(
+                std::path::Path::new("."),
+                None,
+                &provider::InferenceWorkerRequest::default()
+                    .with_model_path(Some("/tmp/model.gguf"))
+                    .with_device_hint(Some("cuda:0")),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(port, 19091);
     }
 }
