@@ -35,6 +35,7 @@ async fn sync_plugin_managed_inference_providers(
     }
 
     let endpoints = plugin_manager.managed_inference_endpoints().await?;
+    let mut descriptors = Vec::with_capacity(endpoints.len());
     for endpoint in endpoints {
         let provider_id =
             provider::plugin_provider_id(&endpoint.plugin_name, &endpoint.endpoint_id);
@@ -66,8 +67,9 @@ async fn sync_plugin_managed_inference_providers(
                 registration.into_descriptor_with_local_match(provider, never_match_local_endpoint)
             }
         };
-        provider::register_provider(descriptor);
+        descriptors.push(descriptor);
     }
+    provider::sync_plugin_provider_descriptors(descriptors);
     Ok(())
 }
 

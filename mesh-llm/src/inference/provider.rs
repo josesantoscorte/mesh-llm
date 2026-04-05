@@ -335,6 +335,13 @@ impl InferenceProviderRegistry {
         providers.push(descriptor);
     }
 
+    pub fn replace_plugin_providers(&self, descriptors: Vec<InferenceProviderDescriptor>) {
+        let mut providers = registered_provider_descriptors()
+            .write()
+            .expect("registered inference provider lock poisoned");
+        *providers = descriptors;
+    }
+
     fn select_provider(
         &self,
         preferred_provider_id: Option<&str>,
@@ -711,6 +718,10 @@ fn registered_provider_descriptors() -> &'static RwLock<Vec<InferenceProviderDes
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn register_provider(descriptor: InferenceProviderDescriptor) {
     provider_registry().register_provider(descriptor);
+}
+
+pub fn sync_plugin_provider_descriptors(descriptors: Vec<InferenceProviderDescriptor>) {
+    provider_registry().replace_plugin_providers(descriptors);
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
