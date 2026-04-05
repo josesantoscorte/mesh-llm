@@ -339,6 +339,30 @@ impl SharedRankingArtifactImportRequest {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct MoeShardPreparationRequest {
+    pub bin_dir: PathBuf,
+    pub model_path: PathBuf,
+    pub assignment: crate::inference::moe::NodeAssignment,
+    pub output_path: PathBuf,
+}
+
+impl MoeShardPreparationRequest {
+    pub fn new(
+        bin_dir: impl Into<PathBuf>,
+        model_path: impl Into<PathBuf>,
+        assignment: crate::inference::moe::NodeAssignment,
+        output_path: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            bin_dir: bin_dir.into(),
+            model_path: model_path.into(),
+            assignment,
+            output_path: output_path.into(),
+        }
+    }
+}
+
 pub trait MoeRankingProvider: Send + Sync {
     fn detect_moe(&self, request: &MoeDetectionRequest)
         -> Option<crate::models::gguf::GgufMoeInfo>;
@@ -614,13 +638,7 @@ pub trait InferenceProvider: Send + Sync {
         request: &'a InferenceWorkerRequest,
     ) -> ProviderFuture<'a, u16>;
 
-    fn prepare_moe_shard(
-        &self,
-        bin_dir: &Path,
-        model_path: &Path,
-        assignment: &crate::inference::moe::NodeAssignment,
-        output_path: &Path,
-    ) -> Result<()>;
+    fn prepare_moe_shard(&self, request: &MoeShardPreparationRequest) -> Result<()>;
 }
 
 /// Built-in provider adapter for the current llama.cpp runtime path.
@@ -901,14 +919,13 @@ impl InferenceProvider for BuiltinLlamaProvider {
         })
     }
 
-    fn prepare_moe_shard(
-        &self,
-        bin_dir: &Path,
-        model_path: &Path,
-        assignment: &crate::inference::moe::NodeAssignment,
-        output_path: &Path,
-    ) -> Result<()> {
-        crate::inference::moe::run_split(bin_dir, model_path, assignment, output_path)
+    fn prepare_moe_shard(&self, request: &MoeShardPreparationRequest) -> Result<()> {
+        crate::inference::moe::run_split(
+            &request.bin_dir,
+            &request.model_path,
+            &request.assignment,
+            &request.output_path,
+        )
     }
 }
 
@@ -1757,13 +1774,7 @@ mod tests {
             Box::pin(async { unreachable!("test provider start_worker should not run") })
         }
 
-        fn prepare_moe_shard(
-            &self,
-            _bin_dir: &Path,
-            _model_path: &Path,
-            _assignment: &crate::inference::moe::NodeAssignment,
-            _output_path: &Path,
-        ) -> Result<()> {
+        fn prepare_moe_shard(&self, _request: &MoeShardPreparationRequest) -> Result<()> {
             unreachable!("test provider prepare_moe_shard should not run")
         }
     }

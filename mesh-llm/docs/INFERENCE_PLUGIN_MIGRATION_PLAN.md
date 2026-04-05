@@ -192,6 +192,7 @@ The following no-behavior-change groundwork is already in place on this branch:
 - managed-provider model-path matchers now apply across local runtime, distributed-host runtime, and worker-runtime selection, not just local runtime
 - MoE ranking operations now use provider-owned request shapes instead of loose parameter lists, which gives the future plugin transport a clean contract for full-analyze, micro-analyze, and heuristic ranking work
 - the remaining backend-facing MoE actions now also use provider-owned request shapes instead of raw path/artifact arguments, so the provider contract is now uniform across detection, cache lookup, shared-artifact import, and ranking generation
+- MoE shard preparation now also uses a provider-owned request shape instead of loose split arguments, keeping the execution-side provider contract consistent with the ranking side
 - built-in llama ranking behavior now delegates to reusable backend-specific helper functions, so a future llama plugin can reuse the same GGUF/analyze implementation instead of copying logic out of the provider trait impl
 
 ## Sync Branches

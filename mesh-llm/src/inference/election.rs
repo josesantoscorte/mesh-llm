@@ -1578,12 +1578,16 @@ async fn moe_election_loop(
 
             if !shard_path.exists() {
                 eprintln!("  Splitting GGUF → {} ...", shard_path.display());
-                match selected_provider.provider().prepare_moe_shard(
+                let shard_request = provider::MoeShardPreparationRequest::new(
                     &bin_dir,
                     &model,
-                    my_assignment,
+                    my_assignment.clone(),
                     &shard_path,
-                ) {
+                );
+                match selected_provider
+                    .provider()
+                    .prepare_moe_shard(&shard_request)
+                {
                     Ok(()) => {
                         let size = std::fs::metadata(&shard_path).map(|m| m.len()).unwrap_or(0);
                         eprintln!("  Split complete: {:.1} GB", size as f64 / 1e9);
