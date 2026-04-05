@@ -56,7 +56,6 @@ async fn sync_plugin_managed_inference_providers(
             provider_id,
             endpoint.plugin_name,
             endpoint.endpoint_id,
-            endpoint.address,
             plugin_manager.clone(),
         )) as Arc<dyn provider::InferenceProvider>;
         let descriptor = match endpoint.local_model_matcher {

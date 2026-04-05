@@ -84,6 +84,17 @@ pub struct EnsureInferenceEndpointResponse {
     pub context_length: u32,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct EnsureInferenceWorkerRequest {
+    pub model_path: Option<String>,
+    pub device_hint: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct EnsureInferenceWorkerResponse {
+    pub port: u16,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct InferenceEndpointDescriptor {
     pub endpoint_id: String,
@@ -361,6 +372,14 @@ pub trait Plugin: Send {
         Ok(None)
     }
 
+    async fn ensure_inference_worker(
+        &mut self,
+        _request: EnsureInferenceWorkerRequest,
+        _context: &mut PluginContext<'_>,
+    ) -> PluginResult<Option<EnsureInferenceWorkerResponse>> {
+        Ok(None)
+    }
+
     async fn handle_rpc(
         &mut self,
         request: proto::RpcRequest,
@@ -424,6 +443,15 @@ pub trait Plugin: Send {
                     Some(result) => json_response(&result),
                     None => Err(PluginError::method_not_found(
                         "Unsupported MCP method 'resources/templates/list'",
+                    )),
+                }
+            }
+            "inference/ensure_worker" => {
+                let params: EnsureInferenceWorkerRequest = parse_rpc_params(&request)?;
+                match self.ensure_inference_worker(params, context).await? {
+                    Some(result) => json_response(&result),
+                    None => Err(PluginError::method_not_found(
+                        "Unsupported plugin method 'inference/ensure_worker'",
                     )),
                 }
             }

@@ -569,7 +569,6 @@ pub struct PluginManagedEndpointProvider {
     provider_id: String,
     plugin_name: String,
     endpoint_id: String,
-    address: Option<String>,
     plugin_manager: crate::plugin::PluginManager,
 }
 
@@ -578,14 +577,12 @@ impl PluginManagedEndpointProvider {
         provider_id: impl Into<String>,
         plugin_name: impl Into<String>,
         endpoint_id: impl Into<String>,
-        address: Option<String>,
         plugin_manager: crate::plugin::PluginManager,
     ) -> Self {
         Self {
             provider_id: provider_id.into(),
             plugin_name: plugin_name.into(),
             endpoint_id: endpoint_id.into(),
-            address,
             plugin_manager,
         }
     }
@@ -626,17 +623,18 @@ impl InferenceProvider for PluginManagedEndpointProvider {
         &'a self,
         _bin_dir: &'a Path,
         _binary_flavor: Option<crate::inference::launch::BinaryFlavor>,
-        _request: &'a InferenceWorkerRequest,
+        request: &'a InferenceWorkerRequest,
     ) -> ProviderFuture<'a, u16> {
         Box::pin(async move {
-            let advertised = self.address.as_deref().unwrap_or("<unadvertised>");
-            anyhow::bail!(
-                "Plugin-managed inference provider '{}' (plugin '{}' endpoint '{}' address '{}') does not support worker runtime launch",
-                self.provider_id,
-                self.plugin_name,
-                self.endpoint_id,
-                advertised
-            )
+            let response = self
+                .plugin_manager
+                .ensure_managed_inference_worker(
+                    &self.plugin_name,
+                    request.model_path.as_deref(),
+                    request.device_hint.as_deref(),
+                )
+                .await?;
+            Ok(response.port)
         })
     }
 }

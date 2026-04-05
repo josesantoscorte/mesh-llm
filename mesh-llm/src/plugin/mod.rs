@@ -343,6 +343,23 @@ impl PluginManager {
         .await
     }
 
+    pub async fn ensure_managed_inference_worker(
+        &self,
+        plugin_name: &str,
+        model_path: Option<&std::path::Path>,
+        device_hint: Option<&str>,
+    ) -> Result<mesh_llm_plugin::EnsureInferenceWorkerResponse> {
+        self.mcp_request(
+            plugin_name,
+            "inference/ensure_worker",
+            mesh_llm_plugin::EnsureInferenceWorkerRequest {
+                model_path: model_path.map(|path| path.display().to_string()),
+                device_hint: device_hint.map(str::to_string),
+            },
+        )
+        .await
+    }
+
     pub async fn managed_inference_endpoints(&self) -> Result<Vec<ManagedInferenceEndpoint>> {
         #[cfg(test)]
         let plugin_names = {
@@ -692,6 +709,17 @@ mod tests {
                             .unwrap(),
                         })
                     }
+                    "inference/ensure_worker" => {
+                        let request: mesh_llm_plugin::EnsureInferenceWorkerRequest =
+                            serde_json::from_str(&params_json).unwrap();
+                        assert_eq!(request.device_hint.as_deref(), Some("cuda:0"));
+                        Ok(RpcResult {
+                            result_json: serde_json::to_string(
+                                &mesh_llm_plugin::EnsureInferenceWorkerResponse { port: 19091 },
+                            )
+                            .unwrap(),
+                        })
+                    }
                     _ => Err(proto::ErrorResponse {
                         code: ErrorCode::METHOD_NOT_FOUND.0,
                         message: format!("Unsupported plugin method '{method}'"),
@@ -792,6 +820,22 @@ mod tests {
         assert_eq!(response.address, "http://127.0.0.1:8123");
         assert_eq!(response.backend_label, "mlx");
         assert_eq!(response.context_length, 32768);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn ensure_managed_inference_worker_routes_through_plugin_bridge() {
+        let plugin_manager =
+            PluginManager::for_test_bridge(&[MLX_PLUGIN_ID], Arc::new(EnsureEndpointTestBridge));
+        let response = plugin_manager
+            .ensure_managed_inference_worker(
+                MLX_PLUGIN_ID,
+                Some(std::path::Path::new("/tmp/model")),
+                Some("cuda:0"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.port, 19091);
     }
 
     #[test]

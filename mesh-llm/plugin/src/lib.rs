@@ -33,9 +33,10 @@ pub use io::{
     write_envelope, LocalStream,
 };
 pub use runtime::{
-    EnsureInferenceEndpointRequest, EnsureInferenceEndpointResponse, InferenceEndpointDescriptor,
-    InferenceLocalModelMatcher, InferenceProviderCapabilitiesDescriptor, MeshVisibility, Plugin,
-    PluginInitializeRequest, PluginMetadata, PluginRuntime, PluginStartupPolicy, SimplePlugin,
+    EnsureInferenceEndpointRequest, EnsureInferenceEndpointResponse, EnsureInferenceWorkerRequest,
+    EnsureInferenceWorkerResponse, InferenceEndpointDescriptor, InferenceLocalModelMatcher,
+    InferenceProviderCapabilitiesDescriptor, MeshVisibility, Plugin, PluginInitializeRequest,
+    PluginMetadata, PluginRuntime, PluginStartupPolicy, SimplePlugin,
 };
 
 #[allow(dead_code)]
