@@ -7,6 +7,31 @@ use std::sync::{Arc, OnceLock, RwLock};
 use tokio::net::TcpListener;
 use url::Url;
 
+#[cfg(target_os = "macos")]
+pub(crate) fn matches_mlx_model_dir(request: &InferenceEndpointRequest) -> bool {
+    let model_path = request.model_path.as_path();
+    model_path.is_dir()
+        && model_path.join("config.json").exists()
+        && model_path.join("tokenizer.json").exists()
+        && std::fs::read_dir(model_path)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .map(|ext| ext == "safetensors")
+                    .unwrap_or(false)
+            })
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn matches_mlx_model_dir(_request: &InferenceEndpointRequest) -> bool {
+    false
+}
+
 /// Backend-neutral runtime handle for a serving instance.
 ///
 /// This sits above any concrete backend implementation:
@@ -561,6 +586,14 @@ impl PluginInferenceProviderRegistration {
         self,
         provider: Arc<dyn InferenceProvider>,
     ) -> InferenceProviderDescriptor {
+        self.into_descriptor_with_local_match(provider, never_match_local_endpoint)
+    }
+
+    pub fn into_descriptor_with_local_match(
+        self,
+        provider: Arc<dyn InferenceProvider>,
+        matches_local_endpoint: fn(&InferenceEndpointRequest) -> bool,
+    ) -> InferenceProviderDescriptor {
         InferenceProviderDescriptor::new(
             InferenceProviderSelection::new(
                 self.provider_id,
@@ -568,7 +601,7 @@ impl PluginInferenceProviderRegistration {
                 self.capabilities,
                 provider,
             ),
-            never_match_local_endpoint,
+            matches_local_endpoint,
             never_match_distributed_endpoint,
             never_match_worker_runtime,
         )
@@ -708,16 +741,7 @@ pub fn register_plugin_provider(
     register_provider(registration.into_descriptor(provider));
 }
 
-pub fn sync_plugin_providers(
-    registrations: Vec<(
-        PluginInferenceProviderRegistration,
-        Arc<dyn InferenceProvider>,
-    )>,
-) {
-    let descriptors = registrations
-        .into_iter()
-        .map(|(registration, provider)| registration.into_descriptor(provider))
-        .collect();
+pub fn sync_plugin_provider_descriptors(descriptors: Vec<InferenceProviderDescriptor>) {
     provider_registry().replace_plugin_providers(descriptors);
 }
 

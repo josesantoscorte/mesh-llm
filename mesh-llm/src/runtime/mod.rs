@@ -29,33 +29,42 @@ use std::sync::Arc;
 async fn sync_plugin_managed_inference_providers(
     plugin_manager: &plugin::PluginManager,
 ) -> Result<()> {
+    fn never_match_local_endpoint(_request: &provider::InferenceEndpointRequest) -> bool {
+        false
+    }
+
     let endpoints = plugin_manager.managed_inference_endpoints().await?;
-    let registrations = endpoints
-        .into_iter()
-        .map(|endpoint| {
-            let provider_id =
-                provider::plugin_provider_id(&endpoint.plugin_name, &endpoint.endpoint_id);
-            (
-                provider::PluginInferenceProviderRegistration::new(
-                    provider_id.clone(),
-                    endpoint.plugin_name.clone(),
-                    provider::InferenceProviderCapabilities {
-                        supports_local_runtime: true,
-                        supports_distributed_host_runtime: false,
-                        requires_worker_runtime: false,
-                        supports_moe_shard_runtime: false,
-                    },
-                ),
-                Arc::new(provider::PluginManagedEndpointProvider::new(
-                    provider_id,
-                    endpoint.plugin_name,
-                    endpoint.endpoint_id,
-                    plugin_manager.clone(),
-                )) as Arc<dyn provider::InferenceProvider>,
-            )
-        })
-        .collect();
-    provider::sync_plugin_providers(registrations);
+    let mut descriptors = Vec::with_capacity(endpoints.len());
+    for endpoint in endpoints {
+        let provider_id =
+            provider::plugin_provider_id(&endpoint.plugin_name, &endpoint.endpoint_id);
+        let registration = provider::PluginInferenceProviderRegistration::new(
+            provider_id.clone(),
+            endpoint.plugin_name.clone(),
+            provider::InferenceProviderCapabilities {
+                supports_local_runtime: endpoint.supports_local_runtime,
+                supports_distributed_host_runtime: endpoint.supports_distributed_host_runtime,
+                requires_worker_runtime: endpoint.requires_worker_runtime,
+                supports_moe_shard_runtime: endpoint.supports_moe_shard_runtime,
+            },
+        );
+        let provider = Arc::new(provider::PluginManagedEndpointProvider::new(
+            provider_id,
+            endpoint.plugin_name,
+            endpoint.endpoint_id,
+            plugin_manager.clone(),
+        )) as Arc<dyn provider::InferenceProvider>;
+        let descriptor = match endpoint.local_model_matcher {
+            #[cfg(target_os = "macos")]
+            plugin::proto::InferenceLocalModelMatcher::MlxModelDir => registration
+                .into_descriptor_with_local_match(provider, provider::matches_mlx_model_dir),
+            _ => {
+                registration.into_descriptor_with_local_match(provider, never_match_local_endpoint)
+            }
+        };
+        descriptors.push(descriptor);
+    }
+    provider::sync_plugin_provider_descriptors(descriptors);
     Ok(())
 }
 

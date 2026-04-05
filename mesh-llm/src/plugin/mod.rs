@@ -200,6 +200,11 @@ pub struct ManagedInferenceEndpoint {
     pub protocol: Option<String>,
     pub address: Option<String>,
     pub supports_streaming: bool,
+    pub local_model_matcher: proto::InferenceLocalModelMatcher,
+    pub supports_local_runtime: bool,
+    pub supports_distributed_host_runtime: bool,
+    pub requires_worker_runtime: bool,
+    pub supports_moe_shard_runtime: bool,
 }
 
 #[derive(Clone)]
@@ -545,6 +550,14 @@ impl PluginManager {
                     protocol: endpoint.protocol,
                     address: endpoint.address,
                     supports_streaming: endpoint.supports_streaming,
+                    local_model_matcher: proto::InferenceLocalModelMatcher::try_from(
+                        endpoint.local_model_matcher,
+                    )
+                    .unwrap_or(proto::InferenceLocalModelMatcher::Unspecified),
+                    supports_local_runtime: endpoint.supports_local_runtime,
+                    supports_distributed_host_runtime: endpoint.supports_distributed_host_runtime,
+                    requires_worker_runtime: endpoint.requires_worker_runtime,
+                    supports_moe_shard_runtime: endpoint.supports_moe_shard_runtime,
                 });
             }
         }
@@ -2092,6 +2105,11 @@ mod tests {
             namespace: None,
             supports_streaming: true,
             managed_by_plugin: false,
+            local_model_matcher: proto::InferenceLocalModelMatcher::Unspecified as i32,
+            supports_local_runtime: false,
+            supports_distributed_host_runtime: false,
+            requires_worker_runtime: false,
+            supports_moe_shard_runtime: false,
         };
         assert_eq!(
             endpoint_declared_capabilities(&endpoint),
@@ -2120,6 +2138,11 @@ mod tests {
                         namespace: None,
                         supports_streaming: true,
                         managed_by_plugin: true,
+                        local_model_matcher: proto::InferenceLocalModelMatcher::MlxModelDir as i32,
+                        supports_local_runtime: true,
+                        supports_distributed_host_runtime: false,
+                        requires_worker_runtime: false,
+                        supports_moe_shard_runtime: false,
                     },
                     proto::EndpointManifest {
                         endpoint_id: "attached".into(),
@@ -2131,6 +2154,11 @@ mod tests {
                         namespace: None,
                         supports_streaming: true,
                         managed_by_plugin: false,
+                        local_model_matcher: proto::InferenceLocalModelMatcher::Unspecified as i32,
+                        supports_local_runtime: false,
+                        supports_distributed_host_runtime: false,
+                        requires_worker_runtime: false,
+                        supports_moe_shard_runtime: false,
                     },
                 ],
                 ..Default::default()
@@ -2147,6 +2175,11 @@ mod tests {
                 protocol: Some("openai_compatible".into()),
                 address: Some("http://127.0.0.1:8091/v1".into()),
                 supports_streaming: true,
+                local_model_matcher: proto::InferenceLocalModelMatcher::MlxModelDir,
+                supports_local_runtime: true,
+                supports_distributed_host_runtime: false,
+                requires_worker_runtime: false,
+                supports_moe_shard_runtime: false,
             }]
         );
     }
@@ -2170,13 +2203,21 @@ mod tests {
                     namespace: None,
                     supports_streaming: true,
                     managed_by_plugin: true,
+                    local_model_matcher: proto::InferenceLocalModelMatcher::MlxModelDir as i32,
+                    supports_local_runtime: true,
+                    supports_distributed_host_runtime: false,
+                    requires_worker_runtime: false,
+                    supports_moe_shard_runtime: false,
                 }],
                 ..Default::default()
             },
         );
         plugin_manager.set_test_manifests(manifests).await;
 
-        let registrations = plugin_manager
+        let registrations: Vec<(
+            provider::PluginInferenceProviderRegistration,
+            Arc<dyn provider::InferenceProvider>,
+        )> = plugin_manager
             .managed_inference_endpoints()
             .await
             .unwrap()
@@ -2189,10 +2230,11 @@ mod tests {
                         provider_id.clone(),
                         endpoint.plugin_name.clone(),
                         provider::InferenceProviderCapabilities {
-                            supports_local_runtime: true,
-                            supports_distributed_host_runtime: false,
-                            requires_worker_runtime: false,
-                            supports_moe_shard_runtime: false,
+                            supports_local_runtime: endpoint.supports_local_runtime,
+                            supports_distributed_host_runtime: endpoint
+                                .supports_distributed_host_runtime,
+                            requires_worker_runtime: endpoint.requires_worker_runtime,
+                            supports_moe_shard_runtime: endpoint.supports_moe_shard_runtime,
                         },
                     ),
                     Arc::new(provider::PluginManagedEndpointProvider::new(
@@ -2204,16 +2246,33 @@ mod tests {
                 )
             })
             .collect();
-        provider::sync_plugin_providers(registrations);
+        for (registration, provider) in registrations {
+            provider::register_provider(
+                registration
+                    .into_descriptor_with_local_match(provider, provider::matches_mlx_model_dir),
+            );
+        }
+
+        let root =
+            std::env::temp_dir().join(format!("mesh-llm-plugin-registry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("config.json"),
+            r#"{"model_type":"deepseek_v3","architectures":["DeepseekV3ForCausalLM"]}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("tokenizer.json"), "{}").unwrap();
+        std::fs::write(root.join("model.safetensors"), b"placeholder").unwrap();
 
         let selection = provider::select_local_endpoint_provider(
-            &provider::InferenceEndpointRequest::local("/tmp/model.gguf", 8080, 1, 1)
-                .with_preferred_provider_id(Some("plugin.mlx.local-mlx")),
+            &provider::InferenceEndpointRequest::local(&root, 8080, 1, 1),
         );
         assert_eq!(selection.provider_id(), "plugin.mlx.local-mlx");
         assert_eq!(selection.backend_label(), "mlx");
 
         provider::clear_registered_providers_for_tests();
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]

@@ -336,6 +336,11 @@ pub fn openai_http_inference_endpoint(
             namespace: None,
             supports_streaming: true,
             managed_by_plugin: false,
+            local_model_matcher: proto::InferenceLocalModelMatcher::Unspecified as i32,
+            supports_local_runtime: false,
+            supports_distributed_host_runtime: false,
+            requires_worker_runtime: false,
+            supports_moe_shard_runtime: false,
         },
     }
 }
@@ -355,6 +360,11 @@ pub fn mcp_stdio_endpoint(
             namespace: None,
             supports_streaming: false,
             managed_by_plugin: false,
+            local_model_matcher: proto::InferenceLocalModelMatcher::Unspecified as i32,
+            supports_local_runtime: false,
+            supports_distributed_host_runtime: false,
+            requires_worker_runtime: false,
+            supports_moe_shard_runtime: false,
         },
     }
 }
@@ -374,6 +384,11 @@ pub fn mcp_http_endpoint(
             namespace: None,
             supports_streaming: true,
             managed_by_plugin: false,
+            local_model_matcher: proto::InferenceLocalModelMatcher::Unspecified as i32,
+            supports_local_runtime: false,
+            supports_distributed_host_runtime: false,
+            requires_worker_runtime: false,
+            supports_moe_shard_runtime: false,
         },
     }
 }
@@ -393,6 +408,11 @@ pub fn mcp_tcp_endpoint(
             namespace: None,
             supports_streaming: false,
             managed_by_plugin: false,
+            local_model_matcher: proto::InferenceLocalModelMatcher::Unspecified as i32,
+            supports_local_runtime: false,
+            supports_distributed_host_runtime: false,
+            requires_worker_runtime: false,
+            supports_moe_shard_runtime: false,
         },
     }
 }
@@ -412,6 +432,11 @@ pub fn mcp_unix_socket_endpoint(
             namespace: None,
             supports_streaming: false,
             managed_by_plugin: false,
+            local_model_matcher: proto::InferenceLocalModelMatcher::Unspecified as i32,
+            supports_local_runtime: false,
+            supports_distributed_host_runtime: false,
+            requires_worker_runtime: false,
+            supports_moe_shard_runtime: false,
         },
     }
 }
@@ -448,6 +473,28 @@ impl EndpointBuilder {
 
     pub fn managed_by_plugin(mut self, managed_by_plugin: bool) -> Self {
         self.inner.managed_by_plugin = managed_by_plugin;
+        self
+    }
+
+    pub fn local_model_matcher(
+        mut self,
+        local_model_matcher: proto::InferenceLocalModelMatcher,
+    ) -> Self {
+        self.inner.local_model_matcher = local_model_matcher as i32;
+        self
+    }
+
+    pub fn provider_capabilities(
+        mut self,
+        supports_local_runtime: bool,
+        supports_distributed_host_runtime: bool,
+        requires_worker_runtime: bool,
+        supports_moe_shard_runtime: bool,
+    ) -> Self {
+        self.inner.supports_local_runtime = supports_local_runtime;
+        self.inner.supports_distributed_host_runtime = supports_distributed_host_runtime;
+        self.inner.requires_worker_runtime = requires_worker_runtime;
+        self.inner.supports_moe_shard_runtime = supports_moe_shard_runtime;
         self
     }
 }
