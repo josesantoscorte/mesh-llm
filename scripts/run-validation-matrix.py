@@ -13,6 +13,7 @@ import argparse
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -24,11 +25,36 @@ DEFAULT_MATRIX = REPO_ROOT / "testdata" / "validation" / "matrix.json"
 DEFAULT_BASELINES = REPO_ROOT / "testdata" / "validation" / "baselines.json"
 DEFAULT_ROOT = REPO_ROOT / "MLX_VALIDATION_RESULTS"
 DEFAULT_WAIT_SECONDS = 300
+COMMON_BIN_DIRS = ["/opt/homebrew/bin", "/usr/local/bin"]
 
 
 def log(message: str) -> None:
     sys.stderr.write(message + "\n")
     sys.stderr.flush()
+
+
+def merged_env(env: dict[str, str] | None = None) -> dict[str, str]:
+    base = dict(os.environ)
+    if env:
+        base.update(env)
+    path_entries = [entry for entry in base.get("PATH", "").split(os.pathsep) if entry]
+    for entry in reversed(COMMON_BIN_DIRS):
+        if entry not in path_entries:
+            path_entries.insert(0, entry)
+    base["PATH"] = os.pathsep.join(path_entries)
+    return base
+
+
+def resolve_command(cmd: list[str], env: dict[str, str]) -> list[str]:
+    if not cmd:
+        return cmd
+    executable = cmd[0]
+    if "/" in executable:
+        return cmd
+    resolved = shutil.which(executable, path=env.get("PATH", ""))
+    if resolved:
+        return [resolved, *cmd[1:]]
+    return cmd
 
 
 def run(
@@ -38,10 +64,11 @@ def run(
     env: dict[str, str] | None = None,
     capture_output: bool = False,
 ) -> subprocess.CompletedProcess[str]:
+    final_env = merged_env(env)
     return subprocess.run(
-        cmd,
+        resolve_command(cmd, final_env),
         cwd=cwd,
-        env=env,
+        env=final_env,
         text=True,
         capture_output=capture_output,
         check=False,
@@ -54,10 +81,11 @@ def run_streaming(
     cwd: Path = REPO_ROOT,
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    final_env = merged_env(env)
     proc = subprocess.Popen(
-        cmd,
+        resolve_command(cmd, final_env),
         cwd=cwd,
-        env=env,
+        env=final_env,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         bufsize=0,
