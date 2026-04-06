@@ -978,7 +978,11 @@ fn fetch_recent_repo_commits(
     let endpoint = hf_endpoint();
     let token = hf_token_override();
     let url = commits_api_url(&endpoint, repo_id, revision, limit);
-    let client = reqwest::blocking::Client::new();
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .context("Build HTTP client")?;
     let mut request = client.get(url);
     if let Some(token) = token {
         request = request.bearer_auth(token);
@@ -1025,10 +1029,11 @@ fn link_or_copy_file(src: &Path, dst: &Path) -> Result<()> {
     }
 }
 
+static SPLIT_GGUF_RE: std::sync::LazyLock<regex_lite::Regex> =
+    std::sync::LazyLock::new(|| regex_lite::Regex::new(r"-\d{5}-of-\d{5}\.gguf$").unwrap());
+
 fn is_split_gguf_file(file: &str) -> bool {
-    regex_lite::Regex::new(r"-\d{5}-of-\d{5}\.gguf$")
-        .unwrap()
-        .is_match(file)
+    SPLIT_GGUF_RE.is_match(file)
 }
 
 fn expected_split_gguf_files(model: &catalog::CatalogModel) -> Vec<String> {
