@@ -148,20 +148,13 @@ pub(crate) fn run_status(owner_key: Option<PathBuf>) -> Result<()> {
             Ok(_) => {
                 eprintln!("Keystore:        valid (unlocked from OS keychain)");
             }
-            Err(OwnerKeychainLoadError::NoEntry) => {
+            Err(OwnerKeychainLoadError::Crypto(e)) => {
                 eprintln!(
-                    "Keystore:        encrypted (no keychain entry for this path; \
-                     provide the passphrase when the owner keystore is consumed)"
+                    "{}",
+                    encrypted_keystore_keychain_status(OwnerKeychainLoadError::Crypto(e))
                 );
             }
-            Err(OwnerKeychainLoadError::Crypto(
-                crate::crypto::CryptoError::KeychainUnavailable { reason },
-            )) => {
-                eprintln!("Keystore:        encrypted (keychain unavailable: {reason})");
-            }
-            Err(OwnerKeychainLoadError::Crypto(e)) => {
-                eprintln!("Keystore:        ERROR loading keys: {e}");
-            }
+            Err(e) => eprintln!("{}", encrypted_keystore_keychain_status(e)),
         }
     } else {
         match load_keystore(&path, None) {
@@ -184,6 +177,26 @@ enum PassphraseSource {
     None,
     Prompt,
     Keychain { account: String },
+}
+
+fn encrypted_keystore_keychain_status(error: OwnerKeychainLoadError) -> String {
+    match error {
+        OwnerKeychainLoadError::NoEntry => {
+            "Keystore:        encrypted (no keychain entry for this path; provide the \
+             passphrase when the owner keystore is consumed)"
+                .into()
+        }
+        OwnerKeychainLoadError::Crypto(crate::crypto::CryptoError::DecryptionFailed) => {
+            "Keystore:        encrypted (keychain entry could not unlock this keystore; \
+             provide the passphrase when the owner keystore is consumed or remove the stale \
+             keychain entry for this path)"
+                .into()
+        }
+        OwnerKeychainLoadError::Crypto(crate::crypto::CryptoError::KeychainUnavailable {
+            reason,
+        }) => format!("Keystore:        encrypted (keychain unavailable: {reason})"),
+        OwnerKeychainLoadError::Crypto(e) => format!("Keystore:        ERROR loading keys: {e}"),
+    }
 }
 
 fn should_default_to_keychain(
@@ -217,6 +230,16 @@ mod tests {
     #[test]
     fn does_not_default_to_keychain_with_no_passphrase() {
         assert!(!should_default_to_keychain(false, true, true));
+    }
+
+    #[test]
+    fn reports_stale_keychain_entry_as_encrypted_keystore() {
+        let message = encrypted_keystore_keychain_status(OwnerKeychainLoadError::Crypto(
+            crate::crypto::CryptoError::DecryptionFailed,
+        ));
+
+        assert!(message.contains("keychain entry could not unlock this keystore"));
+        assert!(message.contains("remove the stale keychain entry for this path"));
     }
 
     #[test]
