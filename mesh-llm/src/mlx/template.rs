@@ -483,17 +483,20 @@ fn template_kwarg(req: &Value, key: &str) -> Option<Value> {
     })
 }
 
+fn template_references_message_field(template: &str, field: &str) -> bool {
+    template.contains(&format!("message['{field}']"))
+        || template.contains(&format!("message[\"{field}\"]"))
+        || template.contains(&format!("message.{field}"))
+}
+
 fn normalize_hf_messages(template: &str, messages: Value) -> Value {
     let Some(messages) = messages.as_array() else {
         return messages;
     };
-    let fill_tool_calls =
-        template.contains("message['tool_calls']") || template.contains("message[\"tool_calls\"]");
-    let fill_tool_call_id = template.contains("message['tool_call_id']")
-        || template.contains("message[\"tool_call_id\"]");
-    let fill_name = template.contains("message['name']") || template.contains("message[\"name\"]");
-    let fill_tool_responses = template.contains("message['tool_responses']")
-        || template.contains("message[\"tool_responses\"]");
+    let fill_tool_calls = template_references_message_field(template, "tool_calls");
+    let fill_tool_call_id = template_references_message_field(template, "tool_call_id");
+    let fill_name = template_references_message_field(template, "name");
+    let fill_tool_responses = template_references_message_field(template, "tool_responses");
 
     Value::Array(
         messages

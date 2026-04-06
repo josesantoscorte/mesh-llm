@@ -705,6 +705,61 @@ fn qwen_prompt_parity_fixture_matches_expected_output() {
 }
 
 #[test]
+fn normalizes_missing_optional_message_fields_for_dot_access_templates() {
+    let messages = json!([
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "hi"}
+    ]);
+    let normalized = normalize_hf_messages(
+        "{% if message.tool_calls %}{{ message.tool_calls }}{% endif %} {{ message.name }} {{ message.tool_call_id }} {{ message.tool_responses }}",
+        messages,
+    );
+
+    let array = normalized.as_array().unwrap();
+    for message in array {
+        let object = message.as_object().unwrap();
+        assert!(object.contains_key("tool_calls"));
+        assert!(object.contains_key("name"));
+        assert!(object.contains_key("tool_call_id"));
+        assert!(object.contains_key("tool_responses"));
+    }
+}
+
+#[test]
+fn qwen_hf_template_with_dot_access_does_not_fall_back_to_chatml() {
+    let root = std::env::temp_dir().join(format!(
+        "mesh-llm-template-qwen-dot-access-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("tokenizer_config.json"),
+        serde_json::json!({
+            "chat_template": "{%- if messages[0]['role'] == 'system' %}{{- '<|im_start|>system\\n' + messages[0]['content'] + '<|im_end|>\\n' }}{%- else %}{{- '<|im_start|>system\\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\\n' }}{%- endif %}{%- for message in messages %}{%- if (message.role == 'user') or (message.role == 'assistant' and not message.tool_calls) %}{{- '<|im_start|>' + message.role + '\\n' + message.content + '<|im_end|>\\n' }}{%- endif %}{%- endfor %}{%- if add_generation_prompt %}{{- '<|im_start|>assistant\\n' }}{%- endif %}"
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let template = PromptTemplate::detect(&root, &serde_json::json!({"model_type":"qwen2"}));
+    let prompt = template
+        .render_request(&json!({
+            "messages": [
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "second"},
+                {"role": "user", "content": "third"}
+            ],
+            "add_generation_prompt": true
+        }))
+        .unwrap();
+
+    assert!(prompt.starts_with("<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n"));
+    assert!(prompt.contains("<|im_start|>assistant\nsecond<|im_end|>\n"));
+    assert!(prompt.ends_with("<|im_start|>assistant\n"));
+}
+
+#[test]
 fn llama3_prompt_parity_fixture_matches_expected_output() {
     let root = std::env::temp_dir().join(format!(
         "mesh-llm-template-llama3-fixture-{}",

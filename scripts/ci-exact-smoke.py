@@ -160,6 +160,7 @@ def record_chat_artifact(
         "request": request_payload,
         "raw_response": response_payload,
         "content": content,
+        "response_text": content,
         "finish_reason": finish_reason,
         "expectations": expectations,
     }
@@ -179,6 +180,15 @@ def fail(message: str, *, content: str = "", response: dict[str, Any] | None = N
         print("--- Log tail ---", file=sys.stderr)
         print(log_path.read_text(encoding="utf-8", errors="replace")[-8000:], file=sys.stderr)
     raise SystemExit(1)
+
+
+def case_failure(message: str, *, content: str = "", response: dict[str, Any] | None = None) -> str:
+    details = message
+    if content:
+        details += f" | Content: {content}"
+    if response is not None:
+        details += f" | Raw response: {json.dumps(response, ensure_ascii=False)}"
+    return details
 
 
 def run_chat(
@@ -215,7 +225,7 @@ def validate_case(
     case_cfg: dict[str, Any],
     default_prompt: str,
     log_path: Path,
-) -> None:
+) -> tuple[bool, str]:
     label = case_cfg.get("label", "primary")
     prompt_text = case_cfg.get("prompt", default_prompt)
     expect_contains = str(case_cfg.get("expect_contains", ""))
@@ -228,51 +238,60 @@ def validate_case(
     max_tokens = int(case_cfg.get("max_tokens", 32) or 32)
 
     print(f"Testing /v1/chat/completions ({label})...", flush=True)
-    request_payload, response_payload, content, finish_reason = run_chat(
-        api_port,
-        prompt_text,
-        max_tokens=max_tokens,
-        enable_thinking=False,
-    )
+    request_payload: dict[str, Any] = {}
+    response_payload: dict[str, Any] | None = None
+    content = ""
+    finish_reason = ""
+    error: str | None = None
 
-    if not content:
-        fail("Empty response from inference", response=response_payload, log_path=log_path)
-    if "<think>" in content:
-        fail("Unexpected reasoning output with enable_thinking=false", content=content, log_path=log_path)
-    if expect_contains and expect_contains not in content:
-        fail(f"Response did not contain expected text: {expect_contains}", content=content)
-    if expect_contains_ci and expect_contains_ci.lower() not in content.lower():
-        fail(
+    try:
+        request_payload, response_payload, content, finish_reason = run_chat(
+            api_port,
+            prompt_text,
+            max_tokens=max_tokens,
+            enable_thinking=False,
+        )
+    except Exception as exc:
+        error = case_failure(f"Request failed: {exc}")
+
+    if error is None and not content:
+        error = case_failure("Empty response from inference", response=response_payload)
+    if error is None and "<think>" in content:
+        error = case_failure("Unexpected reasoning output with enable_thinking=false", content=content)
+    if error is None and expect_contains and expect_contains not in content:
+        error = case_failure(f"Response did not contain expected text: {expect_contains}", content=content)
+    if error is None and expect_contains_ci and expect_contains_ci.lower() not in content.lower():
+        error = case_failure(
             f"Response did not contain expected text (case-insensitive): {expect_contains_ci}",
             content=content,
         )
-    if expect_contains_all_ci:
+    if error is None and expect_contains_all_ci:
         missing = [needle for needle in expect_contains_all_ci if needle.lower() not in content.lower()]
         if missing:
-            fail(
+            error = case_failure(
                 f"Response did not contain all expected terms (case-insensitive): {', '.join(missing)}",
                 content=content,
             )
-    if expect_any_ci and not any(needle.lower() in content.lower() for needle in expect_any_ci):
-        fail(
+    if error is None and expect_any_ci and not any(needle.lower() in content.lower() for needle in expect_any_ci):
+        error = case_failure(
             f"Response did not contain any expected text (case-insensitive): {json.dumps(expect_any_ci)}",
             content=content,
         )
-    if expect_exact and normalize(content) != normalize(expect_exact):
-        fail(
+    if error is None and expect_exact and normalize(content) != normalize(expect_exact):
+        error = case_failure(
             "Response did not exactly match expected text",
             content=f"expected={normalize(expect_exact)!r} actual={normalize(content)!r}",
         )
-    if forbid_contains and forbid_contains in content:
-        fail(f"Response contained forbidden text: {forbid_contains}", content=content)
-    if not finish_reason:
-        fail("Missing finish_reason in response", response=response_payload)
+    if error is None and forbid_contains and forbid_contains in content:
+        error = case_failure(f"Response contained forbidden text: {forbid_contains}", content=content)
+    if error is None and not finish_reason:
+        error = case_failure("Missing finish_reason in response", response=response_payload)
 
     record_chat_artifact(
         label,
         prompt_text,
         request_payload,
-        response_payload,
+        response_payload or {},
         content,
         finish_reason,
         {
@@ -284,28 +303,41 @@ def validate_case(
             "expect_exact": expect_exact,
         },
     )
+    if error is not None:
+        print(f"❌ {error}", flush=True)
+        return False, error
+
     print(f"✅ Inference response: {content}", flush=True)
 
     if thinking_mode:
         print(f"Testing explicit reasoning output ({label})...", flush=True)
-        think_request, think_response, think_content, _ = run_chat(
-            api_port,
-            prompt_text,
-            max_tokens=64,
-            enable_thinking=True,
-        )
+        try:
+            think_request, think_response, think_content, _ = run_chat(
+                api_port,
+                prompt_text,
+                max_tokens=64,
+                enable_thinking=True,
+            )
+        except Exception as exc:
+            error = case_failure(f"Explicit reasoning request failed: {exc}")
+            print(f"❌ {error}", flush=True)
+            return False, error
         if not think_content:
-            fail("Empty response from explicit reasoning request", response=think_response)
-        if thinking_mode == "tagged":
+            error = case_failure("Empty response from explicit reasoning request", response=think_response)
+        elif thinking_mode == "tagged":
             if "<think>" not in think_content:
-                fail("Explicit reasoning response did not contain <think> tags", content=think_content)
+                error = case_failure("Explicit reasoning response did not contain <think> tags", content=think_content)
         elif thinking_mode == "multiline":
             if think_content == content:
-                fail("Explicit reasoning response matched non-thinking response", content=think_content)
-            if "\n" not in think_content:
-                fail("Explicit reasoning response was not multiline", content=think_content)
+                error = case_failure("Explicit reasoning response matched non-thinking response", content=think_content)
+            elif "\n" not in think_content:
+                error = case_failure("Explicit reasoning response was not multiline", content=think_content)
         else:
             fail(f"Unknown thinking mode: {thinking_mode}")
+
+        if error is not None:
+            print(f"❌ {error}", flush=True)
+            return False, error
 
         record_chat_artifact(
             f"{label}.thinking",
@@ -324,6 +356,8 @@ def validate_case(
             },
         )
         print(f"✅ Explicit reasoning response: {think_content}", flush=True)
+
+    return True, content
 
 
 def write_models_artifact(api_port: int) -> None:
@@ -408,7 +442,16 @@ def main() -> int:
                     "forbid_contains": args.forbid_contains,
                     "expect_exact": args.expect_exact,
                 }
-                validate_case(api_port=api_port, case_cfg=primary_case, default_prompt=args.prompt, log_path=log_path)
+                failures: list[tuple[str, str]] = []
+
+                ok, details = validate_case(
+                    api_port=api_port,
+                    case_cfg=primary_case,
+                    default_prompt=args.prompt,
+                    log_path=log_path,
+                )
+                if not ok:
+                    failures.append((primary_case["label"], details))
 
                 if args.prompt_suite_json:
                     print("Running extra prompt suite...", flush=True)
@@ -416,15 +459,24 @@ def main() -> int:
                     for index, case_cfg in enumerate(suite, start=1):
                         case_cfg = dict(case_cfg)
                         case_cfg.setdefault("label", f"case-{index}")
-                        validate_case(
+                        ok, details = validate_case(
                             api_port=api_port,
                             case_cfg=case_cfg,
                             default_prompt=args.prompt,
                             log_path=log_path,
                         )
+                        if not ok:
+                            failures.append((str(case_cfg["label"]), details))
 
                 print("Testing /v1/models...", flush=True)
                 write_models_artifact(api_port)
+
+                if failures:
+                    print("\n=== Exact smoke test failed ===", flush=True)
+                    print("Failed cases:", flush=True)
+                    for label, details in failures:
+                        print(f"  - {label}: {details}", flush=True)
+                    return 1
 
                 print("\n=== Exact smoke test passed ===", flush=True)
                 return 0

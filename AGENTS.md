@@ -225,6 +225,12 @@ pkill -f mesh-llm; pkill -f rpc-server; pkill -f llama-server
 13. Test `/v1/` passthrough on port 3131.
 
 ### Common failures
+- **Use `tmux` for any long-running remote process** — downloads, deploy steps, validation runs, server startup, and similar remote work should be launched inside `tmux`, not as a plain foreground SSH command and not via `nohup`. This keeps the login environment intact, survives disconnects more reliably, and makes progress/log inspection easier.
+- **Use the native login shell style for remote commands** — when SSHing to a Mac, prefer `zsh -lc "<command>"`; when SSHing to Linux, prefer `bash -lc "<command>"`. This loads the normal user environment, including `PATH` updates, exported env vars such as `HF_TOKEN`, Homebrew paths on macOS, and user-installed CLI tools.
+- **Prefer `scp` + remote scripts over nested SSH one-liners** — for nontrivial remote macOS work, copy a small script to the remote host and run it via `zsh -lc`, optionally inside `tmux` for long-lived tasks. Avoid deeply nested `ssh 'zsh -lc ... tmux ...'` command chains when a script would be clearer and less error-prone.
+- **Match generated remote scripts to the host shell** — when generating a script for a remote Mac, write it as a `zsh` script (for example `#!/bin/zsh`); when generating a script for remote Linux, write it as a `bash` script (for example `#!/usr/bin/env bash` or `#!/bin/bash`). Keep the script shell consistent with the remote command shell you use to launch it.
+- **Verify `tmux` sessions actually stayed up** — when launching a long-running remote process in `tmux`, do not assume `tmux new-session -d ...` means success. Launch a small remote script, redirect its stdout/stderr to real log files, then verify the session with `tmux has-session -t <name>` or `tmux ls` both immediately and again after a short delay before treating it as live.
+- **Use absolute paths for remote tools when needed** — on remote Macs, even with `zsh -lc`, important tools may still be more reliable when referenced explicitly, especially Homebrew binaries like `/opt/homebrew/bin/tmux` and user-installed CLIs under `$HOME/Library/Python/.../bin`.
 - **nohup over SSH doesn't stick** — use `bash -c "nohup ... & disown"`, verify process survives disconnect.
 - **Duplicate processes** — always kill-verify-start.
 - **codesign changes the hash** — don't compare local vs codesigned remote.
