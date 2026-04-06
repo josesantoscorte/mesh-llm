@@ -17,6 +17,7 @@ This repo (`mesh-llm`) contains mesh-llm — a Rust binary that pools GPUs over 
 | `mesh-llm/README.md` | Rust crate overview and file map |
 | `mesh-llm/docs/DESIGN.md` | Architecture, protocols, features |
 | `mesh-llm/docs/TESTING.md` | Test playbook, scenarios, remote deploy |
+| `mesh-llm/docs/SAME_ORIGIN_PARITY_WORKFLOW.md` | Workflow for downloading original checkpoints, converting same-origin GGUF/MLX pairs, validating them, publishing them to `meshllm`, and switching matrix rows |
 | `mesh-llm/docs/MoE_PLAN.md` | MoE expert sharding design |
 | `mesh-llm/docs/MoE_DEPLOY_DESIGN.md` | MoE auto-deploy UX |
 | `mesh-llm/docs/MoE_SPLIT_REPORT.md` | MoE splitting validation results |
@@ -158,6 +159,11 @@ Review:
 - `MLX_VALIDATION_RESULTS/<stamp>/exact-baseline-comparison.tsv`
 - `MLX_VALIDATION_RESULTS/<stamp>/behavior-baseline-comparison.tsv`
 - `MLX_VALIDATION_RESULTS/<stamp>/parity-vs-canonical-baseline.tsv`
+
+When replacing a noisy public pair with a same-origin pair derived from the
+original upstream checkpoint, follow:
+
+- `mesh-llm/docs/SAME_ORIGIN_PARITY_WORKFLOW.md`
 
 Do not silently assume `llama.cpp` changes preserve serving behavior, even when
 the Rust code is unchanged.
