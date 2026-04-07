@@ -403,7 +403,6 @@ fn format_variant_row(index: usize, variant: &RepoVariantInspection) -> String {
 }
 
 fn capability_profile_from_flags(
-    _text: bool,
     vision: bool,
     audio: bool,
     multimodal: bool,
@@ -497,33 +496,33 @@ pub async fn dispatch_models_command(command: &ModelsCommand) -> Result<()> {
             query,
             catalog,
             limit,
-            text,
+            text: _,
             vision,
             audio,
             multimodal,
         } => {
-            let profile = capability_profile_from_flags(*text, *vision, *audio, *multimodal)?;
+            let profile = capability_profile_from_flags(*vision, *audio, *multimodal)?;
             run_model_search(query, *catalog, *limit, profile).await?
         }
         ModelsCommand::Show {
             model,
-            text,
+            text: _,
             vision,
             audio,
             multimodal,
         } => {
-            let profile = capability_profile_from_flags(*text, *vision, *audio, *multimodal)?;
+            let profile = capability_profile_from_flags(*vision, *audio, *multimodal)?;
             run_model_show(model, profile).await?
         }
         ModelsCommand::Download {
             model,
             draft,
-            text,
+            text: _,
             vision,
             audio,
             multimodal,
         } => {
-            let profile = capability_profile_from_flags(*text, *vision, *audio, *multimodal)?;
+            let profile = capability_profile_from_flags(*vision, *audio, *multimodal)?;
             run_model_download(model, *draft, profile).await?
         }
         ModelsCommand::Updates { repo, all, check } => {
@@ -543,35 +542,35 @@ mod tests {
     #[test]
     fn capability_flags_select_profile() {
         assert_eq!(
-            capability_profile_from_flags(false, true, false, false).unwrap(),
+            capability_profile_from_flags(true, false, false).unwrap(),
             CapabilityProfile {
                 vision: true,
                 ..Default::default()
             }
         );
         assert_eq!(
-            capability_profile_from_flags(false, false, true, false).unwrap(),
+            capability_profile_from_flags(false, true, false).unwrap(),
             CapabilityProfile {
                 audio: true,
                 ..Default::default()
             }
         );
         assert_eq!(
-            capability_profile_from_flags(false, false, false, true).unwrap(),
+            capability_profile_from_flags(false, false, true).unwrap(),
             CapabilityProfile {
                 multimodal: true,
                 ..Default::default()
             }
         );
         assert_eq!(
-            capability_profile_from_flags(false, false, false, false).unwrap(),
+            capability_profile_from_flags(false, false, false).unwrap(),
             CapabilityProfile::default()
         );
     }
 
     #[test]
     fn capability_flags_support_intersection() {
-        let profile = capability_profile_from_flags(false, true, true, false).unwrap();
+        let profile = capability_profile_from_flags(true, true, false).unwrap();
         assert!(profile.vision);
         assert!(profile.audio);
         assert!(!profile.multimodal);
