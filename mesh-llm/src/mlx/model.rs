@@ -2986,8 +2986,7 @@ impl MlxModel {
             None
         };
 
-        let tokenizer = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json"))
-            .map_err(|e| anyhow::anyhow!("loading tokenizer: {e}"))?;
+        let tokenizer = load_tokenizer(dir, &config_json)?;
         let prompt_template = crate::mlx::template::PromptTemplate::detect(dir, &config_json);
 
         Ok(MlxModel {
@@ -3566,6 +3565,44 @@ fn read_model_config(dir: &Path) -> Option<Value> {
     serde_json::from_str(&text).ok()
 }
 
+fn patch_phi3_special_token_whitespace(tokenizer_json: &mut Value, config_json: &Value) {
+    let is_phi3 = config_json
+        .get("model_type")
+        .and_then(|value| value.as_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("phi3"));
+    if is_phi3 {
+        let preserve_following_whitespace = ["<|assistant|>", "<|user|>", "<|system|>", "<|end|>"];
+        if let Some(tokens) = tokenizer_json
+            .get_mut("added_tokens")
+            .and_then(|value| value.as_array_mut())
+        {
+            for token in tokens {
+                let should_patch = token
+                    .get("content")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|value| preserve_following_whitespace.contains(&value));
+                if should_patch {
+                    token["rstrip"] = Value::Bool(false);
+                }
+            }
+        }
+    }
+}
+
+fn load_tokenizer(dir: &Path, config_json: &Value) -> Result<tokenizers::Tokenizer> {
+    let tokenizer_path = dir.join("tokenizer.json");
+    let mut tokenizer_json: Value = serde_json::from_str(
+        &std::fs::read_to_string(&tokenizer_path).context("reading tokenizer.json")?,
+    )
+    .context("parsing tokenizer.json")?;
+    patch_phi3_special_token_whitespace(&mut tokenizer_json, config_json);
+
+    tokenizers::Tokenizer::from_bytes(
+        serde_json::to_vec(&tokenizer_json).context("serializing patched tokenizer.json")?,
+    )
+    .map_err(|e| anyhow::anyhow!("loading tokenizer: {e}"))
+}
+
 fn ensure_supported_mlx_model(dir: &Path, config: &Value) -> Result<()> {
     if config_supports_mlx(config) {
         return Ok(());
@@ -3783,6 +3820,29 @@ mod tests {
 
         assert!(!config_supports_mlx(&glm));
         assert!(!config_supports_mlx(&lfm2));
+    }
+
+    #[test]
+    fn phi3_tokenizer_patch_preserves_role_marker_whitespace() {
+        let config = serde_json::json!({"model_type": "phi3"});
+        let mut tokenizer = serde_json::json!({
+            "added_tokens": [
+                {"content":"<|user|>","rstrip":true},
+                {"content":"<|assistant|>","rstrip":true},
+                {"content":"<|end|>","rstrip":true},
+                {"content":"<|endoftext|>","rstrip":true},
+                {"content":"<irrelevant>","rstrip":true}
+            ]
+        });
+
+        patch_phi3_special_token_whitespace(&mut tokenizer, &config);
+
+        let added = tokenizer["added_tokens"].as_array().unwrap();
+        assert_eq!(added[0]["rstrip"], Value::Bool(false));
+        assert_eq!(added[1]["rstrip"], Value::Bool(false));
+        assert_eq!(added[2]["rstrip"], Value::Bool(false));
+        assert_eq!(added[3]["rstrip"], Value::Bool(true));
+        assert_eq!(added[4]["rstrip"], Value::Bool(true));
     }
 
     #[test]
