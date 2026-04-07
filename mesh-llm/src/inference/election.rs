@@ -2473,6 +2473,7 @@ async fn start_llama(
         None
     };
 
+    #[cfg(target_os = "macos")]
     if rpc_ports.is_empty() && crate::mlx::model::is_mlx_model_dir(model) {
         match crate::mlx::server::start_mlx_server(model, model_name.to_string(), llama_port).await
         {
