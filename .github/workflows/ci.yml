@@ -302,7 +302,7 @@ jobs:
       - name: Extract Linux binaries
         run: tar -xzf ci-artifacts/linux-binaries.tgz
 
-      - name: Stage binaries for legacy smokes
+      - name: Stage binaries for inference smokes
         run: |
           mkdir -p target/release llama.cpp/build/bin
           cp linux-binaries/mesh-llm target/release/mesh-llm
