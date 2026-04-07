@@ -15,6 +15,8 @@ Core issues:
   - users could not clearly see when a model was downloadable vs locally runnable.
 - Variant/quant selection lacked a clear contract:
   - users could not tell why one variant was picked over another.
+- Capability variants in mixed repos (text/vision/audio) were not handled consistently:
+  - users could not predict which capability family would be selected.
 - Download reliability behavior (retry, resume, restart) was not explicit as a user-facing contract.
 
 Resulting user pain:
@@ -60,6 +62,13 @@ Notes:
 - `mesh-llm serve --model <repo/model-stem>`
 - `mesh-llm load <repo/model-stem>`
 
+Capability selectors (where supported):
+
+- `--text`
+- `--vision`
+- `--audio`
+- `--multimodal`
+
 ## 4. Search Behavior
 
 Each entry prints:
@@ -76,6 +85,14 @@ Each entry prints:
 Gated entries are listed (not dropped), with:
 
 - `🟡 gated: additional info and downloads are unavailable until terms are accepted`
+
+Capability behavior:
+
+- Selection shown in `search` must respect the requested capability profile.
+- If user passed capability selectors, include:
+  - `🎯 capability: <profile>`
+- If capability profile has no matching variants in a repo, skip recommendation lines for that repo and show:
+  - `🟡 no variants matching requested capability profile`
 
 ### 4.1 Example
 
@@ -108,6 +125,7 @@ $ mesh-llm models search minimax
 Print:
 
 - repo header + stats + short description
+- capability availability summary
 - recommended-for-machine block
 - highest-quality block
 - other variants table
@@ -120,6 +138,7 @@ Columns:
 
 - `🔗 ref`
 - `⚖️ quant`
+- `🎯 capability`
 - `📏 size`
 - `💻 fit`
 
@@ -146,6 +165,7 @@ $ mesh-llm models show unsloth/MiniMax-M2-GGUF
 📦 87 GGUF files  ⬇️ 1,474  ❤️ 87
 💬 text-generation
 📝 Meet MiniMax-M2: compact MoE model for coding and agentic workflows.
+🎯 Capabilities available: text
 
 ✅ recommended for this machine
    🔗 unsloth/MiniMax-M2-GGUF/MiniMax-M2-Q2_K_L
@@ -156,10 +176,10 @@ $ mesh-llm models show unsloth/MiniMax-M2-GGUF
    ⬇️ mesh-llm models download unsloth/MiniMax-M2-GGUF/MiniMax-M2-BF16
 
 🧾 Other variants (Found 25)
-🔗 ref                                                         ⚖️ quant   📏 size     💻 fit
-unsloth/MiniMax-M2-GGUF/MiniMax-M2-Q8_0                       Q8_0       226.4 GB   ❌
-unsloth/MiniMax-M2-GGUF/MiniMax-M2-Q6_K                       Q6_K       174.8 GB   ❌
-unsloth/MiniMax-M2-GGUF/MiniMax-M2-Q5_K_M                     Q5_K_M     151.1 GB   ❌
+🔗 ref                                                         ⚖️ quant   🎯 capability  📏 size     💻 fit
+unsloth/MiniMax-M2-GGUF/MiniMax-M2-Q8_0                       Q8_0       text          226.4 GB   ❌
+unsloth/MiniMax-M2-GGUF/MiniMax-M2-Q6_K                       Q6_K       text          174.8 GB   ❌
+unsloth/MiniMax-M2-GGUF/MiniMax-M2-Q5_K_M                     Q5_K_M     text          151.1 GB   ❌
 ...
 ```
 
@@ -185,9 +205,32 @@ Two outputs are always distinct:
 - `✅ recommended for this machine`: best locally runnable choice.
 - `🏆 highest quality`: best quality ignoring local fit.
 
+Capability matching is evaluated before quant/size ranking.
+
+### 6.0 Capability Variant Handling
+
+Repos may contain capability-specific variants (for example text-only and vision-capable files in the same repo). Selection order is:
+
+1. Determine target capability profile.
+2. Filter variants to those that satisfy that profile.
+3. Apply ranking (`recommended for this machine` / `highest quality`) within the filtered set.
+
+Profile rules:
+
+- Default profile is text-oriented (`--text` behavior) unless user explicitly requests another capability.
+- `--vision` requires vision-capable variants.
+- `--audio` requires audio-capable variants.
+- `--multimodal` requires multimodal-capable variants.
+- Multiple selectors combine as intersection (all requested capabilities must be present).
+
+Failure behavior:
+
+- If no variants satisfy requested capability profile, fail with:
+  - `🟡 No <capability>-capable variants found in <repo>. Run 'mesh-llm models show <repo>' to inspect available variants.`
+
 Resolver policy:
 
-1. Apply required selectors (family/ctx/modality if present).
+1. Apply required selectors (family/ctx/capability if present).
 2. Rank by profile (`recommended` vs `highest quality`).
 3. Tie-break by smaller total bytes, then stable lexical fallback.
 
@@ -214,6 +257,15 @@ $ mesh-llm models download MiniMax-M2.5-REAP-172B-A10B-GGUF
 📥 Ensuring wimmmm/MiniMax-M2.5-REAP-172B-A10B-GGUF/Cerebras-MiniMax-M2.5-REAP-172B-Q4_K_M@main is available locally...
 📥 Downloading model Cerebras-MiniMax-M2.5-REAP-172B-Q4_K_M
 ✅ Cached locally
+```
+
+```text
+$ mesh-llm models download unsloth/MiniMax-M2-GGUF --vision
+🔎 Resolving model ref: unsloth/MiniMax-M2-GGUF --vision
+📦 Repo: unsloth/MiniMax-M2-GGUF
+🧾 Found 26 GGUF variants
+👁️ Requested capability: vision
+🟡 No vision-capable variants found in unsloth/MiniMax-M2-GGUF. Run 'mesh-llm models show unsloth/MiniMax-M2-GGUF' to inspect available variants.
 ```
 
 ```text
@@ -256,6 +308,7 @@ No `Error:` prefix.
 
 - Show repo-level information only when available.
 - For blocked metadata, show gated notice.
+- If capability-specific metadata is blocked, include that capability details are unavailable until terms are accepted.
 
 ### 7.4 Example
 
@@ -270,6 +323,8 @@ Shared fit rule:
 
 - `required_bytes = model_bytes * 1.10`
 - `fits_local = available_vram_bytes >= required_bytes`
+
+Fit is evaluated only after capability-profile filtering chooses eligible variants.
 
 ### 8.1 Download
 
@@ -291,6 +346,7 @@ MoE exception:
 
 ```text
 $ mesh-llm models download unsloth/MiniMax-M2-GGUF/MiniMax-M2-Q8_0
+🎯 capability: text
 🟡 This model is likely too large for local serving on this machine.
 📥 Ensuring unsloth/MiniMax-M2-GGUF/MiniMax-M2-Q8_0@main is available locally...
 ✅ Cached locally
@@ -342,6 +398,7 @@ Format:
 
 ```text
 $ mesh-llm models download unsloth/MiniMax-M2-GGUF/MiniMax-M2-Q4_K_M
+🎯 capability: text
 📥 Downloading model MiniMax-M2-Q4_K_M
 🟡 Download failed (HTTP 503). Retrying in 1.0s (attempt 2/6)
 🟡 Download failed (timeout). Retrying in 2.1s (attempt 3/6)
@@ -415,6 +472,7 @@ After transfer:
 
 ```text
 $ mesh-llm models download unsloth/MiniMax-M2-GGUF/MiniMax-M2-Q4_K_M
+🎯 capability: text
 📥 Ensuring unsloth/MiniMax-M2-GGUF/MiniMax-M2-Q4_K_M@main is available locally...
 📥 Resolved split GGUF: 3 files
 
