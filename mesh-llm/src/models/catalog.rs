@@ -1051,6 +1051,19 @@ mod tests {
     }
 
     #[test]
+    fn expand_split_asset_expands_all_parts_from_first_shard() {
+        let asset = HfAsset {
+            repo: "org/repo".to_string(),
+            revision: "main".to_string(),
+            file: "MiniMax-M2-HQ4_K-00001-of-00004.gguf".to_string(),
+        };
+        let expanded = expand_split_asset(&asset).unwrap();
+        assert_eq!(expanded.len(), 4);
+        assert_eq!(expanded[0].file, "MiniMax-M2-HQ4_K-00001-of-00004.gguf");
+        assert_eq!(expanded[3].file, "MiniMax-M2-HQ4_K-00004-of-00004.gguf");
+    }
+
+    #[test]
     fn path_file_name_matches_nested_path_ignore_case() {
         let path = Path::new("/tmp/cache/Subdir/Model.Q4_K_M.gguf");
         assert!(path_suffix_matches_ignore_case(

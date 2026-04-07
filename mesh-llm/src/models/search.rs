@@ -1,5 +1,6 @@
 use super::resolve::{
-    file_preference_score, matching_catalog_model_for_huggingface, merge_capabilities,
+    canonical_hf_ref_file_component, file_preference_score, matching_catalog_model_for_huggingface,
+    merge_capabilities,
     remote_hf_size_label_with_api,
 };
 use super::ModelCapabilities;
@@ -15,7 +16,6 @@ use tokio::task::JoinSet;
 pub struct SearchHit {
     pub repo_id: String,
     pub repo_url: String,
-    pub file: String,
     pub description: Option<String>,
     pub exact_ref: Option<String>,
     pub metadata_notice: Option<String>,
@@ -132,7 +132,6 @@ async fn build_search_hit(api: TokioApi, repo: RepoSummary) -> Result<Option<Sea
         return Ok(Some(SearchHit {
             repo_id: repo_id.clone(),
             repo_url: access::repo_url(&repo_id),
-            file: "<gated repo: accept terms to inspect GGUF files>".to_string(),
             description: detail.description.clone().or(repo.description.clone()),
             exact_ref: None,
             metadata_notice: Some(access::gated_access_message(&repo_id)),
@@ -183,9 +182,11 @@ async fn build_search_hit(api: TokioApi, repo: RepoSummary) -> Result<Option<Sea
     Ok(Some(SearchHit {
         repo_id: repo_id.clone(),
         repo_url: access::repo_url(&repo_id),
-        file: file.clone(),
         description: detail.description.clone().or(repo.description.clone()),
-        exact_ref: Some(format!("{repo_id}/{file}")),
+        exact_ref: Some(format!(
+            "{repo_id}/{}",
+            canonical_hf_ref_file_component(&file)
+        )),
         metadata_notice: None,
         size_label,
         downloads: detail.downloads.or(repo.downloads),
@@ -222,7 +223,6 @@ async fn build_gated_search_hit(
     Ok(Some(SearchHit {
         repo_id: repo_id.clone(),
         repo_url: access::repo_url(&repo_id),
-        file: "<gated repo: accept terms to inspect GGUF files>".to_string(),
         description: repo.description.clone(),
         exact_ref: None,
         metadata_notice: Some(access::gated_access_message(&repo_id)),

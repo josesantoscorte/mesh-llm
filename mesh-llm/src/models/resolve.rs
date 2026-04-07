@@ -1,6 +1,7 @@
 use super::ModelCapabilities;
 use super::{capabilities, catalog, find_model_path, format_size_bytes};
 use anyhow::{anyhow, bail, Context, Result};
+use hf_hub::{Repo, RepoType};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug)]
@@ -61,12 +62,14 @@ pub async fn download_exact_ref(input: &str) -> Result<PathBuf> {
             revision,
             file,
         } => {
+            let resolved_file =
+                resolve_huggingface_file_selector(&repo, revision.as_deref(), &file).await?;
             if let Some(model) =
-                matching_catalog_primary_for_huggingface(&repo, revision.as_deref(), &file)
+                matching_catalog_primary_for_huggingface(&repo, revision.as_deref(), &resolved_file)
             {
                 return catalog::download_model(model).await;
             }
-            catalog::download_hf_repo_file(&repo, revision.as_deref(), &file).await
+            catalog::download_hf_repo_file(&repo, revision.as_deref(), &resolved_file).await
         }
         ExactModelRef::Url { url, filename } => {
             if let Some(model) = matching_catalog_primary_for_url(&url) {
@@ -134,9 +137,16 @@ pub async fn show_exact_model(input: &str) -> Result<ModelDetails> {
             revision,
             file,
         } => {
-            let exact_ref = format_huggingface_exact_ref(&repo, revision.as_deref(), &file);
-            let catalog = matching_catalog_model_for_huggingface(&repo, revision.as_deref(), &file);
-            let download_url = huggingface_resolve_url(&repo, revision.as_deref(), &file);
+            let resolved_file =
+                resolve_huggingface_file_selector(&repo, revision.as_deref(), &file).await?;
+            let exact_ref = format_huggingface_exact_ref(
+                &repo,
+                revision.as_deref(),
+                &canonical_hf_ref_file_component(&resolved_file),
+            );
+            let catalog =
+                matching_catalog_model_for_huggingface(&repo, revision.as_deref(), &resolved_file);
+            let download_url = huggingface_resolve_url(&repo, revision.as_deref(), &resolved_file);
             let size_label = match catalog {
                 Some(model) => Some(model.size.to_string()),
                 None => remote_size_label(&download_url).await,
@@ -147,7 +157,7 @@ pub async fn show_exact_model(input: &str) -> Result<ModelDetails> {
                     let remote = capabilities::infer_remote_hf_capabilities(
                         &repo,
                         revision.as_deref(),
-                        &file,
+                        &resolved_file,
                         None,
                     )
                     .await;
@@ -157,17 +167,17 @@ pub async fn show_exact_model(input: &str) -> Result<ModelDetails> {
                     capabilities::infer_remote_hf_capabilities(
                         &repo,
                         revision.as_deref(),
-                        &file,
+                        &resolved_file,
                         None,
                     )
                     .await
                 }
             };
             Ok(ModelDetails {
-                display_name: Path::new(&file)
+                display_name: Path::new(&resolved_file)
                     .file_name()
                     .and_then(|value| value.to_str())
-                    .unwrap_or(&file)
+                    .unwrap_or(&resolved_file)
                     .to_string(),
                 exact_ref,
                 source: "huggingface",
@@ -328,7 +338,7 @@ fn matching_catalog_primary_for_url(url: &str) -> Option<&'static catalog::Catal
 }
 
 #[cfg(test)]
-mod tests {
+mod selector_tests {
     use super::*;
 
     #[test]
@@ -404,9 +414,6 @@ pub(super) fn parse_huggingface_ref(input: &str) -> Option<(String, Option<Strin
     if let Some(parsed) = parse_hf_resolve_url(input) {
         return Some(parsed);
     }
-    if !input.ends_with(".gguf") {
-        return None;
-    }
 
     let parts: Vec<&str> = input.splitn(3, '/').collect();
     if parts.len() != 3 {
@@ -457,6 +464,10 @@ fn format_huggingface_exact_ref(repo: &str, revision: Option<&str>, file: &str) 
     }
 }
 
+pub(super) fn canonical_hf_ref_file_component(file: &str) -> String {
+    split_gguf_stem(file).unwrap_or_else(|| file.to_string())
+}
+
 fn remote_filename(input: &str) -> Result<String> {
     input
         .rsplit('/')
@@ -473,17 +484,111 @@ async fn existing_download(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-pub(super) fn file_preference_score(file: &str) -> usize {
-    if file.contains("-00001-of-") {
-        return 0;
+async fn resolve_huggingface_file_selector(
+    repo: &str,
+    revision: Option<&str>,
+    selector: &str,
+) -> Result<String> {
+    if selector.ends_with(".gguf") {
+        return Ok(selector.to_string());
     }
+
+    let target = normalize_selector_key(selector);
+    let api = super::build_hf_tokio_api(false)?;
+    let revision = revision.unwrap_or("main").to_string();
+    let repo_handle = Repo::with_revision(repo.to_string(), RepoType::Model, revision);
+    let detail = api
+        .repo(repo_handle)
+        .info()
+        .await
+        .with_context(|| format!("Resolve Hugging Face model selector {repo}/{selector}"))?;
+
+    let files: Vec<String> = detail
+        .siblings
+        .into_iter()
+        .map(|sibling| sibling.rfilename)
+        .collect();
+
+    choose_hf_file_for_selector(&target, &files)
+        .ok_or_else(|| anyhow::anyhow!("Model file selector not found in repo: {repo}/{selector}"))
+}
+
+fn normalize_selector_key(value: &str) -> String {
+    let basename = Path::new(value)
+        .file_name()
+        .and_then(|part| part.to_str())
+        .unwrap_or(value);
+    split_gguf_stem(basename)
+        .unwrap_or_else(|| basename.trim_end_matches(".gguf").to_string())
+        .to_lowercase()
+}
+
+fn choose_hf_file_for_selector(selector_key: &str, files: &[String]) -> Option<String> {
+    let mut matches: Vec<String> = files
+        .iter()
+        .filter(|file| file.ends_with(".gguf"))
+        .filter(|file| normalize_selector_key(file) == selector_key)
+        .cloned()
+        .collect();
+    if matches.is_empty() {
+        return None;
+    }
+    matches.sort_by(|left, right| {
+        file_preference_score(left)
+            .cmp(&file_preference_score(right))
+            .then_with(|| left.cmp(right))
+    });
+    matches.into_iter().next()
+}
+
+fn split_gguf_stem(value: &str) -> Option<String> {
+    let stem = value.trim_end_matches(".gguf");
+    let of_index = stem.rfind("-of-")?;
+    if !stem[of_index + 4..].chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    let prefix = &stem[..of_index];
+    let dash = prefix.rfind('-')?;
+    if !prefix[dash + 1..].chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    Some(prefix[..dash].to_string())
+}
+
+pub(super) fn file_preference_score(file: &str) -> usize {
     const PREFERRED: &[&str] = &[
         "Q4_K_M", "Q4_K_S", "Q4_1", "Q5_K_M", "Q5_K_S", "Q8_0", "BF16",
     ];
-    PREFERRED
+    let quant_rank = PREFERRED
         .iter()
         .position(|needle| file.contains(needle))
-        .unwrap_or(PREFERRED.len() + 1)
+        .unwrap_or(PREFERRED.len() + 1);
+
+    // Prefer single-file variants over split shards when both exist.
+    // If only split files exist, still prefer shard 1.
+    let split_penalty = if file.contains("-of-") { 100 } else { 0 };
+    let split_part_penalty = split_part_number(file)
+        .map(|part| if part <= 1 { 0 } else { 1_000 + part })
+        .unwrap_or(0);
+
+    quant_rank + split_penalty + split_part_penalty
+}
+
+fn split_part_number(file: &str) -> Option<usize> {
+    let marker = file.find("-of-")?;
+    let prefix = &file[..marker];
+    let digits: String = prefix
+        .chars()
+        .rev()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse::<usize>().ok()
 }
 
 async fn remote_size_label(url: &str) -> Option<String> {
@@ -518,4 +623,46 @@ pub(super) async fn remote_hf_size_label_with_api(
 ) -> Option<String> {
     let url = huggingface_resolve_url(repo, revision, file);
     remote_size_label(&url).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::choose_hf_file_for_selector;
+    use super::file_preference_score;
+    use super::canonical_hf_ref_file_component;
+    use super::normalize_selector_key;
+
+    #[test]
+    fn file_preference_prefers_single_file_over_split() {
+        let single = "MiniMax-M2.5-Q4_K_M.gguf";
+        let split = "Q4_K_M/MiniMax-M2.5-Q4_K_M-00001-of-00004.gguf";
+        assert!(file_preference_score(single) < file_preference_score(split));
+    }
+
+    #[test]
+    fn file_preference_prefers_first_split_part() {
+        let first = "Q4_K_M/MiniMax-M2.5-Q4_K_M-00001-of-00004.gguf";
+        let second = "Q4_K_M/MiniMax-M2.5-Q4_K_M-00002-of-00004.gguf";
+        assert!(file_preference_score(first) < file_preference_score(second));
+    }
+
+    #[test]
+    fn canonical_ref_component_collapses_split_suffix() {
+        assert_eq!(
+            canonical_hf_ref_file_component("MiniMax-M2-HQ4_K-00001-of-00004.gguf"),
+            "MiniMax-M2-HQ4_K".to_string()
+        );
+    }
+
+    #[test]
+    fn selector_chooses_first_split_part_for_stem() {
+        let selector = normalize_selector_key("MiniMax-M2-HQ4_K");
+        let files = vec![
+            "MiniMax-M2-HQ4_K-00003-of-00004.gguf".to_string(),
+            "MiniMax-M2-HQ4_K-00001-of-00004.gguf".to_string(),
+            "MiniMax-M2-HQ4_K-00002-of-00004.gguf".to_string(),
+        ];
+        let chosen = choose_hf_file_for_selector(&selector, &files).unwrap();
+        assert_eq!(chosen, "MiniMax-M2-HQ4_K-00001-of-00004.gguf");
+    }
 }
