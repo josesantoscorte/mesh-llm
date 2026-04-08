@@ -135,6 +135,9 @@ async fn build_search_hit(
         .clone()
         .or(detail.model_id.clone())
         .unwrap_or(repo.id.clone());
+    let repo_id_lc = repo_id.to_ascii_lowercase();
+    let repo_namespace = repo_id_lc.split('/').next().unwrap_or_default();
+    let repo_looks_mlx = repo_namespace == "mlx-community" || repo_id_lc.contains("mlx");
     let sibling_names: Vec<String> = detail
         .siblings
         .iter()
@@ -149,7 +152,9 @@ async fn build_search_hit(
     for candidate in candidates {
         let matches_filter = match filter {
             SearchArtifactFilter::Gguf => candidate.kind == RepoArtifactKind::Gguf,
-            SearchArtifactFilter::Mlx => candidate.kind == RepoArtifactKind::Mlx,
+            SearchArtifactFilter::Mlx => {
+                candidate.kind == RepoArtifactKind::Mlx && repo_looks_mlx
+            }
         };
         if !matches_filter {
             continue;
