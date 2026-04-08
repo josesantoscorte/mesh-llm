@@ -307,6 +307,9 @@ ui-dev api="http://127.0.0.1:3131" port="5173":
     cd "{{ ui_dir }}"
     MESH_UI_API_ORIGIN="{{ api }}" npm run dev -- --host 127.0.0.1 --port {{ port }}
 
+# Run the UI with Vite HMR proxying to the public anarchai.org API
+ui-dev-public: (ui-dev "https://www.anarchai.org")
+
 # Start a lite client — no GPU, no model, just a local HTTP proxy to the mesh host.
 
 # Only needs the mesh-llm binary (no llama.cpp binaries or model).
@@ -319,6 +322,16 @@ auto: build
 
 # ── Utilities ──────────────────────────────────────────────────
 
+# Clean UI build artifacts (node_modules, dist). Fixes stale npm state.
+[unix]
+clean-ui:
+    cd "{{ ui_dir }}" && rm -rf node_modules dist
+    echo "Cleaned UI: node_modules + dist removed"
+
+[windows]
+clean-ui:
+    @powershell -NoProfile -ExecutionPolicy Bypass -Command "Set-Location '{{ ui_dir }}'; Remove-Item -Recurse -Force node_modules,dist -ErrorAction SilentlyContinue"
+    echo "Cleaned UI: node_modules + dist removed"
 # Stop all running servers
 stop:
     pkill -f "mesh-llm" 2>/dev/null || true

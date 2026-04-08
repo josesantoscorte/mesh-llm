@@ -11,3 +11,4 @@ evals/results/
 .sisyphus/
 .playwright-mcp/
 MLX_VALIDATION_RESULTS/
+.envrc
