@@ -29,6 +29,12 @@ pub enum SearchProgress {
     InspectingRepos { completed: usize, total: usize },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SearchArtifactFilter {
+    Gguf,
+    Mlx,
+}
+
 pub fn search_catalog_models(query: &str) -> Vec<&'static catalog::CatalogModel> {
     let q = query.to_lowercase();
     let mut results: Vec<_> = catalog::MODEL_CATALOG
@@ -48,6 +54,7 @@ pub fn search_catalog_models(query: &str) -> Vec<&'static catalog::CatalogModel>
 pub async fn search_huggingface<F>(
     query: &str,
     limit: usize,
+    filter: SearchArtifactFilter,
     mut progress: F,
 ) -> Result<Vec<SearchHit>>
 where
@@ -77,7 +84,7 @@ where
     for _ in 0..SEARCH_CONCURRENCY.min(total.max(1)) {
         if let Some((index, repo)) = pending.next() {
             let api = api.clone();
-            join_set.spawn(async move { (index, build_search_hit(api, repo).await) });
+            join_set.spawn(async move { (index, build_search_hit(api, repo, filter).await) });
         }
     }
 
@@ -92,7 +99,7 @@ where
         }
         if let Some((next_index, repo)) = pending.next() {
             let api = api.clone();
-            join_set.spawn(async move { (next_index, build_search_hit(api, repo).await) });
+            join_set.spawn(async move { (next_index, build_search_hit(api, repo, filter).await) });
         }
     }
 
@@ -108,7 +115,11 @@ where
     Ok(hits)
 }
 
-async fn build_search_hit(api: TokioApi, repo: RepoSummary) -> Result<Vec<SearchHit>> {
+async fn build_search_hit(
+    api: TokioApi,
+    repo: RepoSummary,
+    filter: SearchArtifactFilter,
+) -> Result<Vec<SearchHit>> {
     let detail = api
         .repo(repo.repo())
         .info()
@@ -133,6 +144,13 @@ async fn build_search_hit(api: TokioApi, repo: RepoSummary) -> Result<Vec<Search
 
     let mut hits = Vec::new();
     for candidate in candidates {
+        let matches_filter = match filter {
+            SearchArtifactFilter::Gguf => candidate.kind == RepoArtifactKind::Gguf,
+            SearchArtifactFilter::Mlx => candidate.kind == RepoArtifactKind::Mlx,
+        };
+        if !matches_filter {
+            continue;
+        }
         if candidate.kind == RepoArtifactKind::Mlx && !repo_id_lc.contains("mlx") {
             continue;
         }

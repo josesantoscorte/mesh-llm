@@ -14,6 +14,12 @@ pub enum ModelsCommand {
         /// Search terms.
         #[arg(required = true)]
         query: Vec<String>,
+        /// Filter search results to GGUF artifacts (default).
+        #[arg(long, conflicts_with = "mlx")]
+        gguf: bool,
+        /// Filter search results to MLX artifacts.
+        #[arg(long, conflicts_with = "gguf")]
+        mlx: bool,
         /// Search only the built-in catalog.
         #[arg(long)]
         catalog: bool,

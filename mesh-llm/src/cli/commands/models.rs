@@ -2,21 +2,50 @@ use crate::cli::models::ModelsCommand;
 use crate::models::{
     capabilities, catalog, download_exact_ref, find_catalog_model_exact, huggingface_hub_cache_dir,
     installed_model_capabilities, scan_installed_models, search_catalog_models, search_huggingface,
-    show_exact_model, MlxSelectionPolicy, ResolveFormatPreference, SearchProgress,
+    show_exact_model, MlxSelectionPolicy, ResolveFormatPreference, SearchArtifactFilter,
+    SearchProgress,
 };
 use crate::system::hardware;
 use anyhow::{anyhow, Result};
 use std::io::Write;
 
-pub async fn run_model_search(query: &[String], catalog_only: bool, limit: usize) -> Result<()> {
+pub async fn run_model_search(
+    query: &[String],
+    prefer_gguf: bool,
+    prefer_mlx: bool,
+    catalog_only: bool,
+    limit: usize,
+) -> Result<()> {
     let query = query.join(" ");
+    let filter = if prefer_mlx {
+        SearchArtifactFilter::Mlx
+    } else if prefer_gguf {
+        SearchArtifactFilter::Gguf
+    } else {
+        // Default to GGUF when neither flag is provided.
+        SearchArtifactFilter::Gguf
+    };
+    let filter_label = match filter {
+        SearchArtifactFilter::Gguf => "GGUF",
+        SearchArtifactFilter::Mlx => "MLX",
+    };
+
     if catalog_only {
-        let results = search_catalog_models(&query);
+        let results: Vec<_> = search_catalog_models(&query)
+            .into_iter()
+            .filter(|model| match filter {
+                SearchArtifactFilter::Gguf => {
+                    model.file.to_ascii_lowercase().ends_with(".gguf")
+                        || model.file.to_ascii_lowercase().contains("gguf")
+                }
+                SearchArtifactFilter::Mlx => model.file.to_ascii_lowercase().contains("mlx"),
+            })
+            .collect();
         if results.is_empty() {
-            eprintln!("🔎 No catalog models matched '{query}'.");
+            eprintln!("🔎 No {filter_label} catalog models matched '{query}'.");
             return Ok(());
         }
-        println!("📚 Catalog matches for '{query}'");
+        println!("📚 {filter_label} catalog matches for '{query}'");
         if let Some(summary) = local_capacity_summary() {
             println!("{}", summary);
         }
@@ -31,9 +60,9 @@ pub async fn run_model_search(query: &[String], catalog_only: bool, limit: usize
         return Ok(());
     }
 
-    eprintln!("🔎 Searching Hugging Face GGUF repos for '{query}'...");
+    eprintln!("🔎 Searching Hugging Face {filter_label} repos for '{query}'...");
     let mut announced_repo_scan = false;
-    let results = search_huggingface(&query, limit, |progress| match progress {
+    let results = search_huggingface(&query, limit, filter, |progress| match progress {
         SearchProgress::SearchingHub => {}
         SearchProgress::InspectingRepos { completed, total } => {
             if total == 0 {
@@ -55,11 +84,11 @@ pub async fn run_model_search(query: &[String], catalog_only: bool, limit: usize
     })
     .await?;
     if results.is_empty() {
-        eprintln!("🔎 No Hugging Face GGUF matches for '{query}'.");
+        eprintln!("🔎 No Hugging Face {filter_label} matches for '{query}'.");
         return Ok(());
     }
 
-    println!("🔎 Hugging Face GGUF matches for '{query}'");
+    println!("🔎 Hugging Face {filter_label} matches for '{query}'");
     if let Some(summary) = local_capacity_summary() {
         println!("{}", summary);
     }
@@ -346,9 +375,11 @@ pub async fn dispatch_models_command(command: &ModelsCommand) -> Result<()> {
         ModelsCommand::Installed => run_model_installed(),
         ModelsCommand::Search {
             query,
+            gguf,
+            mlx,
             catalog,
             limit,
-        } => run_model_search(query, *catalog, *limit).await?,
+        } => run_model_search(query, *gguf, *mlx, *catalog, *limit).await?,
         ModelsCommand::Show { model } => run_model_show(model).await?,
         ModelsCommand::Download {
             model,
