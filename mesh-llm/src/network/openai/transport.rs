@@ -8,7 +8,9 @@ use crate::mesh;
 use crate::network::affinity::{
     prepare_remote_targets_for_request, AffinityRouter, PreparedTargets,
 };
+use crate::network::openai::adapter;
 use crate::network::openai::errors;
+use crate::network::openai::schema;
 use crate::network::router;
 use crate::plugin;
 use anyhow::{anyhow, bail, Context, Result};
@@ -457,6 +459,17 @@ fn normalize_openai_compat_request(
     path: &str,
     body: &mut serde_json::Value,
 ) -> Result<RequestNormalization> {
+    // Typed edge parsing for known OpenAI-compatible request envelopes.
+    match path_only(path) {
+        "/v1/chat/completions" => {
+            let _ = adapter::parse_chat_request(body)?;
+        }
+        "/v1/responses" => {
+            let _ = adapter::parse_responses_request(body)?;
+        }
+        _ => {}
+    }
+
     let Some(object) = body.as_object_mut() else {
         return Ok(RequestNormalization {
             changed: false,
@@ -1296,13 +1309,12 @@ fn responses_stream_completed_event(
     })
 }
 
-fn upstream_usage_to_responses_usage(chunk: &serde_json::Value) -> Option<serde_json::Value> {
-    let usage = chunk.get("usage")?;
-    Some(serde_json::json!({
-        "input_tokens": usage.get("prompt_tokens").cloned().unwrap_or(serde_json::Value::Null),
-        "output_tokens": usage.get("completion_tokens").cloned().unwrap_or(serde_json::Value::Null),
-        "total_tokens": usage.get("total_tokens").cloned().unwrap_or(serde_json::Value::Null),
-    }))
+fn stream_usage_to_responses_usage(usage: &schema::StreamUsage) -> serde_json::Value {
+    serde_json::json!({
+        "input_tokens": usage.prompt_tokens.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null),
+        "output_tokens": usage.completion_tokens.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null),
+        "total_tokens": usage.total_tokens.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null),
+    })
 }
 
 async fn relay_translated_responses_stream<R: AsyncRead + Unpin>(
@@ -1353,9 +1365,8 @@ async fn relay_translated_responses_stream<R: AsyncRead + Unpin>(
                 done_seen = true;
                 break;
             }
-            let chunk: serde_json::Value =
-                serde_json::from_str(&data).context("parse upstream chat stream chunk")?;
-            if let Some(chunk_model) = chunk.get("model").and_then(|value| value.as_str()) {
+            let chunk = adapter::parse_chat_stream_chunk(&data)?;
+            if let Some(chunk_model) = chunk.model.as_deref() {
                 if model.is_empty() {
                     model = chunk_model.to_string();
                 }
@@ -1369,12 +1380,10 @@ async fn relay_translated_responses_stream<R: AsyncRead + Unpin>(
                 created_emitted = true;
             }
             if let Some(delta) = chunk
-                .get("choices")
-                .and_then(|value| value.as_array())
-                .and_then(|choices| choices.first())
-                .and_then(|choice| choice.get("delta"))
-                .and_then(|delta| delta.get("content"))
-                .and_then(|value| value.as_str())
+                .choices
+                .first()
+                .and_then(|choice| choice.delta.as_ref())
+                .and_then(|delta| delta.content.as_deref())
             {
                 output_text.push_str(delta);
                 let event = serde_json::to_string(&responses_stream_delta_event(&item_id, delta))
@@ -1383,7 +1392,7 @@ async fn relay_translated_responses_stream<R: AsyncRead + Unpin>(
                     .await?;
             }
             if usage.is_none() {
-                usage = upstream_usage_to_responses_usage(&chunk);
+                usage = chunk.usage.as_ref().map(stream_usage_to_responses_usage);
             }
         }
 
