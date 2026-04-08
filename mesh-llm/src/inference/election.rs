@@ -1384,8 +1384,10 @@ pub async fn election_loop(
                     if let Some(proxy) = backend_proxy.take() {
                         proxy.shutdown().await;
                     }
+                    tunnel_mgr.set_http_port(0).await;
                     currently_host = false;
                     current_local_port = None;
+                    node.set_role(NodeRole::Worker).await;
                     update_targets(&node, &model_name, InferenceTarget::None, &target_tx).await;
                     on_process(None);
                     on_change(false, false);
