@@ -475,7 +475,21 @@ mod tests {
             parsed,
             Some((
                 "GreenBitAI/Llama-2-7B-layer-mix-bpw-2.2-mlx".to_string(),
+                None,
                 None
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_huggingface_repo_ref_parses_quant_selector() {
+        let parsed = parse_huggingface_repo_ref("unsloth/gemma-4-31B-it-GGUF:UD-Q4_K_XL");
+        assert_eq!(
+            parsed,
+            Some((
+                "unsloth/gemma-4-31B-it-GGUF".to_string(),
+                None,
+                Some("UD-Q4_K_XL".to_string())
             ))
         );
     }
@@ -486,7 +500,7 @@ mod tests {
             parse_huggingface_repo_url("https://huggingface.co/unsloth/gemma-4-31B-it-GGUF");
         assert_eq!(
             parsed,
-            Some(("unsloth/gemma-4-31B-it-GGUF".to_string(), None))
+            Some(("unsloth/gemma-4-31B-it-GGUF".to_string(), None, None))
         );
     }
 
@@ -499,8 +513,23 @@ mod tests {
             parsed,
             Some((
                 "unsloth/gemma-4-31B-it-GGUF".to_string(),
-                Some("main".to_string())
+                Some("main".to_string()),
+                None
             ))
+        );
+    }
+
+    #[test]
+    fn quant_selector_resolves_to_first_matching_split_gguf() {
+        let siblings = vec![
+            "UD-Q5_K_XL/gemma-4-31B-it-UD-Q5_K_XL-00001-of-00009.gguf".to_string(),
+            "UD-Q4_K_XL/gemma-4-31B-it-UD-Q4_K_XL-00002-of-00009.gguf".to_string(),
+            "UD-Q4_K_XL/gemma-4-31B-it-UD-Q4_K_XL-00001-of-00009.gguf".to_string(),
+        ];
+        let resolved = resolve_hf_file_from_siblings("UD-Q4_K_XL", &siblings).unwrap();
+        assert_eq!(
+            resolved,
+            "UD-Q4_K_XL/gemma-4-31B-it-UD-Q4_K_XL-00001-of-00009.gguf"
         );
     }
 }
@@ -559,7 +588,31 @@ pub(super) fn parse_huggingface_ref(input: &str) -> Option<(String, Option<Strin
     ))
 }
 
-fn parse_huggingface_repo_ref(input: &str) -> Option<(String, Option<String>)> {
+fn parse_repo_tail_selector_and_revision(
+    tail: &str,
+) -> Option<(String, Option<String>, Option<String>)> {
+    let (with_selector, revision) = match tail.split_once('@') {
+        Some((repo, revision)) => {
+            if repo.is_empty() || revision.is_empty() {
+                return None;
+            }
+            (repo, Some(revision.to_string()))
+        }
+        None => (tail, None),
+    };
+    let (repo_tail, selector) = match with_selector.split_once(':') {
+        Some((repo, selector)) => {
+            if repo.is_empty() || selector.is_empty() {
+                return None;
+            }
+            (repo, Some(selector.to_string()))
+        }
+        None => (with_selector, None),
+    };
+    Some((repo_tail.to_string(), revision, selector))
+}
+
+fn parse_huggingface_repo_ref(input: &str) -> Option<(String, Option<String>, Option<String>)> {
     let parts: Vec<&str> = input.splitn(2, '/').collect();
     if parts.len() != 2 {
         return None;
@@ -567,17 +620,11 @@ fn parse_huggingface_repo_ref(input: &str) -> Option<(String, Option<String>)> {
     if parts[0].is_empty() || parts[1].is_empty() || parts[0].contains(':') {
         return None;
     }
-    let (repo_tail, revision) = match parts[1].split_once('@') {
-        Some((repo, revision)) => (repo, Some(revision.to_string())),
-        None => (parts[1], None),
-    };
-    if repo_tail.is_empty() {
-        return None;
-    }
-    Some((format!("{}/{}", parts[0], repo_tail), revision))
+    let (repo_tail, revision, selector) = parse_repo_tail_selector_and_revision(parts[1])?;
+    Some((format!("{}/{}", parts[0], repo_tail), revision, selector))
 }
 
-fn parse_huggingface_repo_url(input: &str) -> Option<(String, Option<String>)> {
+fn parse_huggingface_repo_url(input: &str) -> Option<(String, Option<String>, Option<String>)> {
     let tail = input
         .strip_prefix("https://huggingface.co/")
         .or_else(|| input.strip_prefix("http://huggingface.co/"))?;
@@ -593,12 +640,13 @@ fn parse_huggingface_repo_url(input: &str) -> Option<(String, Option<String>)> {
     if parts.len() < 2 || parts[0].is_empty() || parts[1].is_empty() {
         return None;
     }
-    let repo = format!("{}/{}", parts[0], parts[1]);
+    let (repo_tail, selector_revision, selector) = parse_repo_tail_selector_and_revision(parts[1])?;
+    let repo = format!("{}/{}", parts[0], repo_tail);
     if parts.len() >= 4 && parts[2] == "tree" && !parts[3].is_empty() {
-        return Some((repo, Some(parts[3].to_string())));
+        return Some((repo, Some(parts[3].to_string()), selector));
     }
     if parts.len() == 2 {
-        return Some((repo, None));
+        return Some((repo, selector_revision, selector));
     }
     None
 }
@@ -614,18 +662,18 @@ fn parse_exact_model_ref(input: &str) -> Result<ExactModelRef> {
             file,
         });
     }
-    if let Some((repo, revision)) = parse_huggingface_repo_ref(input) {
+    if let Some((repo, revision, selector)) = parse_huggingface_repo_ref(input) {
         return Ok(ExactModelRef::HuggingFace {
             repo,
             revision,
-            file: String::new(),
+            file: selector.unwrap_or_default(),
         });
     }
-    if let Some((repo, revision)) = parse_huggingface_repo_url(input) {
+    if let Some((repo, revision, selector)) = parse_huggingface_repo_url(input) {
         return Ok(ExactModelRef::HuggingFace {
             repo,
             revision,
-            file: String::new(),
+            file: selector.unwrap_or_default(),
         });
     }
     if input.starts_with("http://") || input.starts_with("https://") {
@@ -635,7 +683,7 @@ fn parse_exact_model_ref(input: &str) -> Result<ExactModelRef> {
         });
     }
     bail!(
-        "Expected an exact model ref. Use a catalog id, a Hugging Face ref like org/repo, org/repo/file.gguf, org/repo/file-stem for split GGUFs, org/repo/model.safetensors, or org/repo/model-00001-of-00048.safetensors, or a direct URL."
+        "Expected an exact model ref. Use a catalog id, a Hugging Face ref like org/repo, org/repo:QUANT, org/repo/file.gguf, org/repo/file-stem for split GGUFs, org/repo/model.safetensors, or org/repo/model-00001-of-00048.safetensors, or a direct URL."
     )
 }
 
@@ -703,16 +751,18 @@ fn resolve_hf_file_from_siblings(requested: &str, siblings: &[String]) -> Option
             let lower = file.to_lowercase();
             let rank = if lower == requested_lower {
                 0
-            } else if lower == safetensors_exact {
+            } else if gguf_matches_quant_selector(&lower, &requested_lower) {
                 1
+            } else if lower == safetensors_exact {
+                2
             } else if lower.starts_with(&safetensors_split_prefix)
                 && lower.ends_with(".safetensors")
             {
-                2
-            } else if lower == gguf_exact {
                 3
-            } else if lower.starts_with(&gguf_split_prefix) && lower.ends_with(".gguf") {
+            } else if lower == gguf_exact {
                 4
+            } else if lower.starts_with(&gguf_split_prefix) && lower.ends_with(".gguf") {
+                5
             } else {
                 return None;
             };
@@ -720,6 +770,16 @@ fn resolve_hf_file_from_siblings(requested: &str, siblings: &[String]) -> Option
         })
         .min_by(|left, right| left.cmp(right))
         .map(|(_, _, file)| file)
+}
+
+fn gguf_matches_quant_selector(file_lower: &str, selector_lower: &str) -> bool {
+    if !file_lower.ends_with(".gguf") || selector_lower.is_empty() {
+        return false;
+    }
+    file_lower.contains(&format!("/{selector_lower}/"))
+        || file_lower.contains(&format!("-{selector_lower}-"))
+        || file_lower.ends_with(&format!("-{selector_lower}.gguf"))
+        || file_lower.ends_with(&format!("/{selector_lower}.gguf"))
 }
 
 async fn resolve_huggingface_file(
