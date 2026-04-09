@@ -128,6 +128,10 @@ import {
   validateAttachmentFile,
 } from "./lib/attachments";
 import {
+  canRunBrowserVision,
+  describeImage,
+} from "./lib/image-describe";
+import {
   dataUrlToArrayBuffer,
   extractPdfText,
   isPdfMimeType,
@@ -386,6 +390,8 @@ type ChatAttachment = {
   extractionSummary?: string;
   /** Page images rendered from a scanned PDF (data URLs). */
   renderedPageImages?: string[];
+  /** Browser-generated image description (when no vision model is warm). */
+  imageDescription?: string;
 };
 
 type ChatMessage = {
@@ -1060,6 +1066,11 @@ export function App() {
         if (attachment.renderedPageImages?.length) kinds.add("image");
         continue;
       }
+      // Images with a browser-generated description will be sent as
+      // input_text — no vision model needed.
+      if (attachment.kind === "image" && attachment.imageDescription) {
+        continue;
+      }
       kinds.add(attachment.kind);
     }
     return kinds;
@@ -1471,6 +1482,15 @@ export function App() {
         continue;
       }
 
+      // Image described locally → inject description as input_text.
+      if (attachment.kind === "image" && attachment.imageDescription) {
+        contentBlocks.push({
+          type: "input_text",
+          text: attachment.imageDescription,
+        });
+        continue;
+      }
+
       // Scanned PDF rendered as images → inject each page as input_image.
       if (attachment.renderedPageImages?.length) {
         for (const pageDataUrl of attachment.renderedPageImages) {
@@ -1849,6 +1869,7 @@ export function App() {
                 extractedText,
                 extractionSummary,
                 renderedPageImages,
+                imageDescription,
                 ...attachment
               }) => attachment,
             )
@@ -2918,6 +2939,76 @@ export function ChatPage(props: {
     setComposerError(null);
   }
 
+  /** Check if any warm model in the mesh has vision support. */
+  function hasWarmVisionModel(): boolean {
+    return warmModels.some((m) => meshModelByName[m]?.vision);
+  }
+
+  /**
+   * Add an image attachment, then auto-describe it via a browser-local
+   * vision model if no warm vision model is available in the mesh.
+   */
+  function addImageAttachment(attachment: Omit<ChatAttachment, "id" | "status" | "error">) {
+    const attachmentId = randomId();
+    const needsDescription = !hasWarmVisionModel() && canRunBrowserVision();
+    setPendingAttachments((prev) => [
+      ...prev,
+      {
+        id: attachmentId,
+        status: needsDescription ? "uploading" : "pending",
+        extractionSummary: needsDescription ? "Describing image..." : undefined,
+        ...attachment,
+      },
+    ]);
+    if (needsDescription) {
+      void describeImageAttachment(attachmentId, attachment.dataUrl);
+    }
+  }
+
+  async function describeImageAttachment(attachmentId: string, dataUrl: string) {
+    try {
+      const result = await describeImage(dataUrl, (message) => {
+        setPendingAttachments((prev) =>
+          prev.map((a) =>
+            a.id === attachmentId
+              ? { ...a, extractionSummary: message }
+              : a,
+          ),
+        );
+      });
+      setPendingAttachments((prev) =>
+        prev.map((a) =>
+          a.id === attachmentId
+            ? {
+                ...a,
+                status: "pending",
+                imageDescription: result.combinedText,
+                extractionSummary: result.ocrText
+                  ? "Described + OCR extracted"
+                  : "Described by local vision",
+              }
+            : a,
+        ),
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setPendingAttachments((prev) =>
+        prev.map((a) =>
+          a.id === attachmentId
+            ? {
+                ...a,
+                status: "pending",
+                extractionSummary: undefined,
+                // Don't fail the attachment — it can still be sent if
+                // the user switches to a vision model.
+              }
+            : a,
+        ),
+      );
+      console.warn("Image description failed:", message);
+    }
+  }
+
   function handleImageSelect(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -2946,7 +3037,7 @@ export function ChatPage(props: {
         canvas.height = height;
         const ctx = canvas.getContext("2d");
         if (!ctx) {
-          addPendingAttachment({
+          addImageAttachment({
             kind: "image",
             dataUrl: src,
             mimeType: parseDataUrl(src)?.mimeType || file.type || "image/jpeg",
@@ -2955,7 +3046,7 @@ export function ChatPage(props: {
           return;
         }
         ctx.drawImage(img, 0, 0, width, height);
-        addPendingAttachment({
+        addImageAttachment({
           kind: "image",
           dataUrl: canvas.toDataURL("image/jpeg", 0.85),
           mimeType: "image/jpeg",
@@ -2964,7 +3055,7 @@ export function ChatPage(props: {
       };
       img.onerror = () => {
         // Canvas resize failed — send original (may be large but better than nothing)
-        addPendingAttachment({
+        addImageAttachment({
           kind: "image",
           dataUrl: src,
           mimeType: parseDataUrl(src)?.mimeType || file.type || "image/jpeg",
@@ -3629,7 +3720,7 @@ export function ChatPage(props: {
                         {attachment.status === "uploading" ? (
                           <div className="absolute inset-0 flex items-center justify-center rounded-md bg-background/70 text-xs">
                             <Loader2 className="mr-1 h-3 w-3 animate-spin" />
-                            Uploading
+                            {attachment.extractionSummary || "Uploading"}
                           </div>
                         ) : attachment.status === "failed" ? (
                           <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 rounded-md bg-background/80 text-xs">
@@ -3643,6 +3734,11 @@ export function ChatPage(props: {
                             >
                               Retry
                             </Button>
+                          </div>
+                        ) : null}
+                        {attachment.extractionSummary && attachment.status !== "uploading" ? (
+                          <div className="absolute inset-x-0 bottom-0 rounded-b-md bg-background/80 px-1.5 py-0.5 text-[10px] text-muted-foreground truncate">
+                            {attachment.extractionSummary}
                           </div>
                         ) : null}
                       </div>
