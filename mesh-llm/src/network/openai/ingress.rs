@@ -51,8 +51,7 @@ pub(crate) async fn api_proxy(
             )
             .await
             {
-                Ok(request) => {
-                    let body_json = request.body_json.as_ref();
+                Ok(mut request) => {
                     if proxy::is_models_list_request(&request.method, &request.path) {
                         let mut models: Vec<String> = targets.targets.keys().cloned().collect();
                         if let Some(plugin_manager) = plugin_manager.as_ref() {
@@ -137,7 +136,8 @@ pub(crate) async fn api_proxy(
                     let (effective_model, classification) = if request.model_name.is_none()
                         || request.model_name.as_deref() == Some("auto")
                     {
-                        if let Some(body_json) = body_json {
+                        request.ensure_body_json();
+                        if let Some(body_json) = request.body_json.as_ref() {
                             let cl = router::classify(body_json);
                             let mut available_models: Vec<String> =
                                 targets.targets.keys().cloned().collect();
@@ -176,6 +176,10 @@ pub(crate) async fn api_proxy(
                     } else {
                         (request.model_name.clone(), None)
                     };
+                    let required_tokens = proxy::request_budget_tokens_from_parts(
+                        request.body_len_bytes,
+                        request.completion_tokens,
+                    );
 
                     if let Some(ref name) = effective_model {
                         node.record_request(name);
@@ -218,6 +222,7 @@ pub(crate) async fn api_proxy(
                             if let (Some((planner_name, planner_port)), Some(strong_port)) =
                                 (planner, strong_local_port)
                             {
+                                request.ensure_body_json();
                                 if let Some(body_json) = request.body_json.clone() {
                                     tracing::info!(
                                         "pipeline: {planner_name} (plan) → {strong_name} (execute)"
@@ -256,13 +261,17 @@ pub(crate) async fn api_proxy(
                                 .session_hint
                                 .clone()
                                 .unwrap_or_else(|| format!("{addr}"));
+                            if targets.get_moe_failover_targets(&session_hint).len() > 1 {
+                                request.ensure_body_json();
+                            }
                             let routed = proxy::route_moe_request(
                                 node.clone(),
                                 tcp_stream,
                                 &targets,
                                 name,
                                 &session_hint,
-                                body_json,
+                                request.body_json.as_ref(),
+                                required_tokens,
                                 &request.raw,
                             )
                             .await;
@@ -323,12 +332,16 @@ pub(crate) async fn api_proxy(
                                 first_available_target(&targets)
                             }
                         } else {
+                            if targets.candidates(name).len() > 1 {
+                                request.ensure_body_json();
+                            }
                             let routed = proxy::route_model_request(
                                 node.clone(),
                                 tcp_stream,
                                 &targets,
                                 name,
-                                body_json,
+                                request.body_json.as_ref(),
+                                required_tokens,
                                 &request.raw,
                                 request.response_adapter,
                                 &affinity,

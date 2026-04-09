@@ -15,6 +15,7 @@ use crate::network::openai::response_adapter;
 use crate::network::router;
 use crate::plugin;
 use anyhow::{anyhow, bail, Context, Result};
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -59,10 +60,27 @@ pub struct BufferedHttpRequest {
     pub method: String,
     pub path: String,
     pub body_json: Option<serde_json::Value>,
+    body_json_attempted: bool,
+    body_bytes: Option<Vec<u8>>,
+    pub body_len_bytes: usize,
+    pub completion_tokens: Option<u32>,
     pub model_name: Option<String>,
     pub session_hint: Option<String>,
     pub request_object_request_ids: Vec<String>,
     pub response_adapter: ResponseAdapter,
+}
+
+impl BufferedHttpRequest {
+    pub fn ensure_body_json(&mut self) {
+        if self.body_json.is_none() && !self.body_json_attempted {
+            self.body_json = self
+                .body_bytes
+                .as_deref()
+                .and_then(|body| serde_json::from_slice(body).ok())
+                .or_else(|| parse_json_body_from_http_request(&self.raw));
+            self.body_json_attempted = true;
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,6 +137,24 @@ struct ParsedResponseHeaders {
     header_end: usize,
     status_code: u16,
     content_length: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RequestMetadata {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    user: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    max_completion_tokens: Option<u32>,
+    #[serde(default)]
+    max_tokens: Option<u32>,
+    #[serde(default)]
+    max_output_tokens: Option<u32>,
+    #[serde(default)]
+    n_predict: Option<u32>,
 }
 
 struct ResponseProbe {
@@ -205,15 +241,20 @@ async fn read_http_request_with_limits(
         Vec::new()
     };
 
-    let mut body_json = if body.is_empty() {
+    let metadata = if body.is_empty() {
         None
     } else {
-        serde_json::from_slice(&body).ok()
+        serde_json::from_slice::<RequestMetadata>(&body).ok()
     };
+    let mut body_json = None;
     let mut request_object_request_ids = Vec::new();
     let mut request_path = parsed.path.clone();
     let mut response_adapter = ResponseAdapter::None;
-    let rewritten_body = if let Some(body_json) = body_json.as_mut() {
+    let requires_json_transform =
+        request_requires_json_transform(&parsed.path, &body, plugin_manager.is_some());
+    let rewritten_body = if requires_json_transform {
+        body_json = serde_json::from_slice(&body).ok();
+        if let Some(body_json) = body_json.as_mut() {
         let normalization = normalize_openai_compat_request(&parsed.path, body_json)?;
         let mut changed = normalization.changed;
         if let Some(rewritten_path) = normalization.rewritten_path {
@@ -236,11 +277,23 @@ async fn read_http_request_with_limits(
         } else {
             None
         }
+        } else {
+            None
+        }
     } else {
         None
     };
-    let model_name = body_json.as_ref().and_then(extract_model_from_json);
-    let session_hint = body_json.as_ref().and_then(extract_session_hint_from_json);
+    let model_name = metadata.as_ref().and_then(|value| value.model.clone());
+    let session_hint = metadata
+        .as_ref()
+        .and_then(|value| value.user.clone().or_else(|| value.session_id.clone()));
+    let completion_tokens = metadata.as_ref().and_then(|value| {
+        value
+            .max_completion_tokens
+            .or(value.max_tokens)
+            .or(value.max_output_tokens)
+            .or(value.n_predict)
+    });
     let raw = finalize_forwarded_request(
         raw,
         header_end,
@@ -248,12 +301,18 @@ async fn read_http_request_with_limits(
         Some(&request_path),
         rewritten_body.as_deref(),
     )?;
+    let body_len_bytes = body.len();
+    let body_bytes = if body.is_empty() { None } else { Some(body) };
 
     Ok(BufferedHttpRequest {
         raw,
         method: parsed.method,
         path: request_path,
         body_json,
+        body_json_attempted: requires_json_transform,
+        body_bytes,
+        body_len_bytes,
+        completion_tokens,
         model_name,
         session_hint,
         request_object_request_ids,
@@ -449,18 +508,40 @@ fn try_decode_chunked_body(buf: &[u8], max_body_bytes: usize) -> Result<Option<(
     }
 }
 
-fn extract_model_from_json(body: &serde_json::Value) -> Option<String> {
-    body.get("model")
-        .and_then(|value| value.as_str())
-        .map(ToString::to_string)
+fn request_requires_json_transform(
+    path: &str,
+    body: &[u8],
+    plugin_manager_present: bool,
+) -> bool {
+    let path_only = path.split('?').next().unwrap_or(path);
+    if body.is_empty() {
+        return false;
+    }
+    if path_only == "/v1/responses" {
+        return true;
+    }
+    if path_only != "/v1/chat/completions" {
+        return false;
+    }
+
+    let body_text = match std::str::from_utf8(body) {
+        Ok(text) => text,
+        Err(_) => return false,
+    };
+
+    body_text.contains("\"max_completion_tokens\"")
+        || body_text.contains("\"max_output_tokens\"")
+        || (plugin_manager_present
+            && (body_text.contains("mesh://blob/")
+                || body_text.contains("\"blob_token\"")
+                || body_text.contains("\"mesh_token\"")
+                || body_text.contains("\"input_audio\"")
+                || body_text.contains("\"input_image\"")))
 }
 
-fn extract_session_hint_from_json(body: &serde_json::Value) -> Option<String> {
-    ["user", "session_id"].into_iter().find_map(|key| {
-        body.get(key)
-            .and_then(|value| value.as_str())
-            .map(ToString::to_string)
-    })
+fn parse_json_body_from_http_request(raw: &[u8]) -> Option<serde_json::Value> {
+    let header_end = raw.windows(4).position(|window| window == b"\r\n\r\n")? + 4;
+    serde_json::from_slice(&raw[header_end..]).ok()
 }
 
 fn normalize_openai_compat_request(
@@ -711,9 +792,9 @@ fn ceil_div_u32(value: u32, divisor: u32) -> u32 {
     value.saturating_add(divisor - 1) / divisor
 }
 
+#[cfg(test)]
 fn request_budget_tokens(body: &serde_json::Value) -> Option<u32> {
     let serialized = serde_json::to_vec(body).ok()?;
-    let prompt_tokens = ceil_div_u32(saturating_u32(serialized.len()), 4);
     let completion_tokens = [
         "max_completion_tokens",
         "max_tokens",
@@ -722,11 +803,21 @@ fn request_budget_tokens(body: &serde_json::Value) -> Option<u32> {
     ]
     .into_iter()
     .find_map(|key| body.get(key).and_then(|value| value.as_u64()))
-    .map(|value| value.min(u32::MAX as u64) as u32)
-    .unwrap_or(0);
+    .map(|value| value.min(u32::MAX as u64) as u32);
+    request_budget_tokens_from_parts(serialized.len(), completion_tokens)
+}
+
+pub(crate) fn request_budget_tokens_from_parts(
+    body_len_bytes: usize,
+    completion_tokens: Option<u32>,
+) -> Option<u32> {
+    if body_len_bytes == 0 {
+        return None;
+    }
+    let prompt_tokens = ceil_div_u32(saturating_u32(body_len_bytes), 4);
     Some(
         prompt_tokens
-            .saturating_add(completion_tokens)
+            .saturating_add(completion_tokens.unwrap_or(0))
             .saturating_add(REQUEST_TOKEN_MARGIN),
     )
 }
@@ -766,10 +857,9 @@ fn reorder_candidates_by_context<T: Clone>(
 async fn order_remote_hosts_by_context(
     node: &mesh::Node,
     model: &str,
-    body_json: Option<&serde_json::Value>,
+    required_tokens: Option<u32>,
     hosts: &[iroh::EndpointId],
 ) -> Vec<iroh::EndpointId> {
-    let required_tokens = body_json.and_then(request_budget_tokens);
     let mut candidates = Vec::with_capacity(hosts.len());
     for host in hosts {
         candidates.push((*host, node.peer_model_context_length(*host, model).await));
@@ -780,10 +870,9 @@ async fn order_remote_hosts_by_context(
 async fn order_targets_by_context(
     node: &mesh::Node,
     model: &str,
-    body_json: Option<&serde_json::Value>,
+    required_tokens: Option<u32>,
     targets: &[election::InferenceTarget],
 ) -> Vec<election::InferenceTarget> {
-    let required_tokens = body_json.and_then(request_budget_tokens);
     let mut candidates = Vec::with_capacity(targets.len());
     for target in targets {
         let context_length = match target {
@@ -1605,7 +1694,7 @@ pub async fn handle_mesh_request(
 ) {
     let mut tcp_stream = tcp_stream;
     let plugin_manager = node.plugin_manager().await;
-    let request =
+    let mut request =
         match read_http_request_with_plugin_manager(&mut tcp_stream, plugin_manager.as_ref()).await
         {
             Ok(v) => v,
@@ -1614,7 +1703,6 @@ pub async fn handle_mesh_request(
                 return;
             }
         };
-    let body_json = request.body_json.as_ref();
 
     // Handle /v1/models
     if is_models_list_request(&request.method, &request.path) {
@@ -1629,6 +1717,7 @@ pub async fn handle_mesh_request(
     // Smart routing: if no model specified (or model="auto"), classify and pick
     let routed_model =
         if request.model_name.is_none() || request.model_name.as_deref() == Some("auto") {
+            request.ensure_body_json();
             if let Some(body_json) = request.body_json.as_ref() {
                 let cl = router::classify(&body_json);
                 let served = node.models_being_served().await;
@@ -1710,6 +1799,12 @@ pub async fn handle_mesh_request(
     } else {
         target_hosts
     };
+    let required_tokens =
+        request_budget_tokens_from_parts(request.body_len_bytes, request.completion_tokens);
+    if effective_model.is_some() && target_hosts.len() > 1 {
+        request.ensure_body_json();
+    }
+    let body_json = request.body_json.as_ref();
     let prepared = effective_model
         .as_ref()
         .map(|name| prepare_remote_targets_for_request(name, &target_hosts, body_json, &affinity))
@@ -1731,12 +1826,11 @@ pub async fn handle_mesh_request(
         })
         .collect();
     let target_hosts = if let Some(name) = effective_model.as_deref() {
-        let ordered = order_remote_hosts_by_context(&node, name, body_json, &target_hosts).await;
+        let ordered = order_remote_hosts_by_context(&node, name, required_tokens, &target_hosts).await;
         if let (Some(prefix_hash), Some(cached_target)) =
             (prepared.learn_prefix_hash, prepared.cached_target.as_ref())
         {
             if let election::InferenceTarget::Remote(cached_host) = cached_target {
-                let required_tokens = body_json.and_then(request_budget_tokens);
                 let cached_context = node.peer_model_context_length(*cached_host, name).await;
                 if matches!(
                     (required_tokens, cached_context),
@@ -1887,6 +1981,7 @@ pub async fn route_model_request(
     targets: &election::ModelTargets,
     model: &str,
     parsed_body: Option<&serde_json::Value>,
+    required_tokens: Option<u32>,
     prefetched: &[u8],
     response_adapter: ResponseAdapter,
     affinity: &AffinityRouter,
@@ -1894,7 +1989,7 @@ pub async fn route_model_request(
     let route_started = Instant::now();
     let mut tcp_stream = tcp_stream;
     let ordered_candidates =
-        order_targets_by_context(&node, model, parsed_body, &targets.candidates(model)).await;
+        order_targets_by_context(&node, model, required_tokens, &targets.candidates(model)).await;
     if ordered_candidates.is_empty() {
         return false;
     }
@@ -1921,7 +2016,6 @@ pub async fn route_model_request(
         selection.learn_prefix_hash,
         selection.cached_target.as_ref(),
     ) {
-        let required_tokens = parsed_body.and_then(request_budget_tokens);
         let cached_context = match cached_target {
             election::InferenceTarget::Local(_) | election::InferenceTarget::MoeLocal(_) => {
                 node.local_model_context_length(model).await
@@ -2045,7 +2139,8 @@ pub async fn route_moe_request(
     targets: &election::ModelTargets,
     model: &str,
     session_hint: &str,
-    parsed_body: Option<&serde_json::Value>,
+    _parsed_body: Option<&serde_json::Value>,
+    required_tokens: Option<u32>,
     prefetched: &[u8],
 ) -> bool {
     let route_started = Instant::now();
@@ -2061,7 +2156,7 @@ pub async fn route_moe_request(
     let mut ordered = order_targets_by_context(
         &node,
         model,
-        parsed_body,
+        required_tokens,
         &targets.get_moe_failover_targets(session_hint),
     )
     .await;
@@ -2831,7 +2926,7 @@ mod tests {
         assert_eq!(request.path, "/v1/chat/completions");
         assert_eq!(request.model_name.as_deref(), Some("qwen"));
         assert_eq!(request.session_hint.as_deref(), Some("alice"));
-        assert_eq!(request.body_json.unwrap()["messages"][0]["content"], "hi");
+        assert!(request.body_json.is_none());
     }
 
     #[tokio::test]
@@ -2848,9 +2943,10 @@ mod tests {
             body
         );
 
-        let request = read_request_from_parts(vec![request.into_bytes()]).await;
+        let mut request = read_request_from_parts(vec![request.into_bytes()]).await;
 
         assert_eq!(request.model_name.as_deref(), Some("qwen"));
+        request.ensure_body_json();
         let body_json = request.body_json.unwrap();
         let content = body_json["messages"][0]["content"].as_str().unwrap();
         assert_eq!(content.len(), 40_000);
@@ -2865,10 +2961,7 @@ mod tests {
 
         assert_eq!(request.model_name.as_deref(), Some("auto"));
         assert_eq!(request.session_hint.as_deref(), Some("sess-42"));
-        assert_eq!(
-            request.body_json.unwrap()["messages"][0]["content"],
-            "hello"
-        );
+        assert!(request.body_json.is_none());
     }
 
     #[tokio::test]
@@ -2886,10 +2979,11 @@ mod tests {
         .to_string();
         let request = build_chunked_request_one_byte_chunks(body.as_bytes(), 16);
 
-        let request = read_request_from_parts_with_limits(vec![request], limits).await;
+        let mut request = read_request_from_parts_with_limits(vec![request], limits).await;
 
         assert_eq!(request.model_name.as_deref(), Some("qwen"));
         assert!(request.raw.len() > limits.max_body_bytes);
+        request.ensure_body_json();
         let body_json = request.body_json.unwrap();
         let content = body_json["messages"][0]["content"].as_str().unwrap();
         assert_eq!(content.len(), 48);
