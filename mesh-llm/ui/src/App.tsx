@@ -1847,23 +1847,6 @@ export function App() {
 
     // Prefer an explicitly compatible model when sending media with model=auto.
     let model = selectedModel || status.model_name;
-    const isAuto = !model || model === "auto";
-    if (isAuto) {
-      // If this conversation already used a vision model (because images
-      // were sent), stick with that model for continuity — don't let auto
-      // bounce to a text-only model that can't see the earlier images.
-      const existingMessages = activeConversation?.messages ?? [];
-      const priorVisionModel = existingMessages.find(
-        (m) =>
-          m.role === "assistant" &&
-          m.model &&
-          visionModels.has(m.model) &&
-          warmModels.includes(m.model),
-      )?.model;
-      if (priorVisionModel) {
-        model = priorVisionModel;
-      }
-    }
     if (pendingAttachments.length > 0 && (!model || model === "auto")) {
       const multimodalModel = warmModels.find(
         (m) =>
@@ -2974,25 +2957,13 @@ export function ChatPage(props: {
   }
 
   /**
-   * Check if the image will be sent to a vision-capable model.
-   * True when the selected model has vision, or auto mode and a warm
-   * vision model exists.
-   */
-  function willUseVisionModel(): boolean {
-    if (selectedModelVision) return true;
-    if (!selectedModel || selectedModel === "auto") {
-      return warmModels.some((m) => meshModelByName[m]?.vision);
-    }
-    return false;
-  }
-
-  /**
-   * Add an image attachment, then auto-describe it via a browser-local
-   * vision model if the image won't be handled by a real vision model.
+   * Add an image attachment and describe it via Florence-2 running
+   * locally in the browser. The description is injected as text so
+   * any model can reason about the image — no vision model needed.
    */
   function addImageAttachment(attachment: Omit<ChatAttachment, "id" | "status" | "error">) {
     const attachmentId = randomId();
-    const needsDescription = !willUseVisionModel() && canRunBrowserVision();
+    const needsDescription = canRunBrowserVision();
     setPendingAttachments((prev) => [
       ...prev,
       {
