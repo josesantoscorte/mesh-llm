@@ -420,6 +420,27 @@ mod tests {
         let resolved = resolve_hf_file_from_siblings("Qwen3-8B-Q4_K_M", &siblings).unwrap();
         assert_eq!(resolved, "Qwen3-8B-Q4_K_M.gguf");
     }
+
+    #[test]
+    fn mlx_stem_resolves_to_model_safetensors() {
+        let siblings = vec![
+            "model.safetensors.index.json".to_string(),
+            "model.safetensors".to_string(),
+        ];
+        let resolved = resolve_hf_file_from_siblings("model", &siblings).unwrap();
+        assert_eq!(resolved, "model.safetensors");
+    }
+
+    #[test]
+    fn mlx_stem_resolves_to_first_split_shard() {
+        let siblings = vec![
+            "model-00002-of-00048.safetensors".to_string(),
+            "model-00001-of-00048.safetensors".to_string(),
+            "model.safetensors.index.json".to_string(),
+        ];
+        let resolved = resolve_hf_file_from_siblings("model", &siblings).unwrap();
+        assert_eq!(resolved, "model-00001-of-00048.safetensors");
+    }
 }
 
 fn matching_catalog_model_by_basename(repo_file: &str) -> Option<&'static catalog::CatalogModel> {
@@ -493,25 +514,35 @@ fn parse_exact_model_ref(input: &str) -> Result<ExactModelRef> {
 }
 
 fn resolve_hf_file_from_siblings(requested: &str, siblings: &[String]) -> Option<String> {
-    if requested.ends_with(".gguf") {
+    if requested.ends_with(".gguf")
+        || requested.ends_with(".safetensors")
+        || requested.ends_with(".safetensors.index.json")
+    {
         return Some(requested.to_string());
     }
 
     let requested_lower = requested.to_lowercase();
-    let exact_with_ext = format!("{requested}.gguf").to_lowercase();
-    let split_prefix = format!("{requested}-00001-of-").to_lowercase();
+    let gguf_exact = format!("{requested}.gguf").to_lowercase();
+    let gguf_split_prefix = format!("{requested}-00001-of-").to_lowercase();
+    let safetensors_exact = format!("{requested}.safetensors").to_lowercase();
+    let safetensors_split_prefix = format!("{requested}-00001-of-").to_lowercase();
 
     siblings
         .iter()
-        .filter(|file| file.to_lowercase().ends_with(".gguf"))
         .filter_map(|file| {
             let lower = file.to_lowercase();
             let rank = if lower == requested_lower {
                 0
-            } else if lower == exact_with_ext {
+            } else if lower == safetensors_exact {
                 1
-            } else if lower.starts_with(&split_prefix) {
+            } else if lower.starts_with(&safetensors_split_prefix)
+                && lower.ends_with(".safetensors")
+            {
                 2
+            } else if lower == gguf_exact {
+                3
+            } else if lower.starts_with(&gguf_split_prefix) && lower.ends_with(".gguf") {
+                4
             } else {
                 return None;
             };
@@ -555,7 +586,7 @@ async fn resolve_huggingface_file(
     }
 
     bail!(
-        "No GGUF file matching stem '{file}' in {repo}@{revision}. Use a full ref like org/repo/file.gguf."
+        "No model file matching stem '{file}' in {repo}@{revision}. Use a full ref like org/repo/file.gguf or org/repo/model.safetensors."
     )
 }
 
