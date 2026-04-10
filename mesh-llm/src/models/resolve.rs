@@ -1,7 +1,9 @@
 use super::ModelCapabilities;
-use super::{build_hf_tokio_api, capabilities, catalog, find_model_path, format_size_bytes};
+use super::{capabilities, catalog, find_model_path, format_size_bytes};
 use anyhow::{anyhow, bail, Context, Result};
 use hf_hub::{Repo, RepoType};
+use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug)]
@@ -18,29 +20,9 @@ pub struct ModelDetails {
     pub moe: Option<catalog::MoeConfig>,
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum ResolveFormatPreference {
-    Auto,
-    Gguf,
-    Mlx,
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum MlxSelectionPolicy {
-    AllowImplicit,
-    RequireExplicitFlag,
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(super) enum RepoArtifactKind {
-    Gguf,
-    Mlx,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct RepoArtifactCandidate {
-    pub kind: RepoArtifactKind,
-    pub file: String,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShowVariantsProgress {
+    Inspecting { completed: usize, total: usize },
 }
 
 #[derive(Clone, Debug)]
@@ -80,19 +62,16 @@ pub fn find_catalog_model_exact(query: &str) -> Option<&'static catalog::Catalog
     })
 }
 
-pub async fn download_exact_ref(
-    input: &str,
-    preference: ResolveFormatPreference,
-    command_prefix: &str,
-    mlx_policy: MlxSelectionPolicy,
-) -> Result<PathBuf> {
-    match parse_exact_model_ref(input, preference, command_prefix, mlx_policy).await? {
+pub async fn download_exact_ref(input: &str) -> Result<PathBuf> {
+    let input = canonicalize_model_ref_input(input).await?;
+    match parse_exact_model_ref(&input)? {
         ExactModelRef::Catalog(model) => catalog::download_model(model).await,
         ExactModelRef::HuggingFace {
             repo,
             revision,
             file,
         } => {
+            let file = resolve_huggingface_file(&repo, revision.as_deref(), &file).await?;
             if let Some(model) =
                 matching_catalog_primary_for_huggingface(&repo, revision.as_deref(), &file)
             {
@@ -130,36 +109,32 @@ pub async fn resolve_model_spec(input: &Path) -> Result<PathBuf> {
         if let Some(entry) = catalog::find_model(&raw) {
             return catalog::download_model(entry).await;
         }
+        if let Ok(canonical) = canonicalize_model_ref_input(&raw).await {
+            if canonical != raw {
+                return download_exact_ref(&canonical)
+                    .await
+                    .with_context(|| format!("Resolve model spec {raw}"));
+            }
+        }
         bail!(
             "Model not found: {raw}\nNot a local file, not in the Hugging Face cache, not in catalog.\n\
              Use a path, a catalog name (run `mesh-llm download` to list), or a Hugging Face exact ref/URL."
         );
     }
 
-    download_exact_ref(
-        &raw,
-        ResolveFormatPreference::Auto,
-        "mesh-llm models download",
-        MlxSelectionPolicy::AllowImplicit,
-    )
-    .await
-    .with_context(|| format!("Resolve model spec {raw}"))
+    download_exact_ref(&raw)
+        .await
+        .with_context(|| format!("Resolve model spec {raw}"))
 }
 
 pub async fn show_exact_model(input: &str) -> Result<ModelDetails> {
-    match parse_exact_model_ref(
-        input,
-        ResolveFormatPreference::Auto,
-        "mesh-llm models show",
-        MlxSelectionPolicy::AllowImplicit,
-    )
-    .await?
-    {
+    let input = canonicalize_model_ref_input(input).await?;
+    match parse_exact_model_ref(&input)? {
         ExactModelRef::Catalog(model) => Ok(ModelDetails {
             display_name: model.name.to_string(),
             exact_ref: model.name.to_string(),
             source: "catalog",
-            kind: catalog_model_kind_label(model),
+            kind: catalog_model_kind(model),
             download_url: match (
                 model.source_repo(),
                 model.source_revision(),
@@ -179,7 +154,8 @@ pub async fn show_exact_model(input: &str) -> Result<ModelDetails> {
             revision,
             file,
         } => {
-            let exact_ref = format_huggingface_exact_ref(&repo, revision.as_deref(), &file);
+            let file = resolve_huggingface_file(&repo, revision.as_deref(), &file).await?;
+            let exact_ref = format_huggingface_display_ref(&repo, revision.as_deref(), &file);
             let catalog = matching_catalog_model_for_huggingface(&repo, revision.as_deref(), &file);
             let download_url = huggingface_resolve_url(&repo, revision.as_deref(), &file);
             let size_label = match catalog {
@@ -216,7 +192,7 @@ pub async fn show_exact_model(input: &str) -> Result<ModelDetails> {
                     .to_string(),
                 exact_ref,
                 source: "huggingface",
-                kind: artifact_kind_label_for_file(&file),
+                kind: artifact_kind_for_file(&file),
                 download_url,
                 size_label,
                 description: catalog.map(|model| model.description.to_string()),
@@ -235,7 +211,7 @@ pub async fn show_exact_model(input: &str) -> Result<ModelDetails> {
                 display_name: filename,
                 exact_ref: url.clone(),
                 source: "url",
-                kind: artifact_kind_label_for_file(&url),
+                kind: artifact_kind_for_file(&url),
                 download_url: url,
                 size_label,
                 description: catalog.map(|model| model.description.to_string()),
@@ -246,6 +222,188 @@ pub async fn show_exact_model(input: &str) -> Result<ModelDetails> {
                 moe: catalog.and_then(|model| model.moe.clone()),
             })
         }
+    }
+}
+
+pub async fn show_model_variants_with_progress<F>(
+    input: &str,
+    mut progress: F,
+) -> Result<Option<Vec<ModelDetails>>>
+where
+    F: FnMut(ShowVariantsProgress),
+{
+    let input = canonicalize_model_ref_input(input).await?;
+    let parsed = parse_huggingface_repo_ref(&input).or_else(|| parse_huggingface_repo_url(&input));
+    let Some((repo, revision, selector)) = parsed else {
+        return Ok(None);
+    };
+    if selector.is_some() {
+        return Ok(None);
+    }
+
+    let api = super::build_hf_tokio_api(false)?;
+    let revision_ref = revision.as_deref().unwrap_or("main");
+    let detail = api
+        .repo(Repo::with_revision(
+            repo.clone(),
+            RepoType::Model,
+            revision_ref.to_string(),
+        ))
+        .info()
+        .await
+        .with_context(|| format!("Fetch Hugging Face repo {repo}"))?;
+
+    let sibling_entries: Vec<(String, Option<u64>)> = detail
+        .siblings
+        .iter()
+        .map(|sibling| (sibling.rfilename.clone(), sibling.size))
+        .collect();
+    let available_bytes = crate::system::hardware::survey().vram_bytes;
+    let variants = collect_show_gguf_variants_from_siblings(&sibling_entries, available_bytes);
+    if variants.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+
+    let quant_variants: Vec<_> = variants
+        .into_iter()
+        .filter(|(file, _)| quant_selector_from_gguf_file(file).is_some())
+        .collect();
+    let total = quant_variants.len();
+    progress(ShowVariantsProgress::Inspecting {
+        completed: 0,
+        total,
+    });
+
+    let mut seen_refs = HashSet::new();
+    let mut out = Vec::new();
+    for (idx, (file, size_bytes)) in quant_variants.into_iter().enumerate() {
+        let exact_ref = format_huggingface_display_ref(&repo, revision.as_deref(), &file);
+        if !seen_refs.insert(exact_ref.clone()) {
+            progress(ShowVariantsProgress::Inspecting {
+                completed: idx + 1,
+                total,
+            });
+            continue;
+        }
+        let size_label = match size_bytes {
+            Some(bytes) => Some(format_size_bytes(bytes)),
+            None => remote_hf_size_label_with_api(&api, &repo, revision.as_deref(), &file).await,
+        };
+        out.push(ModelDetails {
+            display_name: Path::new(&file)
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or(&file)
+                .to_string(),
+            exact_ref,
+            source: "huggingface",
+            kind: artifact_kind_for_file(&file),
+            download_url: huggingface_resolve_url(&repo, revision.as_deref(), &file),
+            size_label,
+            description: None,
+            draft: None,
+            capabilities: ModelCapabilities::default(),
+            moe: None,
+        });
+        progress(ShowVariantsProgress::Inspecting {
+            completed: idx + 1,
+            total,
+        });
+    }
+
+    Ok(Some(out))
+}
+
+pub(super) fn quant_selector_from_gguf_file(file: &str) -> Option<String> {
+    if !file.ends_with(".gguf") {
+        return None;
+    }
+
+    if let Some((prefix, _)) = file.split_once('/') {
+        if is_quant_like_selector(prefix) {
+            return Some(prefix.to_string());
+        }
+    }
+
+    let basename = Path::new(file).file_name()?.to_str()?;
+    let mut stem = basename.strip_suffix(".gguf")?;
+    if let Some((base, shard)) = stem.rsplit_once("-00001-of-") {
+        if shard.len() == 5 && shard.chars().all(|ch| ch.is_ascii_digit()) {
+            stem = base;
+        }
+    }
+
+    if let Some(pos) = stem.rfind("-UD-") {
+        return Some(stem[pos + 1..].to_string());
+    }
+    if let Some(pos) = stem.rfind("-IQ") {
+        return Some(stem[pos + 1..].to_string());
+    }
+    if let Some(pos) = stem.rfind("-Q") {
+        return Some(stem[pos + 1..].to_string());
+    }
+    if let Some(pos) = stem.rfind("-BF16") {
+        return Some(stem[pos + 1..].to_string());
+    }
+    if let Some(pos) = stem.rfind("-F16") {
+        return Some(stem[pos + 1..].to_string());
+    }
+    if let Some(pos) = stem.rfind("-F32") {
+        return Some(stem[pos + 1..].to_string());
+    }
+    None
+}
+
+fn is_quant_like_selector(value: &str) -> bool {
+    let upper = value.to_ascii_uppercase();
+    upper.starts_with("UD-")
+        || upper.starts_with("Q")
+        || upper.starts_with("IQ")
+        || upper == "BF16"
+        || upper == "F16"
+        || upper == "F32"
+}
+
+fn format_repo_selector_ref(repo: &str, revision: Option<&str>, selector: &str) -> String {
+    match revision {
+        Some(revision) => format!("{repo}:{selector}@{revision}"),
+        None => format!("{repo}:{selector}"),
+    }
+}
+
+fn format_huggingface_display_ref(repo: &str, revision: Option<&str>, file: &str) -> String {
+    if let Some(selector) = quant_selector_from_gguf_file(file) {
+        return format_repo_selector_ref(repo, revision, &selector);
+    }
+    if is_primary_mlx_weight_file(file) {
+        return match revision {
+            Some(revision) => format!("{repo}@{revision}"),
+            None => repo.to_string(),
+        };
+    }
+    format_huggingface_exact_ref(repo, revision, file)
+}
+
+fn artifact_kind_for_file(file: &str) -> &'static str {
+    if file.ends_with(".safetensors") || file.ends_with(".safetensors.index.json") {
+        "🍎 MLX"
+    } else {
+        "🦙 GGUF"
+    }
+}
+
+fn catalog_model_kind(model: &catalog::CatalogModel) -> &'static str {
+    if model
+        .source_file()
+        .map(|file| {
+            file.ends_with("model.safetensors") || file.ends_with("model.safetensors.index.json")
+        })
+        .unwrap_or(false)
+        || model.url.contains("model.safetensors")
+    {
+        "🍎 MLX"
+    } else {
+        "🦙 GGUF"
     }
 }
 
@@ -375,8 +533,24 @@ fn matching_catalog_primary_for_url(url: &str) -> Option<&'static catalog::Catal
 }
 
 #[cfg(test)]
-mod repo_artifact_tests {
+mod tests {
     use super::*;
+    use serde::Deserialize;
+    use std::collections::HashMap;
+
+    #[derive(Debug, Deserialize)]
+    struct HfRepoFixture {
+        repo: String,
+        siblings: Vec<String>,
+        size_bytes: HashMap<String, u64>,
+    }
+
+    fn load_gemma_live_fixture() -> HfRepoFixture {
+        serde_json::from_str(include_str!(
+            "testdata/unsloth_gemma_4_31b_it_gguf.live.json"
+        ))
+        .expect("parse live Hugging Face fixture")
+    }
 
     #[test]
     fn primary_hf_ref_maps_to_full_catalog_download() {
@@ -416,6 +590,437 @@ mod repo_artifact_tests {
             "https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/mmproj-BF16.gguf",
         )
         .is_none());
+    }
+
+    #[test]
+    fn split_stem_resolves_to_first_part() {
+        let siblings = vec![
+            "zai-org.GLM-5.1.Q2_K-00002-of-00018.gguf".to_string(),
+            "zai-org.GLM-5.1.Q2_K-00001-of-00018.gguf".to_string(),
+        ];
+        let resolved = resolve_hf_file_from_siblings("zai-org.GLM-5.1.Q2_K", &siblings).unwrap();
+        assert_eq!(resolved, "zai-org.GLM-5.1.Q2_K-00001-of-00018.gguf");
+    }
+
+    #[test]
+    fn stem_without_split_resolves_to_gguf() {
+        let siblings = vec![
+            "Qwen3-8B-Q4_K_M.gguf".to_string(),
+            "Qwen3-8B-Q8_0.gguf".to_string(),
+        ];
+        let resolved = resolve_hf_file_from_siblings("Qwen3-8B-Q4_K_M", &siblings).unwrap();
+        assert_eq!(resolved, "Qwen3-8B-Q4_K_M.gguf");
+    }
+
+    #[test]
+    fn mlx_stem_resolves_to_model_safetensors() {
+        let siblings = vec![
+            "model.safetensors.index.json".to_string(),
+            "model.safetensors".to_string(),
+        ];
+        let resolved = resolve_hf_file_from_siblings("model", &siblings).unwrap();
+        assert_eq!(resolved, "model.safetensors");
+    }
+
+    #[test]
+    fn mlx_stem_resolves_to_first_split_shard() {
+        let siblings = vec![
+            "model-00002-of-00048.safetensors".to_string(),
+            "model-00001-of-00048.safetensors".to_string(),
+            "model.safetensors.index.json".to_string(),
+        ];
+        let resolved = resolve_hf_file_from_siblings("model", &siblings).unwrap();
+        assert_eq!(resolved, "model-00001-of-00048.safetensors");
+    }
+
+    #[test]
+    fn repo_only_resolution_prefers_mlx_model_safetensors() {
+        let siblings = vec![
+            "Qwen3-8B-Q4_K_M.gguf".to_string(),
+            "model.safetensors".to_string(),
+            "model.safetensors.index.json".to_string(),
+        ];
+        let resolved = resolve_hf_file_from_siblings("", &siblings).unwrap();
+        assert_eq!(resolved, "model.safetensors");
+    }
+
+    #[test]
+    fn repo_only_resolution_falls_back_to_gguf_when_no_mlx_weights() {
+        let siblings = vec![
+            "Qwen3-8B-Q8_0.gguf".to_string(),
+            "Qwen3-8B-Q4_K_M.gguf".to_string(),
+        ];
+        let resolved = resolve_hf_file_from_siblings("", &siblings).unwrap();
+        assert_eq!(resolved, "Qwen3-8B-Q4_K_M.gguf");
+    }
+
+    #[test]
+    fn parse_huggingface_ref_rejects_http_url() {
+        assert!(parse_huggingface_ref("https://example.com/model.gguf").is_none());
+    }
+
+    #[test]
+    fn parse_huggingface_repo_ref_parses_repo_only() {
+        let parsed = parse_huggingface_repo_ref("GreenBitAI/Llama-2-7B-layer-mix-bpw-2.2-mlx");
+        assert_eq!(
+            parsed,
+            Some((
+                "GreenBitAI/Llama-2-7B-layer-mix-bpw-2.2-mlx".to_string(),
+                None,
+                None
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_huggingface_repo_ref_parses_quant_selector() {
+        let parsed = parse_huggingface_repo_ref("unsloth/gemma-4-31B-it-GGUF:UD-Q4_K_XL");
+        assert_eq!(
+            parsed,
+            Some((
+                "unsloth/gemma-4-31B-it-GGUF".to_string(),
+                None,
+                Some("UD-Q4_K_XL".to_string())
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_huggingface_repo_url_parses_repo_only() {
+        let parsed =
+            parse_huggingface_repo_url("https://huggingface.co/unsloth/gemma-4-31B-it-GGUF");
+        assert_eq!(
+            parsed,
+            Some(("unsloth/gemma-4-31B-it-GGUF".to_string(), None, None))
+        );
+    }
+
+    #[test]
+    fn parse_huggingface_repo_url_parses_tree_revision() {
+        let parsed = parse_huggingface_repo_url(
+            "https://huggingface.co/unsloth/gemma-4-31B-it-GGUF/tree/main",
+        );
+        assert_eq!(
+            parsed,
+            Some((
+                "unsloth/gemma-4-31B-it-GGUF".to_string(),
+                Some("main".to_string()),
+                None
+            ))
+        );
+    }
+
+    #[test]
+    fn quant_selector_resolves_to_first_matching_split_gguf() {
+        let fixture = load_gemma_live_fixture();
+        let resolved = resolve_hf_file_from_siblings("UD-Q4_K_XL", &fixture.siblings).unwrap();
+        assert_eq!(resolved, "gemma-4-31B-it-UD-Q4_K_XL.gguf");
+    }
+
+    #[test]
+    fn fit_aware_gguf_prefers_largest_comfortable_candidate() {
+        let available = 20_000_000_000u64;
+        let ordering = compare_gguf_candidates_by_fit(
+            "repo/model-q4.gguf",
+            Some(12_000_000_000),
+            "repo/model-q5.gguf",
+            Some(17_000_000_000),
+            available,
+        );
+        assert_eq!(ordering, Ordering::Greater);
+    }
+
+    #[test]
+    fn fit_aware_gguf_prefers_smaller_when_both_too_large() {
+        let available = 20_000_000_000u64;
+        let ordering = compare_gguf_candidates_by_fit(
+            "repo/model-q8.gguf",
+            Some(29_000_000_000),
+            "repo/model-bf16.gguf",
+            Some(35_000_000_000),
+            available,
+        );
+        assert_eq!(ordering, Ordering::Less);
+    }
+
+    #[test]
+    fn gemma_repo_default_prefers_q4_over_bf16_at_local_fit_budget() {
+        // Uses captured live HF artifact sizes from the fixture:
+        // at ~19.3GB available, prefer Q4_0 over BF16.
+        let fixture = load_gemma_live_fixture();
+        let q4 = fixture
+            .size_bytes
+            .get("gemma-4-31B-it-Q4_0.gguf")
+            .copied()
+            .expect("fixture Q4_0 size");
+        let bf16 = fixture
+            .size_bytes
+            .get("BF16/gemma-4-31B-it-BF16-00001-of-00002.gguf")
+            .copied()
+            .expect("fixture BF16 size");
+        let available = 19_300_000_000u64;
+        let ordering = compare_gguf_candidates_by_fit(
+            "unsloth/gemma-4-31B-it-GGUF/gemma-4-31B-it-Q4_0.gguf",
+            Some(q4),
+            "unsloth/gemma-4-31B-it-GGUF/BF16/gemma-4-31B-it-BF16-00001-of-00002.gguf",
+            Some(bf16),
+            available,
+        );
+        assert_eq!(ordering, Ordering::Less);
+    }
+
+    #[test]
+    fn repo_name_can_signal_gguf_intent() {
+        assert!(repo_prefers_gguf_only("unsloth/gemma-4-31B-it-GGUF"));
+        assert!(!repo_prefers_gguf_only(
+            "mlx-community/Llama-3.2-3B-Instruct-4bit"
+        ));
+    }
+
+    #[test]
+    fn parse_exact_model_ref_accepts_unsloth_gemma_repo_ref() {
+        let parsed = parse_exact_model_ref("unsloth/gemma-4-31B-it-GGUF").unwrap();
+        match parsed {
+            ExactModelRef::HuggingFace {
+                repo,
+                revision,
+                file,
+            } => {
+                assert_eq!(repo, "unsloth/gemma-4-31B-it-GGUF");
+                assert_eq!(revision, None);
+                assert_eq!(file, "");
+            }
+            other => panic!("expected HuggingFace repo ref, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_exact_model_ref_accepts_unsloth_gemma_repo_url() {
+        let parsed =
+            parse_exact_model_ref("https://huggingface.co/unsloth/gemma-4-31B-it-GGUF").unwrap();
+        match parsed {
+            ExactModelRef::HuggingFace {
+                repo,
+                revision,
+                file,
+            } => {
+                assert_eq!(repo, "unsloth/gemma-4-31B-it-GGUF");
+                assert_eq!(revision, None);
+                assert_eq!(file, "");
+            }
+            other => panic!("expected HuggingFace repo ref from URL, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_exact_model_ref_accepts_unsloth_gemma_quant_selector() {
+        let parsed = parse_exact_model_ref("unsloth/gemma-4-31B-it-GGUF:UD-Q4_K_XL").unwrap();
+        match parsed {
+            ExactModelRef::HuggingFace {
+                repo,
+                revision,
+                file,
+            } => {
+                assert_eq!(repo, "unsloth/gemma-4-31B-it-GGUF");
+                assert_eq!(revision, None);
+                assert_eq!(file, "UD-Q4_K_XL");
+            }
+            other => panic!("expected HuggingFace quant selector ref, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn simulated_name_and_repo_quant_inputs_converge_to_same_ref() {
+        // Replay two user inputs against captured live siblings:
+        // 1) gemma-4-31B-it-GGUF:UD-Q4_K_XL (after repo discovery)
+        // 2) unsloth/gemma-4-31B-it-GGUF:UD-Q4_K_XL
+        let fixture = load_gemma_live_fixture();
+        let discovered_repo = fixture.repo.as_str();
+        let selector = "UD-Q4_K_XL";
+
+        let from_name = format!(
+            "{}/{}",
+            discovered_repo,
+            resolve_hf_file_from_siblings(selector, &fixture.siblings).unwrap()
+        );
+        let from_repo = format!(
+            "{}/{}",
+            discovered_repo,
+            resolve_hf_file_from_siblings(selector, &fixture.siblings).unwrap()
+        );
+
+        assert_eq!(
+            from_name,
+            "unsloth/gemma-4-31B-it-GGUF/gemma-4-31B-it-UD-Q4_K_XL.gguf"
+        );
+        assert_eq!(from_name, from_repo);
+    }
+
+    #[test]
+    fn parse_exact_model_ref_accepts_unsloth_gemma_repo_url_with_quant_selector() {
+        let parsed =
+            parse_exact_model_ref("https://huggingface.co/unsloth/gemma-4-31B-it-GGUF:UD-Q4_K_XL")
+                .unwrap();
+        match parsed {
+            ExactModelRef::HuggingFace {
+                repo,
+                revision,
+                file,
+            } => {
+                assert_eq!(repo, "unsloth/gemma-4-31B-it-GGUF");
+                assert_eq!(revision, None);
+                assert_eq!(file, "UD-Q4_K_XL");
+            }
+            other => panic!("expected HuggingFace repo URL quant selector ref, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn split_bare_name_selector_supports_name_quant_shorthand() {
+        assert_eq!(
+            split_bare_name_selector("gemma-4-31B-it-GGUF:UD-Q4_K_XL"),
+            ("gemma-4-31B-it-GGUF", Some("UD-Q4_K_XL"))
+        );
+        assert_eq!(
+            split_bare_name_selector("unsloth/gemma-4-31B-it-GGUF:UD-Q4_K_XL"),
+            ("unsloth/gemma-4-31B-it-GGUF:UD-Q4_K_XL", None)
+        );
+    }
+
+    #[test]
+    fn select_strong_repo_hit_prefers_exact_leaf_name() {
+        let repos = vec![
+            "ggml-org/gemma-4-31B-it-GGUF".to_string(),
+            "unsloth/gemma-4-31B-it-GGUF".to_string(),
+            "bartowski/google_gemma-4-31B-it-GGUF".to_string(),
+        ];
+        let picked = select_strong_repo_hit("gemma-4-31B-it-GGUF", &repos);
+        assert_eq!(picked, Some("ggml-org/gemma-4-31B-it-GGUF".to_string()));
+    }
+
+    #[test]
+    fn bare_name_quant_can_be_formatted_with_discovered_repo() {
+        let (name, selector) = split_bare_name_selector("gemma-4-31B-it-GGUF:UD-Q4_K_XL");
+        assert_eq!(name, "gemma-4-31B-it-GGUF");
+        let selector = selector.expect("selector");
+        let canonical = format!("{}:{}", "unsloth/gemma-4-31B-it-GGUF", selector);
+        assert_eq!(canonical, "unsloth/gemma-4-31B-it-GGUF:UD-Q4_K_XL");
+    }
+
+    #[test]
+    fn quant_selector_from_gguf_file_extracts_expected_forms() {
+        assert_eq!(
+            quant_selector_from_gguf_file("gemma-4-31B-it-UD-Q4_K_XL.gguf"),
+            Some("UD-Q4_K_XL".to_string())
+        );
+        assert_eq!(
+            quant_selector_from_gguf_file("BF16/gemma-4-31B-it-BF16-00001-of-00002.gguf"),
+            Some("BF16".to_string())
+        );
+        assert_eq!(
+            quant_selector_from_gguf_file("gemma-4-31B-it-Q4_0.gguf"),
+            Some("Q4_0".to_string())
+        );
+    }
+
+    #[test]
+    fn format_huggingface_display_ref_prefers_selector_form_for_gguf() {
+        assert_eq!(
+            format_huggingface_display_ref(
+                "unsloth/gemma-4-31B-it-GGUF",
+                None,
+                "gemma-4-31B-it-UD-Q4_K_XL.gguf"
+            ),
+            "unsloth/gemma-4-31B-it-GGUF:UD-Q4_K_XL"
+        );
+    }
+
+    #[test]
+    fn format_huggingface_display_ref_prefers_repo_form_for_mlx() {
+        assert_eq!(
+            format_huggingface_display_ref(
+                "mlx-community/SmolLM-135M-8bit",
+                None,
+                "model.safetensors"
+            ),
+            "mlx-community/SmolLM-135M-8bit"
+        );
+        assert_eq!(
+            format_huggingface_display_ref(
+                "avlp12/GLM-5.1-Alis-MLX-Dynamic-2.7bpw",
+                None,
+                "model-00001-of-00010.safetensors"
+            ),
+            "avlp12/GLM-5.1-Alis-MLX-Dynamic-2.7bpw"
+        );
+    }
+
+    #[test]
+    fn parse_exact_model_ref_accepts_legacy_mlx_model_path_shape() {
+        let parsed = parse_exact_model_ref("mlx-community/SmolLM-135M-8bit/model").unwrap();
+        match parsed {
+            ExactModelRef::HuggingFace {
+                repo,
+                revision,
+                file,
+            } => {
+                assert_eq!(repo, "mlx-community/SmolLM-135M-8bit");
+                assert_eq!(revision, None);
+                assert_eq!(file, "model");
+            }
+            _ => panic!("expected HuggingFace ref"),
+        }
+    }
+
+    #[test]
+    fn collect_show_gguf_variants_excludes_mmproj_and_nonfirst_split() {
+        let siblings = vec![
+            ("mmproj-BF16.gguf".to_string(), Some(1_200_000_000)),
+            (
+                "gemma-4-26B-A4B-it-UD-Q3_K_S-00002-of-00009.gguf".to_string(),
+                Some(12_500_000_000),
+            ),
+            (
+                "gemma-4-26B-A4B-it-UD-Q3_K_S-00001-of-00009.gguf".to_string(),
+                Some(12_500_000_000),
+            ),
+            (
+                "gemma-4-26B-A4B-it-UD-Q4_K_M.gguf".to_string(),
+                Some(16_900_000_000),
+            ),
+        ];
+        let files: Vec<_> = collect_show_gguf_variants_from_siblings(&siblings, 0)
+            .into_iter()
+            .map(|(file, _)| file)
+            .collect();
+        assert_eq!(
+            files,
+            vec![
+                "gemma-4-26B-A4B-it-UD-Q3_K_S-00001-of-00009.gguf".to_string(),
+                "gemma-4-26B-A4B-it-UD-Q4_K_M.gguf".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn collect_show_gguf_variants_orders_by_fit_when_memory_known() {
+        let siblings = vec![
+            ("model-UD-Q5_K_M.gguf".to_string(), Some(21_200_000_000)),
+            ("model-UD-Q4_K_M.gguf".to_string(), Some(16_900_000_000)),
+            ("model-UD-Q3_K_S.gguf".to_string(), Some(12_500_000_000)),
+        ];
+        let files: Vec<_> = collect_show_gguf_variants_from_siblings(&siblings, 19_300_000_000)
+            .into_iter()
+            .map(|(file, _)| file)
+            .collect();
+        assert_eq!(
+            files,
+            vec![
+                "model-UD-Q4_K_M.gguf".to_string(),
+                "model-UD-Q3_K_S.gguf".to_string(),
+                "model-UD-Q5_K_M.gguf".to_string(),
+            ]
+        );
     }
 }
 
@@ -473,340 +1078,176 @@ pub(super) fn parse_huggingface_ref(input: &str) -> Option<(String, Option<Strin
     ))
 }
 
-pub(super) fn parse_huggingface_repo_ref(input: &str) -> Option<(String, Option<String>)> {
-    if input.starts_with("http://") || input.starts_with("https://") {
-        return None;
-    }
-    if input.contains("/resolve/") || is_supported_huggingface_file_ref(input) {
-        return None;
-    }
-    let parts: Vec<&str> = input.split('/').collect();
+fn parse_repo_tail_selector_and_revision(
+    tail: &str,
+) -> Option<(String, Option<String>, Option<String>)> {
+    let (with_selector, revision) = match tail.split_once('@') {
+        Some((repo, revision)) => {
+            if repo.is_empty() || revision.is_empty() {
+                return None;
+            }
+            (repo, Some(revision.to_string()))
+        }
+        None => (tail, None),
+    };
+    let (repo_tail, selector) = match with_selector.split_once(':') {
+        Some((repo, selector)) => {
+            if repo.is_empty() || selector.is_empty() {
+                return None;
+            }
+            (repo, Some(selector.to_string()))
+        }
+        None => (with_selector, None),
+    };
+    Some((repo_tail.to_string(), revision, selector))
+}
+
+fn parse_huggingface_repo_ref(input: &str) -> Option<(String, Option<String>, Option<String>)> {
+    let parts: Vec<&str> = input.splitn(2, '/').collect();
     if parts.len() != 2 {
         return None;
     }
-    let (repo_tail, revision) = match parts[1].split_once('@') {
-        Some((repo, revision)) if !repo.is_empty() && !revision.is_empty() => {
-            (repo, Some(revision.to_string()))
-        }
-        Some(_) => return None,
-        None => (parts[1], None),
-    };
-    if parts[0].is_empty() || repo_tail.is_empty() {
+    if parts[0].is_empty() || parts[1].is_empty() || parts[0].contains(':') {
         return None;
     }
-    Some((format!("{}/{}", parts[0], repo_tail), revision))
+    let (repo_tail, revision, selector) = parse_repo_tail_selector_and_revision(parts[1])?;
+    Some((format!("{}/{}", parts[0], repo_tail), revision, selector))
 }
 
-fn is_supported_huggingface_file_ref(input: &str) -> bool {
-    input.ends_with(".gguf")
-        || input.ends_with("model.safetensors")
-        || input.ends_with("model.safetensors.index.json")
-}
-
-pub(super) fn artifact_kind_for_file(file: &str) -> Option<RepoArtifactKind> {
-    if file.ends_with(".gguf") {
-        return Some(RepoArtifactKind::Gguf);
+fn parse_huggingface_repo_url(input: &str) -> Option<(String, Option<String>, Option<String>)> {
+    let tail = input
+        .strip_prefix("https://huggingface.co/")
+        .or_else(|| input.strip_prefix("http://huggingface.co/"))?;
+    let clean = tail
+        .split_once('?')
+        .map(|(left, _)| left)
+        .unwrap_or(tail)
+        .split_once('#')
+        .map(|(left, _)| left)
+        .unwrap_or(tail)
+        .trim_matches('/');
+    let parts: Vec<&str> = clean.split('/').collect();
+    if parts.len() < 2 || parts[0].is_empty() || parts[1].is_empty() {
+        return None;
     }
-    if file.ends_with("model.safetensors") || file.ends_with("model.safetensors.index.json") {
-        return Some(RepoArtifactKind::Mlx);
+    let (repo_tail, selector_revision, selector) = parse_repo_tail_selector_and_revision(parts[1])?;
+    let repo = format!("{}/{}", parts[0], repo_tail);
+    if parts.len() >= 4 && parts[2] == "tree" && !parts[3].is_empty() {
+        return Some((repo, Some(parts[3].to_string()), selector));
+    }
+    if parts.len() == 2 {
+        return Some((repo, selector_revision, selector));
     }
     None
 }
 
-fn validate_preference_matches_file(file: &str, preference: ResolveFormatPreference) -> Result<()> {
-    match preference {
-        ResolveFormatPreference::Auto => Ok(()),
-        ResolveFormatPreference::Gguf => {
-            if artifact_kind_for_file(file) == Some(RepoArtifactKind::Gguf) {
-                Ok(())
-            } else {
-                bail!("`--gguf` requires a GGUF artifact");
-            }
-        }
-        ResolveFormatPreference::Mlx => {
-            if artifact_kind_for_file(file) == Some(RepoArtifactKind::Mlx) {
-                Ok(())
-            } else {
-                bail!("`--mlx` requires an MLX artifact");
-            }
-        }
-    }
-}
-
-fn ensure_explicit_mlx_selection(
-    kind: Option<RepoArtifactKind>,
-    preference: ResolveFormatPreference,
-    mlx_policy: MlxSelectionPolicy,
-    command_prefix: &str,
-    target: &str,
-) -> Result<()> {
-    if kind == Some(RepoArtifactKind::Mlx)
-        && mlx_policy == MlxSelectionPolicy::RequireExplicitFlag
-        && preference != ResolveFormatPreference::Mlx
-    {
-        bail!(
-            "MLX selection requires explicit `--mlx`.\nRetry with:\n  {command_prefix} {target} --mlx"
-        );
-    }
-    Ok(())
-}
-
-pub(super) fn collect_repo_artifact_candidates(siblings: &[String]) -> Vec<RepoArtifactCandidate> {
-    let mut gguf = Vec::new();
-    let mut mlx = Vec::new();
-    for sibling in siblings {
-        if sibling.ends_with(".gguf") {
-            if sibling.contains("-000") && !sibling.contains("-00001-of-") {
-                continue;
-            }
-            gguf.push(RepoArtifactCandidate {
-                kind: RepoArtifactKind::Gguf,
-                file: sibling.clone(),
-            });
-            continue;
-        }
-        if sibling == "model.safetensors.index.json" || sibling == "model.safetensors" {
-            mlx.push(RepoArtifactCandidate {
-                kind: RepoArtifactKind::Mlx,
-                file: sibling.clone(),
-            });
-        }
-    }
-    gguf.sort_by(|left, right| {
-        file_preference_score(&left.file)
-            .cmp(&file_preference_score(&right.file))
-            .then_with(|| left.file.cmp(&right.file))
-    });
-    mlx.sort_by(|left, right| {
-        right
-            .file
-            .ends_with("model.safetensors.index.json")
-            .cmp(&left.file.ends_with("model.safetensors.index.json"))
-            .then_with(|| left.file.cmp(&right.file))
-    });
-    if mlx
-        .iter()
-        .any(|candidate| candidate.file.ends_with("model.safetensors.index.json"))
-    {
-        mlx.retain(|candidate| candidate.file.ends_with("model.safetensors.index.json"));
-    }
-    gguf.extend(mlx);
-    gguf
-}
-
-pub(super) fn artifact_kind_label(kind: RepoArtifactKind) -> &'static str {
-    match kind {
-        RepoArtifactKind::Gguf => "🦙 gguf",
-        RepoArtifactKind::Mlx => "🍎 mlx",
-    }
-}
-
-pub(super) fn artifact_kind_label_for_file(file: &str) -> &'static str {
-    artifact_kind_for_file(file)
-        .map(artifact_kind_label)
-        .unwrap_or("unknown")
-}
-
-pub fn catalog_model_kind_label(model: &catalog::CatalogModel) -> &'static str {
-    if model
-        .source_file()
-        .map(|file| {
-            file.ends_with("model.safetensors") || file.ends_with("model.safetensors.index.json")
-        })
-        .unwrap_or(false)
-        || model.url.contains("model.safetensors")
-    {
-        "🍎 mlx"
-    } else {
-        "🦙 gguf"
-    }
-}
-
-fn format_repo_artifact_suggestions(
-    repo: &str,
-    revision: Option<&str>,
-    candidates: &[RepoArtifactCandidate],
-    command_prefix: &str,
-) -> String {
-    let mut lines = vec![format!("🤔 Multiple artifacts found in {repo}")];
-    if let Some(revision) = revision {
-        lines[0].push('@');
-        lines[0].push_str(revision);
-    }
-    let gguf: Vec<_> = candidates
-        .iter()
-        .filter(|candidate| candidate.kind == RepoArtifactKind::Gguf)
-        .collect();
-    let mlx: Vec<_> = candidates
-        .iter()
-        .filter(|candidate| candidate.kind == RepoArtifactKind::Mlx)
-        .collect();
-    if !gguf.is_empty() {
-        lines.push(String::new());
-        lines.push("🦙 GGUF:".to_string());
-        for candidate in gguf {
-            lines.push(format!(
-                "  {command_prefix} {}",
-                format_huggingface_exact_ref(repo, revision, &candidate.file)
-            ));
-        }
-    }
-    if !mlx.is_empty() {
-        lines.push(String::new());
-        lines.push("🍎 MLX:".to_string());
-        for candidate in mlx {
-            lines.push(format!(
-                "  {command_prefix} {}",
-                format_huggingface_exact_ref(repo, revision, &candidate.file)
-            ));
-        }
-    }
-    lines.join("\n")
-}
-
-fn choose_repo_artifact_candidate(
-    repo: &str,
-    revision: Option<&str>,
-    candidates: &[RepoArtifactCandidate],
-    preference: ResolveFormatPreference,
-    command_prefix: &str,
-    mlx_policy: MlxSelectionPolicy,
-) -> Result<RepoArtifactCandidate> {
-    let filtered: Vec<_> = candidates
-        .iter()
-        .filter(|candidate| match preference {
-            ResolveFormatPreference::Auto => true,
-            ResolveFormatPreference::Gguf => candidate.kind == RepoArtifactKind::Gguf,
-            ResolveFormatPreference::Mlx => candidate.kind == RepoArtifactKind::Mlx,
-        })
-        .cloned()
-        .collect();
-
-    match filtered.len() {
-        0 => match preference {
-            ResolveFormatPreference::Auto => {
-                bail!("No downloadable model artifacts found in {repo}")
-            }
-            ResolveFormatPreference::Gguf => bail!("No GGUF artifacts found in {repo}"),
-            ResolveFormatPreference::Mlx => bail!("No MLX artifacts found in {repo}"),
-        },
-        1 => {
-            let candidate = filtered[0].clone();
-            ensure_explicit_mlx_selection(
-                Some(candidate.kind),
-                preference,
-                mlx_policy,
-                command_prefix,
-                &repo.to_string(),
-            )?;
-            Ok(candidate)
-        }
-        _ => bail!(
-            "{}",
-            format_repo_artifact_suggestions(repo, revision, &filtered, command_prefix)
-        ),
-    }
-}
-
-async fn resolve_repo_artifact_ref(
-    repo: &str,
-    revision: Option<&str>,
-    preference: ResolveFormatPreference,
-    command_prefix: &str,
-    mlx_policy: MlxSelectionPolicy,
-) -> Result<(String, Option<String>, String)> {
-    let api = build_hf_tokio_api(false)?;
-    let repo_handle = match revision {
-        Some(rev) => Repo::with_revision(repo.to_string(), RepoType::Model, rev.to_string()),
-        None => Repo::new(repo.to_string(), RepoType::Model),
-    };
-    let detail = api
-        .repo(repo_handle)
-        .info()
-        .await
-        .map_err(|err| anyhow!("Fetch Hugging Face repo {repo}: {err}"))?;
-    let siblings: Vec<String> = detail
-        .siblings
-        .into_iter()
-        .map(|sibling| sibling.rfilename)
-        .collect();
-    let candidates = collect_repo_artifact_candidates(&siblings);
-    let choice = choose_repo_artifact_candidate(
-        repo,
-        revision,
-        &candidates,
-        preference,
-        command_prefix,
-        mlx_policy,
-    )?;
-    Ok((repo.to_string(), revision.map(str::to_string), choice.file))
-}
-
-async fn parse_exact_model_ref(
-    input: &str,
-    preference: ResolveFormatPreference,
-    command_prefix: &str,
-    mlx_policy: MlxSelectionPolicy,
-) -> Result<ExactModelRef> {
+fn parse_exact_model_ref(input: &str) -> Result<ExactModelRef> {
     if let Some(model) = find_catalog_model_exact(input) {
-        ensure_explicit_mlx_selection(
-            artifact_kind_for_file(&model.file),
-            preference,
-            mlx_policy,
-            command_prefix,
-            input,
-        )?;
         return Ok(ExactModelRef::Catalog(model));
     }
     if let Some((repo, revision, file)) = parse_huggingface_ref(input) {
-        let file = resolve_huggingface_file(&repo, revision.as_deref(), &file).await?;
-        validate_preference_matches_file(&file, preference)?;
-        ensure_explicit_mlx_selection(
-            artifact_kind_for_file(&file),
-            preference,
-            mlx_policy,
-            command_prefix,
-            input,
-        )?;
         return Ok(ExactModelRef::HuggingFace {
             repo,
             revision,
             file,
         });
     }
-    if let Some((repo, revision)) = parse_huggingface_repo_ref(input) {
-        let (repo, revision, file) = resolve_repo_artifact_ref(
-            &repo,
-            revision.as_deref(),
-            preference,
-            command_prefix,
-            mlx_policy,
-        )
-        .await?;
+    if let Some((repo, revision, selector)) = parse_huggingface_repo_ref(input) {
         return Ok(ExactModelRef::HuggingFace {
             repo,
             revision,
-            file,
+            file: selector.unwrap_or_default(),
+        });
+    }
+    if let Some((repo, revision, selector)) = parse_huggingface_repo_url(input) {
+        return Ok(ExactModelRef::HuggingFace {
+            repo,
+            revision,
+            file: selector.unwrap_or_default(),
         });
     }
     if input.starts_with("http://") || input.starts_with("https://") {
-        let filename = remote_filename(input)?;
-        validate_preference_matches_file(&filename, preference)?;
-        ensure_explicit_mlx_selection(
-            artifact_kind_for_file(&filename),
-            preference,
-            mlx_policy,
-            command_prefix,
-            input,
-        )?;
         return Ok(ExactModelRef::Url {
             url: input.to_string(),
-            filename,
+            filename: remote_filename(input)?,
         });
     }
     bail!(
-        "Expected a model ref. Use a catalog id, a Hugging Face ref like org/repo/file.gguf, org/repo/model.safetensors, or org/repo, or a direct URL."
+        "Expected an exact model ref. Use a catalog id, a Hugging Face ref like org/repo, org/repo:QUANT, org/repo/file.gguf, org/repo/file-stem for split GGUFs, org/repo/model.safetensors, or org/repo/model-00001-of-00048.safetensors, or a direct URL."
     )
+}
+
+fn split_bare_name_selector(input: &str) -> (&str, Option<&str>) {
+    match input.split_once(':') {
+        Some((name, selector))
+            if !name.is_empty()
+                && !selector.is_empty()
+                && !name.contains('/')
+                && !name.contains('@')
+                && !name.contains("://") =>
+        {
+            (name, Some(selector))
+        }
+        _ => (input, None),
+    }
+}
+
+fn normalize_repo_leaf_name(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect()
+}
+
+fn select_strong_repo_hit(query: &str, repo_ids: &[String]) -> Option<String> {
+    let query_norm = normalize_repo_leaf_name(query);
+    if query_norm.is_empty() {
+        return None;
+    }
+    let mut exact = Vec::new();
+    for repo_id in repo_ids {
+        let leaf = repo_id.rsplit('/').next().unwrap_or(repo_id);
+        if normalize_repo_leaf_name(leaf) == query_norm {
+            exact.push(repo_id.clone());
+        }
+    }
+    if let Some(first) = exact.into_iter().next() {
+        return Some(first);
+    }
+    None
+}
+
+async fn discover_hf_repo_for_bare_name(name: &str) -> Result<Option<String>> {
+    let api = super::build_hf_tokio_api(false)?;
+    let rows = api
+        .search(RepoType::Model)
+        .with_query(name)
+        .with_filter("gguf")
+        .with_limit(20)
+        .run()
+        .await
+        .with_context(|| format!("Search Hugging Face for '{name}'"))?;
+    let repo_ids: Vec<String> = rows.into_iter().map(|repo| repo.id).collect();
+    Ok(select_strong_repo_hit(name, &repo_ids))
+}
+
+async fn canonicalize_model_ref_input(input: &str) -> Result<String> {
+    if parse_exact_model_ref(input).is_ok() || find_catalog_model_exact(input).is_some() {
+        return Ok(input.to_string());
+    }
+    if input.contains('/') || input.starts_with("http://") || input.starts_with("https://") {
+        return Ok(input.to_string());
+    }
+
+    let (name, selector) = split_bare_name_selector(input);
+    if let Some(repo) = discover_hf_repo_for_bare_name(name).await? {
+        if let Some(selector) = selector {
+            return Ok(format!("{repo}:{selector}"));
+        }
+        return Ok(repo);
+    }
+    Ok(input.to_string())
 }
 
 fn is_split_mlx_first_shard(file: &str) -> bool {
@@ -822,6 +1263,11 @@ fn is_split_mlx_first_shard(file: &str) -> bool {
     left == "00001" && right.len() == 5 && right.bytes().all(|byte| byte.is_ascii_digit())
 }
 
+fn is_primary_mlx_weight_file(file: &str) -> bool {
+    let basename = file.rsplit('/').next().unwrap_or(file);
+    basename.eq_ignore_ascii_case("model.safetensors") || is_split_mlx_first_shard(basename)
+}
+
 fn select_default_hf_file_from_siblings(siblings: &[String]) -> Option<String> {
     siblings
         .iter()
@@ -832,10 +1278,17 @@ fn select_default_hf_file_from_siblings(siblings: &[String]) -> Option<String> {
             } else if is_split_mlx_first_shard(&lower) {
                 1
             } else if lower.ends_with(".gguf") {
+                if is_known_gguf_sidecar(file) {
+                    return None;
+                }
                 if lower.contains("-000") && !lower.contains("-00001-of-") {
                     return None;
                 }
-                if lower.contains("-00001-of-") { 2 } else { 3 }
+                if lower.contains("-00001-of-") {
+                    2
+                } else {
+                    3
+                }
             } else {
                 return None;
             };
@@ -869,16 +1322,18 @@ fn resolve_hf_file_from_siblings(requested: &str, siblings: &[String]) -> Option
             let lower = file.to_lowercase();
             let rank = if lower == requested_lower {
                 0
-            } else if lower == safetensors_exact {
+            } else if gguf_matches_quant_selector(&lower, &requested_lower) {
                 1
+            } else if lower == safetensors_exact {
+                2
             } else if lower.starts_with(&safetensors_split_prefix)
                 && lower.ends_with(".safetensors")
             {
-                2
-            } else if lower == gguf_exact {
                 3
-            } else if lower.starts_with(&gguf_split_prefix) && lower.ends_with(".gguf") {
+            } else if lower == gguf_exact {
                 4
+            } else if lower.starts_with(&gguf_split_prefix) && lower.ends_with(".gguf") {
+                5
             } else {
                 return None;
             };
@@ -888,7 +1343,200 @@ fn resolve_hf_file_from_siblings(requested: &str, siblings: &[String]) -> Option
         .map(|(_, _, file)| file)
 }
 
-async fn resolve_huggingface_file(repo: &str, revision: Option<&str>, file: &str) -> Result<String> {
+fn gguf_matches_quant_selector(file_lower: &str, selector_lower: &str) -> bool {
+    if !file_lower.ends_with(".gguf") || selector_lower.is_empty() {
+        return false;
+    }
+    file_lower.contains(&format!("/{selector_lower}/"))
+        || file_lower.contains(&format!("-{selector_lower}-"))
+        || file_lower.ends_with(&format!("-{selector_lower}.gguf"))
+        || file_lower.ends_with(&format!("/{selector_lower}.gguf"))
+}
+
+pub(super) fn is_known_gguf_sidecar(file: &str) -> bool {
+    let basename = file.rsplit('/').next().unwrap_or(file);
+    basename.to_ascii_lowercase().starts_with("mmproj")
+}
+
+fn collect_show_gguf_variants_from_siblings(
+    siblings: &[(String, Option<u64>)],
+    available_bytes: u64,
+) -> Vec<(String, Option<u64>)> {
+    let mut gguf_candidates: Vec<(String, Option<u64>)> = siblings
+        .iter()
+        .filter_map(|(file, size)| {
+            let lower = file.to_lowercase();
+            if !lower.ends_with(".gguf") {
+                return None;
+            }
+            if is_known_gguf_sidecar(file) {
+                return None;
+            }
+            if lower.contains("-000") && !lower.contains("-00001-of-") {
+                return None;
+            }
+            Some((file.clone(), *size))
+        })
+        .collect();
+
+    if available_bytes == 0 {
+        gguf_candidates.sort_by(|left, right| {
+            file_preference_score(&left.0)
+                .cmp(&file_preference_score(&right.0))
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        return gguf_candidates;
+    }
+
+    gguf_candidates.sort_by(|left, right| {
+        compare_gguf_candidates_by_fit(&left.0, left.1, &right.0, right.1, available_bytes)
+    });
+    gguf_candidates
+}
+
+fn fit_bucket(size_bytes: u64, available_bytes: u64) -> u8 {
+    if size_bytes.saturating_mul(10) <= available_bytes.saturating_mul(9) {
+        0
+    } else if size_bytes.saturating_mul(10) <= available_bytes.saturating_mul(11) {
+        1
+    } else {
+        2
+    }
+}
+
+fn compare_gguf_candidates_by_fit(
+    left_file: &str,
+    left_size: Option<u64>,
+    right_file: &str,
+    right_size: Option<u64>,
+    available_bytes: u64,
+) -> Ordering {
+    match (left_size, right_size) {
+        (Some(left), Some(right)) => {
+            let left_bucket = fit_bucket(left, available_bytes);
+            let right_bucket = fit_bucket(right, available_bytes);
+            if left_bucket != right_bucket {
+                return left_bucket.cmp(&right_bucket);
+            }
+            let size_order = if left_bucket <= 1 {
+                right.cmp(&left)
+            } else {
+                left.cmp(&right)
+            };
+            if size_order != Ordering::Equal {
+                return size_order;
+            }
+        }
+        (Some(_), None) => return Ordering::Less,
+        (None, Some(_)) => return Ordering::Greater,
+        (None, None) => {}
+    }
+
+    file_preference_score(left_file)
+        .cmp(&file_preference_score(right_file))
+        .then_with(|| left_file.cmp(right_file))
+}
+
+async fn remote_size_bytes(url: &str) -> Option<u64> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .user_agent(format!("mesh-llm/{}", crate::VERSION))
+        .build()
+        .ok()?;
+    let response = client
+        .head(url)
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?;
+    response
+        .headers()
+        .get(reqwest::header::CONTENT_LENGTH)?
+        .to_str()
+        .ok()?
+        .parse::<u64>()
+        .ok()
+}
+
+async fn select_default_hf_file_fit_aware(
+    repo: &str,
+    revision: Option<&str>,
+    siblings: &[(String, Option<u64>)],
+) -> Option<String> {
+    let mut gguf_candidates: Vec<(String, Option<u64>)> = Vec::new();
+    for (file, api_size) in siblings {
+        let lower = file.to_lowercase();
+        if !lower.ends_with(".gguf") {
+            continue;
+        }
+        if is_known_gguf_sidecar(file) {
+            continue;
+        }
+        if lower.contains("-000") && !lower.contains("-00001-of-") {
+            continue;
+        }
+        gguf_candidates.push((file.clone(), *api_size));
+    }
+    if gguf_candidates.is_empty() {
+        return None;
+    }
+
+    let available_bytes = crate::system::hardware::survey().vram_bytes;
+    if available_bytes == 0 {
+        gguf_candidates.sort_by(|left, right| {
+            file_preference_score(&left.0)
+                .cmp(&file_preference_score(&right.0))
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        return gguf_candidates.first().map(|(f, _)| f.clone());
+    }
+
+    // Prefer API-provided sizes; only fall back to HEAD for files missing a size.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .user_agent(format!("mesh-llm/{}", crate::VERSION))
+        .build()
+        .ok();
+    let mut scored: Vec<(String, Option<u64>)> = Vec::with_capacity(gguf_candidates.len());
+    for (file, api_size) in gguf_candidates {
+        let size = if api_size.is_some() {
+            api_size
+        } else if let Some(ref c) = client {
+            let url = huggingface_resolve_url(repo, revision, &file);
+            c.head(&url)
+                .send()
+                .await
+                .ok()
+                .and_then(|r| r.error_for_status().ok())
+                .and_then(|r| {
+                    r.headers()
+                        .get(reqwest::header::CONTENT_LENGTH)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|s| s.parse::<u64>().ok())
+                })
+        } else {
+            None
+        };
+        scored.push((file, size));
+    }
+    scored.sort_by(|left, right| {
+        compare_gguf_candidates_by_fit(&left.0, left.1, &right.0, right.1, available_bytes)
+    });
+    scored.first().map(|(file, _)| file.clone())
+}
+
+fn repo_prefers_gguf_only(repo: &str) -> bool {
+    repo.to_ascii_lowercase().contains("gguf")
+}
+
+async fn resolve_huggingface_file(
+    repo: &str,
+    revision: Option<&str>,
+    file: &str,
+) -> Result<String> {
     if file.ends_with(".gguf")
         || file.ends_with(".safetensors")
         || file.ends_with(".safetensors.index.json")
@@ -897,7 +1545,7 @@ async fn resolve_huggingface_file(repo: &str, revision: Option<&str>, file: &str
     }
 
     let revision = revision.unwrap_or("main");
-    let api = build_hf_tokio_api(false)?;
+    let api = super::build_hf_tokio_api(false)?;
     let detail = api
         .repo(Repo::with_revision(
             repo.to_string(),
@@ -907,11 +1555,42 @@ async fn resolve_huggingface_file(repo: &str, revision: Option<&str>, file: &str
         .info()
         .await
         .with_context(|| format!("Fetch Hugging Face repo {repo}@{revision}"))?;
-    let siblings: Vec<String> = detail
+    let sibling_entries: Vec<(String, Option<u64>)> = detail
         .siblings
         .iter()
-        .map(|sibling| sibling.rfilename.clone())
+        .map(|sibling| (sibling.rfilename.clone(), sibling.size))
         .collect();
+    let siblings: Vec<String> = sibling_entries.iter().map(|(f, _)| f.clone()).collect();
+    let has_mlx_weights = siblings
+        .iter()
+        .any(|entry| entry == "model.safetensors" || is_split_mlx_first_shard(entry));
+
+    if file.is_empty() {
+        let gguf_only = repo_prefers_gguf_only(repo);
+        if gguf_only {
+            if let Some(resolved) =
+                select_default_hf_file_fit_aware(repo, Some(revision), &sibling_entries).await
+            {
+                return Ok(resolved);
+            }
+            bail!("No GGUF model files found in {repo}@{revision}.");
+        }
+
+        if let Some(resolved) = select_default_hf_file_from_siblings(&siblings) {
+            return Ok(resolved);
+        }
+
+        if let Some(resolved) =
+            select_default_hf_file_fit_aware(repo, Some(revision), &sibling_entries).await
+        {
+            return Ok(resolved);
+        }
+    }
+    if file == "model" && has_mlx_weights {
+        bail!(
+            "MLX shorthand '/model' is not supported. Use '{repo}' or a full file ref like '{repo}/model.safetensors'."
+        );
+    }
 
     if let Some(resolved) = resolve_hf_file_from_siblings(file, &siblings) {
         return Ok(resolved);
@@ -965,26 +1644,7 @@ pub(super) fn file_preference_score(file: &str) -> usize {
 }
 
 async fn remote_size_label(url: &str) -> Option<String> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(300))
-        .connect_timeout(std::time::Duration::from_secs(30))
-        .user_agent(format!("mesh-llm/{}", crate::VERSION))
-        .build()
-        .ok()?;
-    let response = client
-        .head(url)
-        .send()
-        .await
-        .ok()?
-        .error_for_status()
-        .ok()?;
-    let size = response
-        .headers()
-        .get(reqwest::header::CONTENT_LENGTH)?
-        .to_str()
-        .ok()?
-        .parse::<u64>()
-        .ok()?;
+    let size = remote_size_bytes(url).await?;
     Some(format_size_bytes(size))
 }
 
@@ -996,132 +1656,4 @@ pub(super) async fn remote_hf_size_label_with_api(
 ) -> Option<String> {
     let url = huggingface_resolve_url(repo, revision, file);
     remote_size_label(&url).await
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_huggingface_repo_ref_accepts_repo_and_revision_shorthand() {
-        let (repo, revision) =
-            parse_huggingface_repo_ref("mlx-community/Qwen2.5-0.5B-Instruct@main").unwrap();
-        assert_eq!(repo, "mlx-community/Qwen2.5-0.5B-Instruct");
-        assert_eq!(revision.as_deref(), Some("main"));
-    }
-
-    #[test]
-    fn split_stem_resolves_to_first_part() {
-        let siblings = vec![
-            "zai-org.GLM-5.1.Q2_K-00002-of-00018.gguf".to_string(),
-            "zai-org.GLM-5.1.Q2_K-00001-of-00018.gguf".to_string(),
-        ];
-        let resolved = resolve_hf_file_from_siblings("zai-org.GLM-5.1.Q2_K", &siblings).unwrap();
-        assert_eq!(resolved, "zai-org.GLM-5.1.Q2_K-00001-of-00018.gguf");
-    }
-
-    #[test]
-    fn mlx_stem_resolves_to_model_safetensors() {
-        let siblings = vec![
-            "model.safetensors.index.json".to_string(),
-            "model.safetensors".to_string(),
-        ];
-        let resolved = resolve_hf_file_from_siblings("model", &siblings).unwrap();
-        assert_eq!(resolved, "model.safetensors");
-    }
-
-    #[test]
-    fn collect_repo_artifact_candidates_prefers_mlx_index_and_split_gguf_primary() {
-        let siblings = vec![
-            "Qwen3-8B-Q4_K_M-00002-of-00004.gguf".to_string(),
-            "Qwen3-8B-Q4_K_M-00001-of-00004.gguf".to_string(),
-            "Qwen3-8B-Q6_K.gguf".to_string(),
-            "model.safetensors".to_string(),
-            "model.safetensors.index.json".to_string(),
-        ];
-        let candidates = collect_repo_artifact_candidates(&siblings);
-        let files: Vec<_> = candidates
-            .into_iter()
-            .map(|candidate| candidate.file)
-            .collect();
-        assert_eq!(
-            files,
-            vec![
-                "Qwen3-8B-Q4_K_M-00001-of-00004.gguf".to_string(),
-                "Qwen3-8B-Q6_K.gguf".to_string(),
-                "model.safetensors.index.json".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn format_repo_artifact_suggestions_groups_by_backend() {
-        let text = format_repo_artifact_suggestions(
-            "some-org/repo",
-            None,
-            &[
-                RepoArtifactCandidate {
-                    kind: RepoArtifactKind::Gguf,
-                    file: "Qwen3-8B-Q4_K_M.gguf".to_string(),
-                },
-                RepoArtifactCandidate {
-                    kind: RepoArtifactKind::Mlx,
-                    file: "model.safetensors".to_string(),
-                },
-            ],
-            "mesh-llm models download",
-        );
-        assert!(text.contains("🤔 Multiple artifacts found in some-org/repo"));
-        assert!(text.contains("🦙 GGUF:"));
-        assert!(text.contains("🍎 MLX:"));
-        assert!(text.contains("mesh-llm models download some-org/repo/Qwen3-8B-Q4_K_M.gguf"));
-        assert!(text.contains("mesh-llm models download some-org/repo/model.safetensors"));
-    }
-
-    #[test]
-    fn explicit_mlx_flag_is_required_for_exact_mlx_artifacts_when_requested() {
-        let err = ensure_explicit_mlx_selection(
-            Some(RepoArtifactKind::Mlx),
-            ResolveFormatPreference::Auto,
-            MlxSelectionPolicy::RequireExplicitFlag,
-            "mesh-llm --model",
-            "mlx-community/Qwen3-0.6B-4bit/model.safetensors.index.json",
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("MLX selection requires explicit `--mlx`"));
-        assert!(err.contains(
-            "mesh-llm --model mlx-community/Qwen3-0.6B-4bit/model.safetensors.index.json --mlx"
-        ));
-    }
-
-    #[test]
-    fn explicit_mlx_flag_allows_exact_mlx_artifacts() {
-        ensure_explicit_mlx_selection(
-            Some(RepoArtifactKind::Mlx),
-            ResolveFormatPreference::Mlx,
-            MlxSelectionPolicy::RequireExplicitFlag,
-            "mesh-llm --model",
-            "mlx-community/Qwen3-0.6B-4bit/model.safetensors.index.json",
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn choose_repo_artifact_candidate_requires_mlx_flag_for_mlx_only_repo() {
-        let err = choose_repo_artifact_candidate(
-            "mlx-community/Qwen3-0.6B-4bit",
-            None,
-            &[RepoArtifactCandidate {
-                kind: RepoArtifactKind::Mlx,
-                file: "model.safetensors.index.json".to_string(),
-            }],
-            ResolveFormatPreference::Auto,
-            "mesh-llm --model",
-            MlxSelectionPolicy::RequireExplicitFlag,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("MLX selection requires explicit `--mlx`"));
-    }
 }

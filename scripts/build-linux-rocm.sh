@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# build-linux-amd.sh — build llama.cpp (ROCm/HIP) + mesh-llm on Linux
+# build-linux-rocm.sh — build llama.cpp (ROCm/HIP) + mesh-llm on Linux
 #
-# Usage: scripts/build-linux-amd.sh [amdgpu_targets]
+# Usage: scripts/build-linux-rocm.sh [amdgpu_targets]
 #   amdgpu_targets  Semicolon-separated AMDGPU targets, e.g.
 #                   "gfx90a;gfx942;gfx1100". If omitted, a broad default is used.
 
@@ -17,13 +17,7 @@ UI_DIR="$MESH_DIR/ui"
 
 AMDGPU_TARGETS="${1:-gfx90a;gfx942;gfx1100;gfx1101;gfx1102;gfx1200;gfx1201}"
 ROCM_PATH="${ROCM_PATH:-/opt/rocm}"
-
-trace_cmd() {
-    printf '+ '
-    printf '%q ' "$@"
-    printf '\n'
-    "$@"
-}
+LLAMA_PIN_SHA="${MESH_LLM_LLAMA_PIN_SHA:-}"
 
 if [[ ! -d "$ROCM_PATH" ]]; then
     echo "Error: ROCm not found at $ROCM_PATH" >&2
@@ -47,7 +41,7 @@ configure_compiler_cache() {
     elif command -v ccache >/dev/null 2>&1; then
         cache_bin="ccache"
     else
-        return 0
+        return
     fi
 
     echo "Using compiler cache: $cache_bin"
@@ -59,18 +53,43 @@ configure_compiler_cache() {
 }
 
 if [[ ! -d "$LLAMA_DIR" ]]; then
-    echo "Cloning michaelneale/llama.cpp (upstream-latest)..."
-    trace_cmd git clone -b upstream-latest \
-        https://github.com/michaelneale/llama.cpp.git "$LLAMA_DIR"
+    if [[ -n "$LLAMA_PIN_SHA" ]]; then
+        echo "Cloning michaelneale/llama.cpp pinned to $LLAMA_PIN_SHA..."
+        git clone -b upstream-latest --depth 1 \
+            https://github.com/michaelneale/llama.cpp.git "$LLAMA_DIR"
+        if ! (cd "$LLAMA_DIR" && git cat-file -e "${LLAMA_PIN_SHA}^{commit}" 2>/dev/null); then
+            echo "Pinned SHA not on upstream-latest tip, fetching explicitly..."
+            (cd "$LLAMA_DIR" && git fetch --depth 1 origin "$LLAMA_PIN_SHA")
+        fi
+        (cd "$LLAMA_DIR" && git checkout --detach "$LLAMA_PIN_SHA")
+    else
+        echo "Cloning michaelneale/llama.cpp (upstream-latest)..."
+        git clone -b upstream-latest \
+            https://github.com/michaelneale/llama.cpp.git "$LLAMA_DIR"
+    fi
 else
     cd "$LLAMA_DIR"
-    CURRENT_BRANCH=$(git branch --show-current)
-    if [[ "$CURRENT_BRANCH" != "upstream-latest" ]]; then
-        echo "⚠️  llama.cpp is on branch '$CURRENT_BRANCH', switching to upstream-latest..."
-        trace_cmd git checkout upstream-latest
+    if [[ -n "$LLAMA_PIN_SHA" ]]; then
+        if ! git cat-file -e "${LLAMA_PIN_SHA}^{commit}" 2>/dev/null; then
+            echo "Fetching pinned llama.cpp SHA $LLAMA_PIN_SHA..."
+            git fetch --depth 1 origin "$LLAMA_PIN_SHA"
+        fi
+        CURRENT_SHA="$(git rev-parse HEAD)"
+        if [[ "$CURRENT_SHA" != "$LLAMA_PIN_SHA" ]]; then
+            echo "Checking out pinned llama.cpp SHA $LLAMA_PIN_SHA (was $CURRENT_SHA)..."
+            git checkout --detach "$LLAMA_PIN_SHA"
+        else
+            echo "llama.cpp already at pinned SHA $LLAMA_PIN_SHA, no checkout needed"
+        fi
+    else
+        CURRENT_BRANCH=$(git branch --show-current)
+        if [[ "$CURRENT_BRANCH" != "upstream-latest" ]]; then
+            echo "⚠️  llama.cpp is on branch '$CURRENT_BRANCH', switching to upstream-latest..."
+            git checkout upstream-latest
+        fi
+        echo "Pulling latest upstream-latest from origin..."
+        git pull --ff-only origin upstream-latest
     fi
-    echo "Pulling latest upstream-latest from origin..."
-    trace_cmd git pull --ff-only origin upstream-latest
     cd "$REPO_ROOT"
 fi
 
@@ -80,12 +99,11 @@ echo "Building for AMDGPU targets: $AMDGPU_TARGETS"
 configure_compiler_cache
 
 HIPCXX="$(hipconfig -l)/clang" HIP_PATH="$(hipconfig -R)" \
-trace_cmd cmake -B "$BUILD_DIR" -S "$LLAMA_DIR" \
+cmake -B "$BUILD_DIR" -S "$LLAMA_DIR" \
     -DGGML_HIP=ON \
     -DGGML_CUDA=OFF \
     -DGGML_VULKAN=OFF \
     -DGGML_METAL=OFF \
-    -DGGML_NATIVE=OFF \
     -DGGML_RPC=ON \
     -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
     -DBUILD_SHARED_LIBS=OFF \
@@ -93,7 +111,7 @@ trace_cmd cmake -B "$BUILD_DIR" -S "$LLAMA_DIR" \
     -DAMDGPU_TARGETS="$AMDGPU_TARGETS" \
     "${compiler_launcher_flags[@]}"
 
-trace_cmd cmake --build "$BUILD_DIR" --config Release -j"$(nproc)"
+cmake --build "$BUILD_DIR" --config Release -j"$(nproc)"
 echo "llama.cpp ROCm build complete: $BUILD_DIR/bin/"
 
 if [[ -d "$MESH_DIR" ]]; then

@@ -12,15 +12,13 @@ This repo (`mesh-llm`) contains mesh-llm — a Rust binary that pools GPUs over 
 | `CONTRIBUTING.md` | Build from source, dev workflow, UI dev |
 | `RELEASE.md` | Release process (build, bundle, tag, GitHub release) |
 | `ROADMAP.md` | Future directions |
-| `PLAN.md` | Historical design notes and benchmarks |
 | `mesh-llm/TODO.md` | Current work items and backlog |
 | `mesh-llm/README.md` | Rust crate overview and file map |
 | `mesh-llm/docs/DESIGN.md` | Architecture, protocols, features |
 | `mesh-llm/docs/TESTING.md` | Test playbook, scenarios, remote deploy |
-| `mesh-llm/docs/SAME_ORIGIN_PARITY_WORKFLOW.md` | Workflow for downloading original checkpoints, converting same-origin GGUF/MLX pairs, validating them, publishing them to `meshllm`, and switching matrix rows |
+| `mesh-llm/docs/MULTI_MODAL.md` | Multimodal design: capability model, blob plugin, console, routing |
 | `mesh-llm/docs/MoE_PLAN.md` | MoE expert sharding design |
 | `mesh-llm/docs/MoE_DEPLOY_DESIGN.md` | MoE auto-deploy UX |
-| `mesh-llm/docs/MoE_SPLIT_REPORT.md` | MoE splitting validation results |
 | `fly/README.md` | Fly.io deployment (console + API apps) |
 | `relay/README.md` | Self-hosted iroh relay on Fly |
 
@@ -128,14 +126,29 @@ Current structure notes.
 ## Key Source Files
 
 - `mesh-llm/src/main.rs` — CLI args, orchestration: `run_auto()`, `run_idle()`, `run_passive()`
-- `mesh-llm/src/mesh.rs` — `Node` struct, gossip, mesh_id, peer management
-- `mesh-llm/src/election.rs` — Host election, tensor split calculation
-- `mesh-llm/src/proxy.rs` — HTTP proxy: request parsing, model routing, response helpers
-- `mesh-llm/src/api.rs` — Management API (:3131): `/api/status`, `/api/events`, `/api/discover`, `/api/join`
-- `mesh-llm/src/nostr.rs` — Nostr discovery, `score_mesh()`, `smart_auto()`
-- `mesh-llm/src/download.rs` — Model catalog (`MODEL_CATALOG`), HuggingFace downloads
-- `mesh-llm/src/moe.rs` — MoE detection, expert rankings, split orchestration
-- `mesh-llm/src/launch.rs` — llama-server/rpc-server process management
+- `mesh-llm/src/mesh/mod.rs` — `Node` struct, gossip, mesh_id, peer management
+- `mesh-llm/src/inference/election.rs` — Host election, tensor split calculation
+- `mesh-llm/src/inference/launch.rs` — llama-server/rpc-server process management
+- `mesh-llm/src/inference/moe.rs` — MoE detection, expert rankings, split orchestration
+- `mesh-llm/src/network/proxy.rs` — HTTP proxy: request parsing, model routing, response helpers
+- `mesh-llm/src/network/router.rs` — Request classification, model scoring, multimodal routing
+- `mesh-llm/src/network/nostr.rs` — Nostr discovery, `score_mesh()`, `smart_auto()`
+- `mesh-llm/src/network/tunnel.rs` — TCP ↔ QUIC relay (RPC + HTTP)
+- `mesh-llm/src/api/mod.rs` — Management API (:3131): `/api/status`, `/api/events`, `/api/discover`, `/api/join`
+- `mesh-llm/src/models/catalog.rs` — Model catalog, HuggingFace downloads
+- `mesh-llm/src/models/capabilities.rs` — Multimodal/vision/audio/reasoning capability inference
+- `mesh-llm/src/plugins/blobstore/mod.rs` — Request-scoped media object storage for multimodal
+
+## Mesh Protocol Compatibility
+
+Mesh compatibility across versions is critical. Nodes in the wild run different versions and must interoperate.
+
+- The mesh supports mixed-version operation: QUIC ALPN `mesh-llm/1` (protobuf) and `mesh-llm/0` (legacy JSON) nodes coexist. Do not break this.
+- Gossip fields, stream types, and protobuf schemas must be additive. New fields should be optional and ignored by older nodes. Do not repurpose or remove existing fields.
+- When adding new gossip fields, stream types, or changing wire format, explicitly consider what happens when an older node receives the new data and when a newer node talks to an older peer.
+- Capability advertisement (vision, audio, multimodal, reasoning, tool_use, moe) is gossiped to all peers and consumed by routing, the API, and the UI. Changes to capability semantics affect the whole mesh, not just the local node.
+- If a change would break mixed-version meshes, explicitly flag it as a breaking protocol change and ask the developer before proceeding.
+- Test compatibility by running the current branch against a released binary on a second node. Verify gossip, routing, and inference work across the version boundary.
 
 ## Plugin Protocol Compatibility
 
@@ -153,43 +166,18 @@ For changes in `mesh-llm/ui/`, use components and compose interfaces consistentl
 
 Read `mesh-llm/docs/TESTING.md` before running tests. It has all test scenarios, remote deploy instructions, and cleanup commands.
 
-## Validation Baselines
+Testing matters more than usual in this project because:
 
-If the bundled `llama.cpp` source, branch pin, or effective build commit changes,
-rerun the checked-in validation matrix and compare the new results to the
-checked-in baseline data under `testdata/validation/` before treating the new
-build as equivalent.
+- Nodes run on different machines with different hardware and OS versions. Bugs that don't reproduce locally can appear in real deployments.
+- The mesh protocol is a distributed system — gossip, election, and routing interact across nodes. Single-node unit tests don't catch protocol-level regressions.
+- The public mesh at anarchai.org runs continuously. Breaking changes that pass local tests can take down live inference for real users.
+- Multimodal, MoE splitting, and multi-model routing all have complex interaction paths that are hard to reason about statically.
 
-At minimum, rerun the canonical GGUF side:
+When making changes that touch gossip, routing, proxy, election, or capability advertisement, test against at least two nodes before merging. The deploy checklist above is not optional.
 
-```bash
-python3 scripts/run-validation-matrix.py --backend gguf --skip-build --stamp <stamp>
-```
+### Cargo Concurrency
 
-Review:
-
-- `MLX_VALIDATION_RESULTS/<stamp>/exact-baseline-comparison.tsv`
-- `MLX_VALIDATION_RESULTS/<stamp>/behavior-baseline-comparison.tsv`
-- `MLX_VALIDATION_RESULTS/<stamp>/parity-vs-canonical-baseline.tsv`
-
-When replacing a noisy public pair with a same-origin pair derived from the
-original upstream checkpoint, follow:
-
-- `mesh-llm/docs/SAME_ORIGIN_PARITY_WORKFLOW.md`
-
-Do not silently assume `llama.cpp` changes preserve serving behavior, even when
-the Rust code is unchanged.
-
-## Command Concurrency
-
-Do not run Rust build, test, or format commands in parallel in the same worktree.
-
-- Never run multiple `cargo build`, `cargo test`, `cargo check`, or `cargo fmt` commands at the same time.
-- Never run `just build` in parallel with any Cargo command.
-- Prefer sequential Rust verification steps to avoid Cargo package-cache and target-dir lock contention.
-- If a Rust build/test command is already running, wait for it to finish before starting another.
-- Parallel tool use is fine for reads like `rg`, `sed`, `git status`, and `git diff`, but not for Rust build/test commands.
-- When using `multi_tool_use.parallel`, do not include more than one Rust build/test/format command in the same batch.
+Run `cargo` commands serially. Do not run multiple `cargo` commands in parallel (including parallel test runs), because this repo frequently hits Cargo lock conflicts (`package cache` / `artifact directory`) under concurrent invocation.
 
 ## Formatting
 
@@ -260,12 +248,6 @@ cat "$(python3 -c 'import tempfile; print(tempfile.gettempdir())')/mesh-llm-llam
 Typical path: `/var/folders/XX/.../T/mesh-llm-llama-server.log`. rpc-server logs are in the same directory as `mesh-llm-rpc-{port}.log`.
 
 ### Common failures
-- **Use `tmux` for any long-running remote process** — downloads, deploy steps, validation runs, server startup, and similar remote work should be launched inside `tmux`, not as a plain foreground SSH command and not via `nohup`. This keeps the login environment intact, survives disconnects more reliably, and makes progress/log inspection easier.
-- **Use the native login shell style for remote commands** — when SSHing to a Mac, prefer `zsh -lc "<command>"`; when SSHing to Linux, prefer `bash -lc "<command>"`. This loads the normal user environment, including `PATH` updates, exported env vars such as `HF_TOKEN`, Homebrew paths on macOS, and user-installed CLI tools.
-- **Prefer `scp` + remote scripts over nested SSH one-liners** — for nontrivial remote macOS work, copy a small script to the remote host and run it via `zsh -lc`, optionally inside `tmux` for long-lived tasks. Avoid deeply nested `ssh 'zsh -lc ... tmux ...'` command chains when a script would be clearer and less error-prone.
-- **Match generated remote scripts to the host shell** — when generating a script for a remote Mac, write it as a `zsh` script (for example `#!/bin/zsh`); when generating a script for remote Linux, write it as a `bash` script (for example `#!/usr/bin/env bash` or `#!/bin/bash`). Keep the script shell consistent with the remote command shell you use to launch it.
-- **Verify `tmux` sessions actually stayed up** — when launching a long-running remote process in `tmux`, do not assume `tmux new-session -d ...` means success. Launch a small remote script, redirect its stdout/stderr to real log files, then verify the session with `tmux has-session -t <name>` or `tmux ls` both immediately and again after a short delay before treating it as live.
-- **Use absolute paths for remote tools when needed** — on remote Macs, even with `zsh -lc`, important tools may still be more reliable when referenced explicitly, especially Homebrew binaries like `/opt/homebrew/bin/tmux` and user-installed CLIs under `$HOME/Library/Python/.../bin`.
 - **nohup over SSH doesn't stick** — use `bash -c "nohup ... & disown"`, verify process survives disconnect.
 - **Duplicate processes** — always kill-verify-start.
 - **codesign changes the hash** — don't compare local vs codesigned remote.

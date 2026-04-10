@@ -2,20 +2,8 @@ name: CI
 
 on:
   workflow_dispatch:
-    inputs:
-      run_llama_smoke_tests:
-        description: "Run Llama Smoke Tests (GGUF exact matrix)"
-        type: boolean
-        required: false
-        default: true
-      run_mlx_smoke_tests:
-        description: "Run MLX Smoke Tests (MLX exact matrix)"
-        type: boolean
-        required: false
-        default: true
   push:
-    branches:
-      - '**'
+    branches: [main]
   pull_request:
 
 concurrency:
@@ -104,21 +92,36 @@ jobs:
       # ── Rust ──
       - uses: dtolnay/rust-toolchain@stable
 
+      - uses: mozilla-actions/sccache-action@v0.0.9
 
+      # Workspace `. -> target` because the cargo workspace is at repo root
+      # (`Cargo.toml` members = ["mesh-llm", ...]) and cargo writes to
+      # `./target/`, NOT `mesh-llm/target/`. Using `workspaces: mesh-llm`
+      # silently caches an empty dir and gives zero PR cache hits — we
+      # measured a 4-minute regression from this exact misconfiguration.
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: mesh-llm
+          workspaces: . -> target
           prefix-key: ${{ env.CACHE_NAMESPACE }}-rust-${{ hashFiles('.github/cache-version.txt') }}
 
-      - name: Unit tests
-        run: cargo test --release
-
-      - name: Build mesh-llm
-        run: cargo build --release -p mesh-llm --bin mesh-llm
-
+      # Early-fail gate: runs before expensive compile/test work.
       - name: Check formatting
         working-directory: mesh-llm
-        run: cargo fmt -- --check || true
+        run: cargo fmt -- --check
+
+      # Build in dev/debug profile, NOT release. Two reasons:
+      #  1. Build + Unit tests steps share one target/ subdir and one
+      #     incremental cache — zero duplicated codegen.
+      #  2. debug has `incremental = true`; release has `incremental = false`.
+      #     Warm rebuild after a lib edit: release ~43s, debug ~4s (M4 Pro).
+      # mesh-llm is a thin orchestrator around llama-server; the hot loop is
+      # inside llama-server C++, so debug vs release binary perf is
+      # negligible for smoke tests. Integration steps below use target/debug.
+      - name: Build mesh-llm binary (debug)
+        run: cargo build -p mesh-llm --bin mesh-llm
+
+      - name: Unit tests
+        run: cargo test --lib --tests
 
       - name: Clippy
         working-directory: mesh-llm
@@ -140,36 +143,84 @@ jobs:
           cmake -B llama.cpp/build -S llama.cpp \
             -DGGML_METAL=OFF \
             -DGGML_CUDA=OFF \
-            -DGGML_NATIVE=OFF \
             -DGGML_RPC=ON \
             -DBUILD_SHARED_LIBS=OFF \
             -DLLAMA_OPENSSL=OFF \
             "${CACHE_FLAGS[@]}"
           cmake --build llama.cpp/build --config Release -j$(nproc) --target rpc-server llama-server llama-moe-split
 
-      - name: Package Linux binaries
-        run: |
-          mkdir -p ci-artifacts/linux-binaries
-          cp target/release/mesh-llm ci-artifacts/linux-binaries/
-          cp llama.cpp/build/bin/rpc-server ci-artifacts/linux-binaries/
-          cp llama.cpp/build/bin/llama-server ci-artifacts/linux-binaries/
-          cp llama.cpp/build/bin/llama-moe-split ci-artifacts/linux-binaries/ 2>/dev/null || true
-          tar -czf ci-artifacts/linux-binaries.tgz -C ci-artifacts linux-binaries
-
-      - name: Upload Linux binaries
-        uses: actions/upload-artifact@v6
+      # ── Download model ──
+      - name: Cache model
+        id: cache-model
+        uses: actions/cache@v5
         with:
-          name: linux-binaries
-          path: ci-artifacts/linux-binaries.tgz
-          if-no-files-found: error
+          path: ~/.models/${{ env.MODEL_FILE }}
+          key: ${{ env.CACHE_NAMESPACE }}-${{ runner.os }}-model-${{ env.MODEL_FILE }}-${{ hashFiles('.github/cache-version.txt', '.github/workflows/ci.yml') }}
+
+      - name: Download model
+        if: steps.cache-model.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/.models
+          curl -fSL "$MODEL_URL" -o ~/.models/$MODEL_FILE
+          ls -lh ~/.models/$MODEL_FILE
+
+      # ── Integration smoke test ──
+      - name: Smoke test (real inference)
+        run: |
+          scripts/ci-smoke-test.sh \
+            target/debug/mesh-llm \
+            llama.cpp/build/bin \
+            ~/.models/$MODEL_FILE
+
+      - name: OpenAI Python compat smoke
+        run: |
+          scripts/ci-compat-smoke.sh \
+            target/debug/mesh-llm \
+            llama.cpp/build/bin \
+            ~/.models/$MODEL_FILE
+
+      - name: Split-mode test (host/worker routing)
+        run: |
+          scripts/ci-split-test.sh \
+            target/debug/mesh-llm \
+            llama.cpp/build/bin \
+            ~/.models/$MODEL_FILE
+
+      # ── MoE split test ──
+      - name: Cache MoE model
+        id: cache-moe-model
+        uses: actions/cache@v5
+        with:
+          path: ~/.models/${{ env.MOE_MODEL_FILE }}
+          key: ${{ env.CACHE_NAMESPACE }}-${{ runner.os }}-model-${{ env.MOE_MODEL_FILE }}-${{ hashFiles('.github/cache-version.txt', '.github/workflows/ci.yml') }}
+
+      - name: Download MoE model
+        if: steps.cache-moe-model.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/.models
+          curl -fSL "$MOE_MODEL_URL" -o ~/.models/$MOE_MODEL_FILE
+          ls -lh ~/.models/$MOE_MODEL_FILE
+
+      - name: MoE split test (expert sharding)
+        run: |
+          scripts/ci-moe-split-test.sh \
+            llama.cpp/build/bin \
+            ~/.models/$MOE_MODEL_FILE
+
+      - name: MoE mesh test (expert sharding end-to-end)
+        run: |
+          scripts/ci-moe-mesh-test.sh \
+            target/debug/mesh-llm \
+            llama.cpp/build/bin \
+            ~/.models/$MOE_MODEL_FILE
 
       - name: CLI smoke test
         run: |
-          target/release/mesh-llm --version
-          target/release/mesh-llm --help | head -5
+          target/debug/mesh-llm --version
+          target/debug/mesh-llm --help | head -5
 
       - name: Client-auto boot test
-        run: scripts/ci-client-auto-test.sh target/release/mesh-llm
+        run: scripts/ci-client-auto-test.sh target/debug/mesh-llm
 
       - name: Show sccache stats
         if: always()
@@ -198,17 +249,25 @@ jobs:
       # ── Rust ──
       - uses: dtolnay/rust-toolchain@stable
 
+      - uses: mozilla-actions/sccache-action@v0.0.9
 
+      # See linux job for explanation of `. -> target`.
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: mesh-llm
+          workspaces: . -> target
           prefix-key: ${{ env.CACHE_NAMESPACE }}-rust-${{ hashFiles('.github/cache-version.txt') }}
 
-      - name: Unit tests
-        run: cargo test --release
+      # Early-fail gate: runs before expensive compile/test work.
+      - name: Check formatting
+        working-directory: mesh-llm
+        run: cargo fmt -- --check
 
-      - name: Build mesh-llm
-        run: cargo build --release -p mesh-llm --bin mesh-llm
+      # See linux job for rationale on building in dev/debug, not release.
+      - name: Build mesh-llm binary (debug)
+        run: cargo build -p mesh-llm --bin mesh-llm
+
+      - name: Unit tests
+        run: cargo test -p mesh-llm --lib --tests
 
       # ── llama.cpp (Metal + RPC) ──
       - name: Clone llama.cpp fork
@@ -225,126 +284,43 @@ jobs:
           fi
           cmake -B llama.cpp/build -S llama.cpp \
             -DGGML_METAL=OFF \
-            -DGGML_NATIVE=OFF \
             -DGGML_RPC=ON \
             -DBUILD_SHARED_LIBS=OFF \
             -DLLAMA_OPENSSL=OFF \
             "${CACHE_FLAGS[@]}"
           cmake --build llama.cpp/build --config Release -j$(sysctl -n hw.ncpu) --target rpc-server llama-server llama-moe-split
 
-      - name: Package macOS binaries
-        run: |
-          mkdir -p ci-artifacts/macos-binaries
-          cp target/release/mesh-llm ci-artifacts/macos-binaries/
-          cp llama.cpp/build/bin/rpc-server ci-artifacts/macos-binaries/
-          cp llama.cpp/build/bin/llama-server ci-artifacts/macos-binaries/
-          cp llama.cpp/build/bin/llama-moe-split ci-artifacts/macos-binaries/ 2>/dev/null || true
-          cp llama.cpp/build/bin/*.dylib ci-artifacts/macos-binaries/ 2>/dev/null || true
-          shopt -s nullglob
-          metallibs=(target/release/build/mlx-sys-*/out/build/lib/mlx.metallib)
-          if [ "${#metallibs[@]}" -gt 0 ]; then
-            cp "${metallibs[0]}" ci-artifacts/macos-binaries/mlx.metallib
-          fi
-          tar -czf ci-artifacts/macos-binaries.tgz -C ci-artifacts macos-binaries
-
-      - name: Upload macOS binaries
-        uses: actions/upload-artifact@v6
-        with:
-          name: macos-binaries
-          path: ci-artifacts/macos-binaries.tgz
-          if-no-files-found: error
-
-      - name: CLI smoke test
-        run: |
-          target/release/mesh-llm --version
-          target/release/mesh-llm --help | head -5
-
-      - name: Client-auto boot test
-        run: scripts/ci-client-auto-test.sh target/release/mesh-llm
-
-      - name: Show sccache stats
-        if: always()
-        run: sccache --show-stats || true
-
-  inference_smoke_tests:
-    needs: [changes, linux]
-    if: ${{ needs.linux.result == 'success' && (github.event_name == 'workflow_dispatch' || needs.changes.outputs.rust == 'true') }}
-    name: Inference Smoke Tests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-
-      - uses: actions/setup-node@v5
-        with:
-          node-version: 24
-          cache: npm
-          cache-dependency-path: |
-            .github/cache-version.txt
-            mesh-llm/ui/package-lock.json
-
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-          cache: pip
-          cache-dependency-path: |
-            .github/cache-version.txt
-            ci/requirements-ci-python.txt
-
-      - name: Install Python SDKs
-        run: python -m pip install --upgrade pip -r ci/requirements-ci-python.txt
-
-      - name: Download Linux binaries
-        uses: actions/download-artifact@v7
-        with:
-          name: linux-binaries
-          path: ci-artifacts
-
-      - name: Extract Linux binaries
-        run: tar -xzf ci-artifacts/linux-binaries.tgz
-
-      - name: Stage binaries for inference smokes
-        run: |
-          mkdir -p target/release llama.cpp/build/bin
-          cp linux-binaries/mesh-llm target/release/mesh-llm
-          cp linux-binaries/rpc-server llama.cpp/build/bin/rpc-server
-          cp linux-binaries/llama-server llama.cpp/build/bin/llama-server
-          cp linux-binaries/llama-moe-split llama.cpp/build/bin/llama-moe-split 2>/dev/null || true
-
-      - name: Cache integration model
+      # ── Download model ──
+      - name: Cache model
         id: cache-model
         uses: actions/cache@v5
         with:
           path: ~/.models/${{ env.MODEL_FILE }}
           key: ${{ env.CACHE_NAMESPACE }}-${{ runner.os }}-model-${{ env.MODEL_FILE }}-${{ hashFiles('.github/cache-version.txt', '.github/workflows/ci.yml') }}
 
-      - name: Download integration model
+      - name: Download model
         if: steps.cache-model.outputs.cache-hit != 'true'
         run: |
           mkdir -p ~/.models
           curl -fSL "$MODEL_URL" -o ~/.models/$MODEL_FILE
           ls -lh ~/.models/$MODEL_FILE
 
+      # ── Integration smoke test ──
       - name: Smoke test (real inference)
         run: |
           scripts/ci-smoke-test.sh \
-            target/release/mesh-llm \
-            llama.cpp/build/bin \
-            ~/.models/$MODEL_FILE
-
-      - name: OpenAI Python compat smoke
-        run: |
-          scripts/ci-compat-smoke.sh \
-            target/release/mesh-llm \
+            target/debug/mesh-llm \
             llama.cpp/build/bin \
             ~/.models/$MODEL_FILE
 
       - name: Split-mode test (host/worker routing)
         run: |
           scripts/ci-split-test.sh \
-            target/release/mesh-llm \
+            target/debug/mesh-llm \
             llama.cpp/build/bin \
             ~/.models/$MODEL_FILE
 
+      # ── MoE split test ──
       - name: Cache MoE model
         id: cache-moe-model
         uses: actions/cache@v5
@@ -368,166 +344,17 @@ jobs:
       - name: MoE mesh test (expert sharding end-to-end)
         run: |
           scripts/ci-moe-mesh-test.sh \
-            target/release/mesh-llm \
+            target/debug/mesh-llm \
             llama.cpp/build/bin \
             ~/.models/$MOE_MODEL_FILE
 
-  generate_model_family_test_matrix:
-    needs: [inference_smoke_tests]
-    name: Generate smoke test matrix
-    # Derives GGUF and MLX smoke-test matrices from testdata/validation/matrix.json.
-    runs-on: ubuntu-latest
-    outputs:
-      gguf_matrix: ${{ steps.gen.outputs.gguf_matrix }}
-      mlx_matrix: ${{ steps.gen.outputs.mlx_matrix }}
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Generate smoke matrices from matrix.json
-        id: gen
+      - name: CLI smoke test
         run: |
-          python3 - <<'PY'
-          import json
-          from pathlib import Path
-          import os
+          target/debug/mesh-llm --version
+          target/debug/mesh-llm --help | head -5
 
-          matrix = json.loads(Path("testdata/validation/matrix.json").read_text(encoding="utf-8"))
-          gguf = []
-          mlx = []
-
-          for model in matrix.get("models", []):
-            model_id = model.get("id")
-            label = model.get("label", model_id)
-
-            gguf_entry = model.get("gguf")
-            if gguf_entry:
-              ref = gguf_entry.get("model_ref", "")
-              parts = ref.split("/")
-              if len(parts) >= 2:
-                cache_slug = f"{parts[0]}--{parts[1]}"
-                gguf.append({"name": label, "id": model_id, "cache_slug": cache_slug})
-
-            mlx_entry = model.get("mlx")
-            if mlx_entry:
-              ref = mlx_entry.get("model_ref", "")
-              parts = ref.split("/")
-              if len(parts) >= 2:
-                cache_slug = f"{parts[0]}--{parts[1]}"
-                mlx.append({"name": label, "id": model_id, "cache_slug": cache_slug})
-
-          out_path = Path(os.environ["GITHUB_OUTPUT"])
-          with out_path.open("a", encoding="utf-8") as out:
-            out.write(f"gguf_matrix={json.dumps({'include': gguf}, separators=(',', ':'))}\n")
-            out.write(f"mlx_matrix={json.dumps({'include': mlx}, separators=(',', ':'))}\n")
-          PY
-
-  mlx_smoke_tests:
-    needs: [changes, macos, inference_smoke_tests, generate_model_family_test_matrix]
-    if: ${{ github.event_name == 'workflow_dispatch' && needs.macos.result == 'success' && needs.inference_smoke_tests.result == 'success' && needs.generate_model_family_test_matrix.result == 'success' && github.event.inputs.run_mlx_smoke_tests != 'false' }}
-    name: MLX Smoke Tests
-    runs-on: macos-latest
-    environment: mlx-smoke-approval
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.generate_model_family_test_matrix.outputs.mlx_matrix) }}
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Download macOS binaries
-        uses: actions/download-artifact@v7
-        with:
-          name: macos-binaries
-          path: ci-artifacts
-
-      - name: Extract macOS binaries
-        run: tar -xzf ci-artifacts/macos-binaries.tgz
-
-      - name: Stage binaries for validation runner
-        run: |
-          mkdir -p target/release llama.cpp/build/bin
-          cp macos-binaries/mesh-llm target/release/mesh-llm
-          cp macos-binaries/rpc-server llama.cpp/build/bin/rpc-server
-          cp macos-binaries/llama-server llama.cpp/build/bin/llama-server
-          if [ -f macos-binaries/mlx.metallib ]; then
-            cp macos-binaries/mlx.metallib target/release/mlx.metallib
-          fi
-          if ls macos-binaries/*.dylib >/dev/null 2>&1; then
-            cp macos-binaries/*.dylib llama.cpp/build/bin/
-          fi
-
-      - name: Cache MLX model repo
-        uses: actions/cache@v5
-        with:
-          path: ~/.cache/huggingface/hub/models--${{ matrix.cache_slug }}
-          key: mlx-hub-${{ matrix.cache_slug }}
-
-      - name: MLX exact matrix
-        run: |
-          python3 scripts/run-validation-matrix.py \
-            --suite exact \
-            --backend mlx \
-            --skip-build \
-            --cases "${{ matrix.id }}" \
-            --stamp "ci-macos-mlx-${{ matrix.id }}"
-
-      - name: Upload MLX exact results
-        if: always()
-        uses: actions/upload-artifact@v6
-        with:
-          name: mlx-exact-${{ matrix.id }}
-          path: MLX_VALIDATION_RESULTS/ci-macos-mlx-${{ matrix.id }}
-          if-no-files-found: warn
-
-  llama_smoke_tests:
-    needs: [changes, linux, inference_smoke_tests, generate_model_family_test_matrix]
-    if: ${{ github.event_name == 'workflow_dispatch' && needs.linux.result == 'success' && needs.inference_smoke_tests.result == 'success' && needs.generate_model_family_test_matrix.result == 'success' && github.event.inputs.run_llama_smoke_tests != 'false' }}
-    name: Llama Smoke Tests
-    runs-on: ubuntu-latest
-    environment: llama-smoke-approval
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.generate_model_family_test_matrix.outputs.gguf_matrix) }}
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Download Linux GGUF smoke binaries
-        uses: actions/download-artifact@v7
-        with:
-          name: linux-binaries
-          path: ci-artifacts
-
-      - name: Extract Linux GGUF smoke binaries
-        run: tar -xzf ci-artifacts/linux-binaries.tgz
-
-      - name: Stage binaries for validation runner
-        run: |
-          mkdir -p target/release llama.cpp/build/bin
-          cp linux-binaries/mesh-llm target/release/mesh-llm
-          cp linux-binaries/rpc-server llama.cpp/build/bin/rpc-server
-          cp linux-binaries/llama-server llama.cpp/build/bin/llama-server
-
-      - name: Cache GGUF model
-        uses: actions/cache@v5
-        with:
-          path: ~/.cache/huggingface/hub/models--${{ matrix.cache_slug }}
-          key: gguf-hub-${{ matrix.cache_slug }}
-
-      - name: GGUF exact matrix
-        run: |
-          python3 scripts/run-validation-matrix.py \
-            --suite exact \
-            --backend gguf \
-            --skip-build \
-            --cases "${{ matrix.id }}" \
-            --stamp "ci-gguf-${{ matrix.id }}"
-
-      - name: Upload GGUF exact results
-        if: always()
-        uses: actions/upload-artifact@v6
-        with:
-          name: gguf-exact-${{ matrix.id }}
-          path: MLX_VALIDATION_RESULTS/ci-gguf-${{ matrix.id }}
-          if-no-files-found: warn
+      - name: Client-auto boot test
+        run: scripts/ci-client-auto-test.sh target/debug/mesh-llm
 
       - name: Show sccache stats
         if: always()
@@ -536,7 +363,7 @@ jobs:
   linux_cuda:
     needs: changes
     if: ${{ github.event_name == 'workflow_dispatch' || needs.changes.outputs.rust == 'true' }}
-    name: Linux CUDA
+    name: Linux CUDA slim
     runs-on: ubuntu-latest
     container:
       image: nvidia/cuda:12.8.0-devel-ubuntu22.04
@@ -579,6 +406,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - uses: mozilla-actions/sccache-action@v0.0.9
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -586,33 +414,127 @@ jobs:
             . -> target
           prefix-key: ${{ env.CACHE_NAMESPACE }}-rust-${{ hashFiles('.github/cache-version.txt') }}
 
-      - name: Build Linux CUDA backend
+      # ── Cross-PR llama.cpp / CUDA slim artifact cache (read-only consumer) ──
+      #
+      # Goal: every PR gets a "warm" llama.cpp CUDA build for free. Without
+      # this cache the CUDA job pays ~194s warm (sccache hit) or ~26m cold
+      # (sccache eviction) on every PR. With it, the llama.cpp build is
+      # skipped entirely on cache hit and the only remaining work is the
+      # mesh-llm cargo build.
+      #
+      # This job RESTORES ONLY. It never writes the cache. All writes
+      # happen in .github/workflows/warm-caches.yml, which runs on push
+      # to main (paths-filtered) and on workflow_dispatch. Splitting the
+      # writer into its own workflow prevents PR runs from polluting
+      # PR-scoped cache storage with a ~500 MB `llama.cpp/build/bin`
+      # entry on every push, and lets the warmup workflow prune old
+      # versions (see warm-caches.yml for the retention policy).
+      #
+      # The cache key MUST stay byte-identical to the one in
+      # warm-caches.yml or PRs will never hit the main-warmed entry.
+      # Any change to the hashFiles() list or literal suffix must be
+      # mirrored in both files in the same commit.
+      #
+      # Cross-branch read: pushes to `main` write the cache under
+      # `refs/heads/main`. PR runs on `refs/pull/<N>/merge` automatically
+      # fall back to the base branch's cache scope, so PRs hit the
+      # main-warmed cache without needing any cache to exist on the PR
+      # ref itself.
+      #
+      # The cache key embeds EVERY input that affects the produced binaries:
+      #   - llama.cpp upstream commit SHA, resolved at workflow time below
+      #     via `git ls-remote`.
+      #   - hash of the build inputs in this repo: scripts/build-linux.sh,
+      #     Justfile, ci.yml, warm-caches.yml, gpu-warm-cache-job.yml,
+      #     cache-version.txt.
+      #   - the CUDA arch literal (`arch89`), the GGML_CUDA_FA_ALL_QUANTS
+      #     state (`fa-off`), and the CUDA toolkit version pulled from the
+      #     container image.
+      - name: Resolve llama.cpp upstream SHA
+        id: llama_sha
         shell: bash
         run: |
-          just --shell bash --shell-arg -lc release-build-cuda
+          set -euo pipefail
+          SHA=$(git ls-remote https://github.com/michaelneale/llama.cpp.git refs/heads/upstream-latest | cut -f1)
+          if [[ -z "$SHA" ]]; then
+            echo "Failed to resolve llama.cpp upstream-latest SHA" >&2
+            exit 1
+          fi
+          echo "Resolved llama.cpp upstream-latest SHA: $SHA"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+      # `actions/cache/restore@v5` (NOT `actions/cache@v5`): restore-only,
+      # never saves. PR runs on `refs/pull/<N>/merge` never write anything
+      # to PR-scoped cache storage. The only writer is warm-caches.yml.
+      # On cache miss the full llama.cpp build still runs to prove the
+      # change works, but the result is discarded at job end.
+      - name: Restore llama.cpp CUDA cache
+        id: llama_cuda_cache
+        uses: actions/cache/restore@v5
+        with:
+          path: llama.cpp/build/bin
+          key: ${{ env.CACHE_NAMESPACE }}-llama-cuda-slim-${{ steps.llama_sha.outputs.sha }}-${{ hashFiles('scripts/build-linux.sh', 'Justfile', '.github/workflows/ci.yml', '.github/workflows/warm-caches.yml', '.github/workflows/gpu-warm-cache-job.yml', '.github/cache-version.txt') }}-arch89-fa-off-cuda12.8
+
+      # CI is a validation build only: we only need to prove CUDA compiles
+      # and the Rust binary runs. User-facing release artifacts are produced
+      # by release.yml which keeps the full default cuda_arch list, release
+      # profile, and GGML_CUDA_FA_ALL_QUANTS=ON. Here we pass four CI-only
+      # opt-outs, all documented in scripts/build-linux.sh:
+      #   1. single cuda_arch 89 (Ada Lovelace) — ~3.7x faster llama.cpp build
+      #   2. MESH_LLM_BUILD_PROFILE=dev — debug profile for mesh-llm itself
+      #   3. MESH_LLM_CUDA_FA_ALL_QUANTS=off — skip the full FlashAttention
+      #      kernel matrix. Safe ONLY because the CUDA smoke test is
+      #      `mesh-llm --version` — the asymmetric K/V cache path that would
+      #      crash rpc-server with BEST_FATTN_KERNEL_NONE is never exercised.
+      #      NEVER set this in release.yml.
+      #   4. MESH_LLM_LLAMA_PIN_SHA — pin the llama.cpp checkout to the SHA
+      #      embedded in the artifact cache key (above). NEVER set this in
+      #      release.yml; release artifacts must build the current
+      #      upstream-latest tip.
+      #
+      # Split into two mutually exclusive steps keyed off the artifact cache:
+      #
+      #   - Cache miss → do the fast PR-only llama.cpp + mesh-llm build via the
+      #     build script. This validates the same arch89/fa-off shape that
+      #     main warms, but PR runs never write the shared cache.
+      #   - Cache hit  → skip llama.cpp entirely (we already proved it builds
+      #     at this SHA + flag combo) and run only the mesh-llm cargo build.
+      #     This is the warm path every PR hits when main has already run.
+      - name: Build Linux CUDA backend (cache miss — full llama.cpp build)
+        if: steps.llama_cuda_cache.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          MESH_LLM_BUILD_PROFILE: dev
+          MESH_LLM_CUDA_FA_ALL_QUANTS: off
+          MESH_LLM_LLAMA_PIN_SHA: ${{ steps.llama_sha.outputs.sha }}
+        run: |
+          just --shell bash --shell-arg -lc release-build-cuda 89
+
+      - name: Build mesh-llm binary only (cache hit — llama.cpp skipped)
+        if: steps.llama_cuda_cache.outputs.cache-hit == 'true'
+        shell: bash
+        env:
+          MESH_LLM_BUILD_PROFILE: dev
+        run: |
+          set -euo pipefail
+          echo "✓ llama.cpp CUDA build restored from cache (SHA ${{ steps.llama_sha.outputs.sha }})"
+          if [[ ! -d llama.cpp/build/bin ]]; then
+            echo "ERROR: cache hit but llama.cpp/build/bin is missing" >&2
+            exit 1
+          fi
+          if ! find llama.cpp/build/bin -maxdepth 1 -type f | grep -q .; then
+            echo "ERROR: cache hit but llama.cpp/build/bin contains no cached binaries" >&2
+            exit 1
+          fi
+          ls -lh llama.cpp/build/bin/ | head -20
+          cargo build -p mesh-llm --bin mesh-llm
+          ls -lh target/debug/mesh-llm
 
       - name: CLI smoke test
         shell: bash
         run: |
-          target/release/mesh-llm --version
-          target/release/mesh-llm --help | head -5
-
-      - name: Package Linux CUDA binaries
-        shell: bash
-        run: |
-          mkdir -p ci-artifacts/linux-cuda-binaries
-          cp target/release/mesh-llm ci-artifacts/linux-cuda-binaries/
-          cp llama.cpp/build/bin/rpc-server ci-artifacts/linux-cuda-binaries/
-          cp llama.cpp/build/bin/llama-server ci-artifacts/linux-cuda-binaries/
-          cp llama.cpp/build/bin/llama-moe-split ci-artifacts/linux-cuda-binaries/ 2>/dev/null || true
-          tar -czf ci-artifacts/linux-cuda-binaries.tgz -C ci-artifacts linux-cuda-binaries
-
-      - name: Upload Linux CUDA binaries
-        uses: actions/upload-artifact@v6
-        with:
-          name: linux-cuda-binaries
-          path: ci-artifacts/linux-cuda-binaries.tgz
-          if-no-files-found: error
+          target/debug/mesh-llm --version
+          target/debug/mesh-llm --help | head -5
 
       - name: Show sccache stats
         if: always()
@@ -621,7 +543,7 @@ jobs:
   linux_rocm:
     needs: changes
     if: ${{ github.event_name == 'workflow_dispatch' || needs.changes.outputs.rust == 'true' }}
-    name: Linux ROCm
+    name: Linux ROCm slim
     runs-on: ubuntu-latest
     container:
       image: rocm/dev-ubuntu-24.04:7.0-complete
@@ -664,6 +586,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - uses: mozilla-actions/sccache-action@v0.0.9
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -671,33 +594,61 @@ jobs:
             . -> target
           prefix-key: ${{ env.CACHE_NAMESPACE }}-rust-${{ hashFiles('.github/cache-version.txt') }}
 
-      - name: Build Linux ROCm backend
+      - name: Resolve llama.cpp upstream SHA
+        id: llama_sha
         shell: bash
         run: |
-          just --shell bash --shell-arg -lc release-build-amd
+          set -euo pipefail
+          SHA=$(git ls-remote https://github.com/michaelneale/llama.cpp.git refs/heads/upstream-latest | cut -f1)
+          if [[ -z "$SHA" ]]; then
+            echo "Failed to resolve llama.cpp upstream-latest SHA" >&2
+            exit 1
+          fi
+          echo "Resolved llama.cpp upstream-latest SHA: $SHA"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Restore llama.cpp ROCm cache
+        id: llama_rocm_cache
+        uses: actions/cache/restore@v5
+        with:
+          path: llama.cpp/build/bin
+          key: ${{ env.CACHE_NAMESPACE }}-llama-rocm-slim-${{ steps.llama_sha.outputs.sha }}-${{ hashFiles('scripts/build-linux-rocm.sh', 'Justfile', '.github/workflows/ci.yml', '.github/workflows/warm-caches.yml', '.github/workflows/gpu-warm-cache-job.yml', '.github/cache-version.txt') }}-gfx1100-rocm7.0
+
+      # This lane is compile-only plus a CLI smoke check (`--version`/`--help`).
+      # It does not exercise ROCm inference on real AMD hardware, so restrict
+      # the build to one representative target instead of compiling the full
+      # default AMDGPU target matrix.
+      - name: Build Linux ROCm backend (cache miss — full llama.cpp build)
+        if: steps.llama_rocm_cache.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          MESH_LLM_LLAMA_PIN_SHA: ${{ steps.llama_sha.outputs.sha }}
+        run: |
+          just --shell bash --shell-arg -lc release-build-rocm gfx1100
+
+      - name: Build mesh-llm binary only (cache hit — llama.cpp skipped)
+        if: steps.llama_rocm_cache.outputs.cache-hit == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "✓ llama.cpp ROCm build restored from cache (SHA ${{ steps.llama_sha.outputs.sha }})"
+          if [[ ! -d llama.cpp/build/bin ]]; then
+            echo "ERROR: cache hit but llama.cpp/build/bin is missing" >&2
+            exit 1
+          fi
+          if ! find llama.cpp/build/bin -maxdepth 1 -type f | grep -q .; then
+            echo "ERROR: cache hit but llama.cpp/build/bin contains no cached binaries" >&2
+            exit 1
+          fi
+          ls -lh llama.cpp/build/bin/ | head -20
+          cargo build --release --locked -p mesh-llm --bin mesh-llm
+          ls -lh target/release/mesh-llm
 
       - name: CLI smoke test
         shell: bash
         run: |
           target/release/mesh-llm --version
           target/release/mesh-llm --help | head -5
-
-      - name: Package Linux ROCm binaries
-        shell: bash
-        run: |
-          mkdir -p ci-artifacts/linux-rocm-binaries
-          cp target/release/mesh-llm ci-artifacts/linux-rocm-binaries/
-          cp llama.cpp/build/bin/rpc-server ci-artifacts/linux-rocm-binaries/
-          cp llama.cpp/build/bin/llama-server ci-artifacts/linux-rocm-binaries/
-          cp llama.cpp/build/bin/llama-moe-split ci-artifacts/linux-rocm-binaries/ 2>/dev/null || true
-          tar -czf ci-artifacts/linux-rocm-binaries.tgz -C ci-artifacts linux-rocm-binaries
-
-      - name: Upload Linux ROCm binaries
-        uses: actions/upload-artifact@v6
-        with:
-          name: linux-rocm-binaries
-          path: ci-artifacts/linux-rocm-binaries.tgz
-          if-no-files-found: error
 
       - name: Show sccache stats
         if: always()
@@ -749,6 +700,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - uses: mozilla-actions/sccache-action@v0.0.9
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -766,23 +718,6 @@ jobs:
         run: |
           target/release/mesh-llm --version
           target/release/mesh-llm --help | head -5
-
-      - name: Package Linux Vulkan binaries
-        shell: bash
-        run: |
-          mkdir -p ci-artifacts/linux-vulkan-binaries
-          cp target/release/mesh-llm ci-artifacts/linux-vulkan-binaries/
-          cp llama.cpp/build/bin/rpc-server ci-artifacts/linux-vulkan-binaries/
-          cp llama.cpp/build/bin/llama-server ci-artifacts/linux-vulkan-binaries/
-          cp llama.cpp/build/bin/llama-moe-split ci-artifacts/linux-vulkan-binaries/ 2>/dev/null || true
-          tar -czf ci-artifacts/linux-vulkan-binaries.tgz -C ci-artifacts linux-vulkan-binaries
-
-      - name: Upload Linux Vulkan binaries
-        uses: actions/upload-artifact@v6
-        with:
-          name: linux-vulkan-binaries
-          path: ci-artifacts/linux-vulkan-binaries.tgz
-          if-no-files-found: error
 
       - name: Show sccache stats
         if: always()
