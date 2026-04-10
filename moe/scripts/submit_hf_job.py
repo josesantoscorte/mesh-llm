@@ -22,6 +22,7 @@ except ModuleNotFoundError:  # pragma: no cover - depends on caller environment
 DEFAULT_RELEASE_REPO = "michaelneale/mesh-llm"
 DEFAULT_JOB_FLAVOR = "cpu-xl"
 DEFAULT_TIMEOUT = "1h"
+RELEASE_TARGET_CHOICES = ["auto", "cpu", "cuda", "rocm", "vulkan", "metal"]
 
 
 def parse_args() -> argparse.Namespace:
@@ -62,6 +63,12 @@ def parse_args() -> argparse.Namespace:
         help="Context window passed to llama-moe-analyze.",
     )
     parser.add_argument(
+        "--n-gpu-layers",
+        type=int,
+        default=0,
+        help="Number of layers to offload to GPU inside the remote job. Use 0 for CPU-only runs.",
+    )
+    parser.add_argument(
         "--all-layers",
         action="store_true",
         default=True,
@@ -82,6 +89,12 @@ def parse_args() -> argparse.Namespace:
         "--release-tag",
         default="latest",
         help="Release tag to download inside the job. Use `latest` for the latest GitHub release.",
+    )
+    parser.add_argument(
+        "--release-target",
+        choices=RELEASE_TARGET_CHOICES,
+        default="auto",
+        help="Release bundle target to use inside the job. Use `cuda` for HF GPU jobs that should use the CUDA bundle.",
     )
     parser.add_argument(
         "--dataset-repo",
@@ -162,12 +175,16 @@ def build_script_args(args: argparse.Namespace) -> list[str]:
         args.release_repo,
         "--release-tag",
         args.release_tag,
+        "--release-target",
+        args.release_target,
         "--analyzer-id",
         args.analyzer_id,
         "--token-count",
         str(args.token_count),
         "--context-size",
         str(args.context_size),
+        "--n-gpu-layers",
+        str(args.n_gpu_layers),
         "--dataset-repo",
         args.dataset_repo,
         "--dataset-revision",

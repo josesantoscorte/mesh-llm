@@ -45,6 +45,7 @@ DEFAULT_MICRO_PROMPTS = [
 
 SHARD_SUFFIX_RE = re.compile(r"-(\d{5})-of-(\d{5})$")
 DEFAULT_RELEASE_REPO = "michaelneale/mesh-llm"
+RELEASE_TARGET_CHOICES = ["auto", "cpu", "cuda", "rocm", "vulkan", "metal"]
 
 
 @dataclass(frozen=True)
@@ -65,6 +66,7 @@ class AnalyzerBinary:
     release_repo: str | None = None
     release_tag: str | None = None
     release_asset: str | None = None
+    release_target: str | None = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -115,6 +117,12 @@ def parse_args() -> argparse.Namespace:
         help="Context window passed to llama-moe-analyze.",
     )
     parser.add_argument(
+        "--n-gpu-layers",
+        type=int,
+        default=0,
+        help="Number of layers to offload to GPU. Use 0 for CPU-only runs.",
+    )
+    parser.add_argument(
         "--all-layers",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -151,6 +159,12 @@ def parse_args() -> argparse.Namespace:
         "--release-tag",
         default="latest",
         help="Release tag to download when --analyzer-source=release. Use `latest` for the latest release.",
+    )
+    parser.add_argument(
+        "--release-target",
+        choices=RELEASE_TARGET_CHOICES,
+        default="auto",
+        help="Release bundle target to use when --analyzer-source=release. Use `auto` to infer from the runtime platform.",
     )
     parser.add_argument(
         "--dataset-repo",
@@ -190,6 +204,10 @@ def parse_args() -> argparse.Namespace:
         parser.error(
             "--prompt-file is not supported by the built-in analyzer ids; add a new analyzer id for a custom prompt set"
         )
+    if args.n_gpu_layers < 0:
+        parser.error("--n-gpu-layers must be >= 0")
+    if args.analyzer_source == "local" and args.release_target != "auto":
+        parser.error("--release-target is only valid when --analyzer-source=release")
     return args
 
 
@@ -227,19 +245,35 @@ def load_prompts(prompt_file: str | None) -> list[str]:
     return prompts
 
 
-def release_asset_name(release_tag: str) -> str:
-    if sys.platform == "darwin" and os.uname().machine == "arm64":
-        target_triple = "aarch64-apple-darwin"
-    elif sys.platform.startswith("linux") and os.uname().machine in {"x86_64", "amd64"}:
-        target_triple = "x86_64-unknown-linux-gnu"
-    else:
+def resolve_release_target(release_target: str) -> tuple[str, str]:
+    if release_target == "auto":
+        if sys.platform == "darwin" and os.uname().machine == "arm64":
+            return "metal", "aarch64-apple-darwin"
+        if sys.platform.startswith("linux") and os.uname().machine in {"x86_64", "amd64"}:
+            return "cpu", "x86_64-unknown-linux-gnu"
         raise SystemExit(
             f"Unsupported platform for release bootstrap: platform={sys.platform} arch={os.uname().machine}"
         )
 
+    if release_target == "metal":
+        if not (sys.platform == "darwin" and os.uname().machine == "arm64"):
+            raise SystemExit("--release-target=metal requires macOS arm64")
+        return "metal", "aarch64-apple-darwin"
+
+    if release_target in {"cpu", "cuda", "rocm", "vulkan"}:
+        if not (sys.platform.startswith("linux") and os.uname().machine in {"x86_64", "amd64"}):
+            raise SystemExit(f"--release-target={release_target} requires Linux x86_64")
+        return release_target, "x86_64-unknown-linux-gnu"
+
+    raise SystemExit(f"Unsupported --release-target={release_target}")
+
+
+def release_asset_name(release_tag: str, release_target: str) -> tuple[str, str]:
+    resolved_target, target_triple = resolve_release_target(release_target)
+    target_suffix = target_triple if resolved_target in {"cpu", "metal"} else f"{target_triple}-{resolved_target}"
     if release_tag == "latest":
-        return f"mesh-llm-{target_triple}.tar.gz"
-    return f"mesh-llm-{release_tag}-{target_triple}.tar.gz"
+        return f"mesh-llm-{target_suffix}.tar.gz", resolved_target
+    return f"mesh-llm-{release_tag}-{target_suffix}.tar.gz", resolved_target
 
 
 def release_download_url(release_repo: str, release_tag: str, asset_name: str) -> str:
@@ -285,8 +319,8 @@ def resolve_analyzer_binary(args: argparse.Namespace) -> AnalyzerBinary:
             raise SystemExit(f"Analyzer binary not found: {path}")
         return AnalyzerBinary(path=path, source="local")
 
-    asset_name = release_asset_name(args.release_tag)
-    cache_root = args.tool_cache_dir / "github-releases" / args.release_repo / args.release_tag
+    asset_name, resolved_release_target = release_asset_name(args.release_tag, args.release_target)
+    cache_root = args.tool_cache_dir / "github-releases" / args.release_repo / args.release_tag / resolved_release_target
     archive_path = cache_root / asset_name
     binary_path = cache_root / "bin" / "llama-moe-analyze"
     if not binary_path.exists():
@@ -299,6 +333,7 @@ def resolve_analyzer_binary(args: argparse.Namespace) -> AnalyzerBinary:
         release_repo=args.release_repo,
         release_tag=args.release_tag,
         release_asset=asset_name,
+        release_target=resolved_release_target,
     )
 
 
@@ -410,7 +445,7 @@ def build_command(
         "-c",
         str(args.context_size),
         "-ngl",
-        "0",
+        str(args.n_gpu_layers),
     ]
     if args.all_layers:
         command.append("--all-layers")
@@ -587,6 +622,7 @@ def write_metadata(
         "analyzer_release_repo": analyzer.release_repo,
         "analyzer_release_tag": analyzer.release_tag,
         "analyzer_release_asset": analyzer.release_asset,
+        "analyzer_release_target": analyzer.release_target,
         "ranking_path": "ranking.csv",
         "primary_file": distribution.primary_file,
         "all_files": distribution.files,
@@ -604,6 +640,7 @@ def write_metadata(
             "analyzer_bin": str(analyzer.path),
             "context_size": args.context_size,
             "token_count": args.token_count if args.analyzer_id == "micro-v1" else 32,
+            "n_gpu_layers": args.n_gpu_layers,
             "analyzer_id": args.analyzer_id,
         },
         "created_at": datetime.now(timezone.utc).isoformat(),
