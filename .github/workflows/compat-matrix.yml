@@ -20,6 +20,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Create empty embedded console dir
+        run: mkdir -p mesh-llm/ui/dist
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/cache@v4
         with:
