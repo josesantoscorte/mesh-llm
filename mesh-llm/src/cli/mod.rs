@@ -211,14 +211,6 @@ pub(crate) struct Cli {
     #[arg(long)]
     pub(crate) model: Vec<PathBuf>,
 
-    /// Prefer the GGUF backend when resolving an ambiguous Hugging Face repo.
-    #[arg(long, conflicts_with = "mlx")]
-    pub(crate) gguf: bool,
-
-    /// Prefer the MLX backend when resolving an ambiguous Hugging Face repo.
-    #[arg(long, conflicts_with = "gguf")]
-    pub(crate) mlx: bool,
-
     /// Raw local GGUF file to serve directly (repeatable).
     #[arg(long = "gguf-file")]
     pub(crate) gguf_file: Vec<PathBuf>,

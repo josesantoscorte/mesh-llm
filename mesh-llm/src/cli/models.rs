@@ -54,12 +54,6 @@ pub enum ModelsCommand {
     Download {
         /// Exact catalog id, Hugging Face ref, repo shorthand, or direct URL.
         model: String,
-        /// Prefer the GGUF backend when resolving an ambiguous Hugging Face repo.
-        #[arg(long, conflicts_with = "mlx")]
-        gguf: bool,
-        /// Prefer the MLX backend when resolving an ambiguous Hugging Face repo.
-        #[arg(long, conflicts_with = "gguf")]
-        mlx: bool,
         /// Also download the recommended draft model for speculative decoding.
         #[arg(long)]
         draft: bool,

@@ -22,7 +22,6 @@ use crate::mesh;
 use crate::mesh::NodeRole;
 use crate::models;
 use crate::models::catalog;
-use crate::models::ResolveFormatPreference;
 use crate::network::{affinity, nostr, router, tunnel};
 use crate::plugin;
 use crate::system::{autoupdate, benchmark, hardware};
@@ -38,7 +37,6 @@ struct StartupModelSpec {
     model_ref: PathBuf,
     mmproj_ref: Option<PathBuf>,
     ctx_size: Option<u32>,
-    preference: ResolveFormatPreference,
 }
 
 #[derive(Clone, Debug)]
@@ -406,7 +404,7 @@ pub(crate) async fn run() -> Result<()> {
                 .join("config.toml")
         });
         eprintln!(
-            "⚠️ `mesh-llm serve` needs at least one startup model.\n  Add `[[models]]` to {}, or pass `--model` / `--gguf` explicitly.",
+            "⚠️ `mesh-llm serve` needs at least one startup model.\n  Add `[[models]]` to {}, or pass `--model`, `--gguf-file`, or `--mlx-file` explicitly.",
             config_path.display()
         );
         Cli::command().print_help().ok();
@@ -436,43 +434,15 @@ pub(crate) async fn run() -> Result<()> {
 }
 
 /// Resolve a model path: local file, catalog name, or HuggingFace URL.
-async fn resolve_model(
-    input: &std::path::Path,
-    preference: ResolveFormatPreference,
-) -> Result<PathBuf> {
+async fn resolve_model(input: &std::path::Path) -> Result<PathBuf> {
     let s = input.to_string_lossy();
 
     // Already a local file
     if input.exists() {
-        #[cfg(target_os = "macos")]
-        {
-            if preference == ResolveFormatPreference::Mlx {
-                // When --mlx is explicit, normalize a safetensors file path to its parent model dir
-                // so downstream code consistently receives a directory, not a file path.
-                if let Some(dir) = crate::mlx::mlx_model_dir(input) {
-                    if crate::mlx::is_mlx_model_dir(dir) {
-                        return Ok(dir.to_path_buf());
-                    }
-                }
-            } else if let Some(dir) = crate::mlx::mlx_model_dir(input) {
-                if crate::mlx::is_mlx_model_dir(dir) {
-                    anyhow::bail!(
-                        "MLX model paths require explicit `--mlx` or `--mlx-file`.\nRetry with:\n  mesh-llm --model {} --mlx",
-                        input.display()
-                    );
-                }
-            }
-        }
         return Ok(input.to_path_buf());
     }
     if s.contains('/') {
-        return models::download_exact_ref(
-            &s,
-            preference,
-            "mesh-llm --model",
-            models::MlxSelectionPolicy::RequireExplicitFlag,
-        )
-        .await;
+        return models::download_exact_ref(&s).await;
     }
 
     models::resolve_model_spec(input).await
@@ -492,18 +462,10 @@ fn build_startup_model_specs(
 
     #[cfg(not(target_os = "macos"))]
     {
-        if !cli.mlx_file.is_empty() || cli.mlx {
+        if !cli.mlx_file.is_empty() {
             anyhow::bail!("MLX model selection is only supported on macOS");
         }
     }
-
-    let preference = if cli.gguf {
-        ResolveFormatPreference::Gguf
-    } else if cli.mlx {
-        ResolveFormatPreference::Mlx
-    } else {
-        ResolveFormatPreference::Auto
-    };
 
     let mut specs = Vec::new();
     if cli_has_explicit_models(cli) {
@@ -515,7 +477,6 @@ fn build_startup_model_specs(
                 model_ref: path.clone(),
                 mmproj_ref: None,
                 ctx_size: cli.ctx_size,
-                preference: ResolveFormatPreference::Gguf,
             });
         }
         for path in &cli.mlx_file {
@@ -523,7 +484,6 @@ fn build_startup_model_specs(
                 model_ref: path.clone(),
                 mmproj_ref: None,
                 ctx_size: cli.ctx_size,
-                preference: ResolveFormatPreference::Mlx,
             });
         }
         for model in &cli.model {
@@ -531,7 +491,6 @@ fn build_startup_model_specs(
                 model_ref: model.clone(),
                 mmproj_ref: None,
                 ctx_size: cli.ctx_size,
-                preference,
             });
         }
         if let Some(mmproj) = &cli.mmproj {
@@ -547,7 +506,6 @@ fn build_startup_model_specs(
             model_ref: PathBuf::from(model.model.clone()),
             mmproj_ref: model.mmproj.as_ref().map(PathBuf::from),
             ctx_size: cli.ctx_size.or(model.ctx_size),
-            preference: ResolveFormatPreference::Auto,
         });
     }
     Ok(specs)
@@ -556,9 +514,9 @@ fn build_startup_model_specs(
 async fn resolve_startup_models(specs: &[StartupModelSpec]) -> Result<Vec<StartupModelPlan>> {
     let mut plans = Vec::with_capacity(specs.len());
     for spec in specs {
-        let resolved_path = resolve_model(&spec.model_ref, spec.preference).await?;
+        let resolved_path = resolve_model(&spec.model_ref).await?;
         let mmproj_path = match spec.mmproj_ref.as_ref() {
-            Some(mmproj) => Some(resolve_model(mmproj, ResolveFormatPreference::Auto).await?),
+            Some(mmproj) => Some(resolve_model(mmproj).await?),
             None => None,
         };
         plans.push(StartupModelPlan {
@@ -1772,7 +1730,6 @@ async fn run_auto(
                         let result = async {
                             let model_path = resolve_model(
                                 &PathBuf::from(&spec),
-                                ResolveFormatPreference::Auto,
                             )
                             .await?;
                             let runtime_model_name = resolved_model_name(&model_path);
@@ -2274,12 +2231,9 @@ mod tests {
         std::fs::create_dir_all(model_path.parent().unwrap()).unwrap();
         std::fs::write(&model_path, b"gguf").unwrap();
 
-        let resolved = resolve_model(
-            Path::new("Llama-3.2-1B-Instruct-Q4_K_M"),
-            ResolveFormatPreference::Auto,
-        )
-        .await
-        .unwrap();
+        let resolved = resolve_model(Path::new("Llama-3.2-1B-Instruct-Q4_K_M"))
+            .await
+            .unwrap();
         assert_eq!(resolved, model_path);
 
         let _ = std::fs::remove_dir_all(&cache_root);
@@ -2321,20 +2275,14 @@ mod tests {
         std::fs::create_dir_all(model_path.parent().unwrap()).unwrap();
         std::fs::write(&model_path, b"gguf").unwrap();
 
-        let resolved_by_stem = resolve_model(
-            Path::new("Custom-Model-Q4_K_M"),
-            ResolveFormatPreference::Auto,
-        )
-        .await
-        .unwrap();
+        let resolved_by_stem = resolve_model(Path::new("Custom-Model-Q4_K_M"))
+            .await
+            .unwrap();
         assert_eq!(resolved_by_stem, model_path);
 
-        let resolved_by_filename = resolve_model(
-            Path::new("Custom-Model-Q4_K_M.gguf"),
-            ResolveFormatPreference::Auto,
-        )
-        .await
-        .unwrap();
+        let resolved_by_filename = resolve_model(Path::new("Custom-Model-Q4_K_M.gguf"))
+            .await
+            .unwrap();
         assert_eq!(resolved_by_filename, model_path);
 
         let _ = std::fs::remove_dir_all(&cache_root);
@@ -2508,7 +2456,6 @@ mod tests {
             model_ref: PathBuf::from("Qwen3-8B-Q4_K_M"),
             mmproj_ref: None,
             ctx_size: None,
-            preference: ResolveFormatPreference::Auto,
         }];
 
         assert!(!should_show_serve_config_help(
