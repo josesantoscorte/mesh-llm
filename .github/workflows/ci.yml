@@ -314,7 +314,11 @@ jobs:
           cp linux-binaries/mesh-llm target/debug/mesh-llm
           cp linux-binaries/rpc-server llama.cpp/build/bin/rpc-server
           cp linux-binaries/llama-server llama.cpp/build/bin/llama-server
-          cp linux-binaries/llama-moe-split llama.cpp/build/bin/llama-moe-split 2>/dev/null || true
+          cp linux-binaries/llama-moe-split llama.cpp/build/bin/llama-moe-split
+          test -x target/debug/mesh-llm
+          test -x llama.cpp/build/bin/rpc-server
+          test -x llama.cpp/build/bin/llama-server
+          test -x llama.cpp/build/bin/llama-moe-split
 
       - name: Cache integration model
         id: cache-model
