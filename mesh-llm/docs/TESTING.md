@@ -1,5 +1,8 @@
 # Testing mesh-llm
 
+If you are bringing up a new MLX model family end-to-end, start with
+[`MLX_FAMILY_BRINGUP.md`](/Users/jdumay/code/worktrees/mesh-llm-validation/mesh-llm/docs/MLX_FAMILY_BRINGUP.md).
+
 ## Local validation matrix
 
 Use the checked-in validation runner when you want to rerun the local backend

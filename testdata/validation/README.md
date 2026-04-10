@@ -1,5 +1,9 @@
 # Validation Testdata
 
+For the full workflow to add a new MLX family, derive same-origin `GGUF` and
+`MLX` artifacts, publish them to `meshllm`, and then pin them here, start with
+[`mesh-llm/docs/MLX_FAMILY_BRINGUP.md`](/Users/jdumay/code/worktrees/mesh-llm-validation/mesh-llm/docs/MLX_FAMILY_BRINGUP.md).
+
 This directory contains the checked-in data that drives local and CI validation
 for the GGUF and MLX backends.
 
