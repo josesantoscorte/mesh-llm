@@ -7,6 +7,23 @@
   },
   "exact": {
     "gguf": {
+      "mistral": {
+        "exit": 0,
+        "case_id": "mistral-gguf-exact",
+        "prompt_outputs": {
+          "after-monday": "tuesday",
+          "alt-green": "green",
+          "alt-red": "the color you asked for is red",
+          "banana-color": "yellow",
+          "breathing-gas": "oxygen",
+          "capital-france": "paris",
+          "largest-planet": "jupiter",
+          "opposite-hot": "cold",
+          "primary": "blue",
+          "primary-colors": "red, green, blue",
+          "two-plus-two": "2 + 2 = 4"
+        }
+      },
       "qwen25": {
         "exit": 0,
         "case_id": "qwen25-gguf-exact"
@@ -45,6 +62,23 @@
       }
     },
     "mlx": {
+      "mistral": {
+        "exit": 0,
+        "case_id": "mistral-mlx-exact",
+        "prompt_outputs": {
+          "after-monday": "tuesday",
+          "alt-green": "green",
+          "alt-red": "the color you asked for is red",
+          "banana-color": "yellow",
+          "breathing-gas": "oxygen",
+          "capital-france": "paris",
+          "largest-planet": "jupiter",
+          "opposite-hot": "cold",
+          "primary": "blue",
+          "primary-colors": "red, green, blue",
+          "two-plus-two": "2 + 2 = 4"
+        }
+      },
       "qwen25": {
         "exit": 1,
         "case_id": "qwen25-mlx-exact"
@@ -84,7 +118,30 @@
     }
   },
   "behavior": {
-    "gguf": {},
-    "mlx": {}
+    "gguf": {
+      "mistral": {
+        "failed_prompt_count": 10,
+        "prompt_count": 80,
+        "flagged_prompt_ids": [
+          "reasoning#70728745",
+          "math#17722882",
+          "math#35264271",
+          "math#9170963",
+          "math#42252927",
+          "math#48989963",
+          "coding#34377376",
+          "coding#19673382",
+          "extraction#34830845",
+          "stem#67710207"
+        ]
+      }
+    },
+    "mlx": {
+      "mistral": {
+        "failed_prompt_count": 0,
+        "prompt_count": 80,
+        "flagged_prompt_ids": []
+      }
+    }
   }
 }

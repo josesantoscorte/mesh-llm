@@ -385,6 +385,7 @@ def main() -> int:
     parser.add_argument("--expected-template-source", default="")
     parser.add_argument("--prompt", default="Reply with exactly: blue")
     parser.add_argument("--expect-contains", default="")
+    parser.add_argument("--expect-contains-ci", default="")
     parser.add_argument("--forbid-contains", default="")
     parser.add_argument("--expect-exact", default="")
     parser.add_argument("--prompt-suite-json", default="")
@@ -439,6 +440,7 @@ def main() -> int:
                     "label": "primary",
                     "prompt": args.prompt,
                     "expect_contains": args.expect_contains,
+                    "expect_contains_ci": args.expect_contains_ci,
                     "forbid_contains": args.forbid_contains,
                     "expect_exact": args.expect_exact,
                 }

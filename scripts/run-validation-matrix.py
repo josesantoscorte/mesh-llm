@@ -216,6 +216,18 @@ def case_dir(root: Path, stamp: str, suite: str, case_id: str) -> Path:
     return root / stamp / suite / case_id
 
 
+def exact_config_for(matrix: dict[str, Any], model: dict[str, Any]) -> dict[str, Any]:
+    exact_cfg = dict(matrix["defaults"]["exact"])
+    if "prompt_suite" in exact_cfg:
+        exact_cfg["prompt_suite"] = [dict(item) for item in exact_cfg["prompt_suite"]]
+    model_exact = model.get("exact")
+    if isinstance(model_exact, dict):
+        exact_cfg.update(model_exact)
+        if "prompt_suite" in model_exact:
+            exact_cfg["prompt_suite"] = [dict(item) for item in model_exact["prompt_suite"]]
+    return exact_cfg
+
+
 def run_exact_case(
     root: Path,
     stamp: str,
@@ -224,7 +236,7 @@ def run_exact_case(
     backend: str,
     resolved_models: dict[tuple[str, str], str],
 ) -> int:
-    exact_defaults = matrix["defaults"]["exact"]
+    exact_defaults = exact_config_for(matrix, model)
     backend_cfg = model[backend]
     case_id = backend_cfg["exact_case_id"]
     env = {
@@ -250,6 +262,8 @@ def run_exact_case(
         exact_defaults["prompt"],
         "--expect-contains",
         exact_defaults["expect_contains"],
+        "--expect-contains-ci",
+        exact_defaults.get("expect_contains_ci", ""),
         "--forbid-contains",
         exact_defaults["forbid_contains"],
         "--expect-exact",
