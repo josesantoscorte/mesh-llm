@@ -44,6 +44,56 @@ struct GenerationOutcome {
     finish_reason: &'static str,
 }
 
+fn encode_prompt_tokens(model: &MlxModel, prompt: &str) -> Result<Vec<u32>> {
+    let patch = match &model.tokenizer_spacing_patch {
+        Some(patch) => patch,
+        None => {
+            return Ok(model
+                .tokenizer
+                .encode(prompt, false)
+                .map_err(|e| anyhow::anyhow!("tokenizer encode: {e}"))?
+                .get_ids()
+                .to_vec())
+        }
+    };
+
+    let mut tokens = Vec::new();
+    let mut cursor = 0usize;
+    while cursor < prompt.len() {
+        let remaining = &prompt[cursor..];
+        if let Some((special, token_id)) = patch
+            .special_tokens
+            .iter()
+            .find(|(special, _)| remaining.starts_with(special))
+        {
+            tokens.push(*token_id);
+            if remaining[special.len()..].starts_with(' ') {
+                tokens.push(patch.space_token_id);
+            }
+            cursor += special.len();
+            continue;
+        }
+
+        let next_special = patch
+            .special_tokens
+            .iter()
+            .filter_map(|(special, _)| remaining.find(special))
+            .min()
+            .unwrap_or(remaining.len());
+        let segment = &remaining[..next_special];
+        if !segment.is_empty() {
+            let encoding = model
+                .tokenizer
+                .encode(segment, false)
+                .map_err(|e| anyhow::anyhow!("tokenizer encode: {e}"))?;
+            tokens.extend_from_slice(encoding.get_ids());
+        }
+        cursor += next_special;
+    }
+
+    Ok(tokens)
+}
+
 fn sanitize_behavior_output(_model: &MlxModel, text: &str) -> String {
     let normalized = collapse_alpha_outline_markers(text);
     trim_to_behavior_safe_prefix(&normalized)
@@ -962,12 +1012,7 @@ fn run_inference(
     if state.model.cacheless_generation() {
         return run_inference_cacheless(state, prompt, generation);
     }
-    let encoding = state
-        .model
-        .tokenizer
-        .encode(prompt, false)
-        .map_err(|e| anyhow::anyhow!("tokenizer encode: {e}"))?;
-    let prompt_tokens: Vec<u32> = encoding.get_ids().to_vec();
+    let prompt_tokens = encode_prompt_tokens(&state.model, prompt)?;
     let prompt_len = prompt_tokens.len();
     if prompt_tokens.is_empty() {
         anyhow::bail!("prompt encoded to zero tokens — check that the prompt is non-empty");
@@ -1066,12 +1111,7 @@ fn run_inference_streaming(
     if state.model.cacheless_generation() {
         return run_inference_streaming_cacheless(state, prompt, generation, tx);
     }
-    let encoding = state
-        .model
-        .tokenizer
-        .encode(prompt, false)
-        .map_err(|e| anyhow::anyhow!("tokenizer encode: {e}"))?;
-    let prompt_tokens: Vec<u32> = encoding.get_ids().to_vec();
+    let prompt_tokens = encode_prompt_tokens(&state.model, prompt)?;
     if prompt_tokens.is_empty() {
         anyhow::bail!("prompt encoded to zero tokens — check that the prompt is non-empty");
     }
@@ -1151,12 +1191,7 @@ fn run_inference_cacheless(
     prompt: &str,
     generation: &GenerationConfig,
 ) -> Result<GenerationOutcome> {
-    let encoding = state
-        .model
-        .tokenizer
-        .encode(prompt, false)
-        .map_err(|e| anyhow::anyhow!("tokenizer encode: {e}"))?;
-    let mut tokens: Vec<u32> = encoding.get_ids().to_vec();
+    let mut tokens = encode_prompt_tokens(&state.model, prompt)?;
     let prompt_len = tokens.len();
     let mut sampler = Sampler::new(generation.sampling.clone());
     let mut stop_buffer = StopBuffer::new(generation.stop_sequences.clone());
@@ -1220,12 +1255,7 @@ fn run_inference_streaming_cacheless(
     generation: &GenerationConfig,
     tx: &tokio::sync::mpsc::Sender<StreamEvent>,
 ) -> Result<&'static str> {
-    let encoding = state
-        .model
-        .tokenizer
-        .encode(prompt, false)
-        .map_err(|e| anyhow::anyhow!("tokenizer encode: {e}"))?;
-    let mut tokens: Vec<u32> = encoding.get_ids().to_vec();
+    let mut tokens = encode_prompt_tokens(&state.model, prompt)?;
     let mut sampler = Sampler::new(generation.sampling.clone());
     let mut stop_buffer = StopBuffer::new(generation.stop_sequences.clone());
     let mut response_filter = ResponseFilter::new(generation.response_policy.clone());

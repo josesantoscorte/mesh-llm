@@ -3,17 +3,33 @@
 //! Loads quantized safetensors and runs inference entirely on Metal GPU.
 //! No Python, no subprocess — just Rust + MLX C library.
 
+mod families;
+mod family;
+
 use anyhow::{bail, Context, Result};
 use mlx_rs::array;
 use mlx_rs::ops::indexing::{IndexOp, TryIndexMutOp};
-use mlx_rs::ops::{conv1d, dequantize, dequantize_device, pad, quantize};
+use mlx_rs::ops::{conv1d, dequantize_device, pad, quantize};
 use mlx_rs::Array;
 use mlx_rs::{Dtype, StreamOrDevice};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::Read;
 use std::path::Path;
+
+use families::apply_family_tensor_transforms;
+#[cfg(test)]
+use family::ModelArchitecture;
+pub use family::ReasoningFamily;
+use family::{
+    config_supports_mlx, detect_architecture_from_safetensors_header, ensure_supported_mlx_model,
+    model_architecture, reasoning_family, uses_traditional_rope,
+};
+
+#[derive(Debug, Clone)]
+pub struct TokenizerSpacingPatch {
+    pub special_tokens: Vec<(String, u32)>,
+    pub space_token_id: u32,
+}
 
 #[derive(Debug, serde::Deserialize)]
 pub struct ModelConfig {
@@ -148,16 +164,6 @@ pub struct LinearAttnConfig {
     pub head_dim: i32,
     #[serde(default)]
     pub short_conv_kernel_size: Option<i32>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReasoningFamily {
-    None,
-    Qwen3,
-    Glm,
-    Kimi,
-    GptOss,
-    Lfm2,
 }
 
 #[derive(Debug, serde::Deserialize, Clone)]
@@ -454,6 +460,7 @@ pub struct Attention {
     attn_logit_softcapping: Option<f32>,
     rope_dim: i32,
     rope_theta: f32,
+    rope_traditional: bool,
     window_size: Option<i32>,
     kv_shared_source: Option<usize>,
 }
@@ -484,7 +491,14 @@ impl Attention {
         let q = self.q_proj.forward(x)?;
         let q = Self::apply_qk_norm(q, self.q_norm.as_ref(), b, l, self.num_heads, self.head_dim)?
             .transpose_axes(&[0, 2, 1, 3])?;
-        let q = apply_rope(&q, self.rope_dim, self.head_dim, self.rope_theta, 0)?;
+        let q = apply_rope(
+            &q,
+            self.rope_dim,
+            self.head_dim,
+            self.rope_theta,
+            self.rope_traditional,
+            0,
+        )?;
 
         let k = self.k_proj.forward(x)?;
         let v = self.v_proj.forward(x)?;
@@ -504,7 +518,14 @@ impl Attention {
             v
         }
         .transpose_axes(&[0, 2, 1, 3])?;
-        let k = apply_rope(&k, self.rope_dim, self.head_dim, self.rope_theta, 0)?;
+        let k = apply_rope(
+            &k,
+            self.rope_dim,
+            self.head_dim,
+            self.rope_theta,
+            self.rope_traditional,
+            0,
+        )?;
 
         let mask = if self.window_size.is_some() {
             attention_mask(l, l, 0, self.window_size)?
@@ -549,7 +570,14 @@ impl Attention {
             .transpose_axes(&[0, 2, 1, 3])?;
 
         let offset = cache.offset as i32;
-        let q = apply_rope(&q, self.rope_dim, self.head_dim, self.rope_theta, offset)?;
+        let q = apply_rope(
+            &q,
+            self.rope_dim,
+            self.head_dim,
+            self.rope_theta,
+            self.rope_traditional,
+            offset,
+        )?;
         let (k, v) = if let Some(shared_cache) = shared_cache {
             shared_cache
                 .views()
@@ -573,7 +601,14 @@ impl Attention {
                 v
             }
             .transpose_axes(&[0, 2, 1, 3])?;
-            let k = apply_rope(&k, self.rope_dim, self.head_dim, self.rope_theta, offset)?;
+            let k = apply_rope(
+                &k,
+                self.rope_dim,
+                self.head_dim,
+                self.rope_theta,
+                self.rope_traditional,
+                offset,
+            )?;
             cache.update(k, v)?
         };
 
@@ -711,6 +746,7 @@ impl DeepseekV3Attention {
             self.qk_rope_head_dim,
             self.qk_rope_head_dim,
             self.rope_theta,
+            false,
             offset,
         )?;
         let k_pe = apply_rope(
@@ -718,6 +754,7 @@ impl DeepseekV3Attention {
             self.qk_rope_head_dim,
             self.qk_rope_head_dim,
             self.rope_theta,
+            false,
             offset,
         )?;
 
@@ -852,13 +889,14 @@ fn apply_rope(
     rope_dim: i32,
     head_dim: i32,
     rope_theta: f32,
+    rope_traditional: bool,
     offset: i32,
 ) -> Result<Array> {
     if rope_dim == head_dim {
         return Ok(mlx_rs::fast::rope(
             x,
             head_dim,
-            false,
+            rope_traditional,
             Some(rope_theta),
             1.0,
             offset,
@@ -875,7 +913,7 @@ fn apply_rope(
     let rotated = mlx_rs::fast::rope(
         &rotated,
         rope_dim,
-        false,
+        rope_traditional,
         Some(rope_theta),
         1.0,
         offset,
@@ -1781,180 +1819,6 @@ fn quant_params_for(
     )
 }
 
-fn transform_deepseek_v3_tensors(
-    tensors: &mut HashMap<String, Array>,
-    prefixes: &TensorPrefixes,
-    config: &ModelConfig,
-    config_json: &Value,
-    default_group_size: i32,
-    default_bits: i32,
-) -> Result<()> {
-    let num_heads = config.num_attention_heads;
-    let qk_nope_head_dim = config
-        .qk_nope_head_dim
-        .context("missing qk_nope_head_dim for DeepSeekV3")?;
-    let v_head_dim = config
-        .v_head_dim
-        .context("missing v_head_dim for DeepSeekV3")?;
-    let kv_lora_rank = config
-        .kv_lora_rank
-        .context("missing kv_lora_rank for DeepSeekV3")?;
-
-    for i in 0..config.num_hidden_layers {
-        let prefix = format!("{}.layers.{i}.self_attn", prefixes.model);
-        if !tensors.contains_key(&format!("{prefix}.kv_b_proj.weight"))
-            || tensors.contains_key(&format!("{prefix}.embed_q.weight"))
-        {
-            continue;
-        }
-
-        let (group_size, bits) = quant_params_for(
-            config_json,
-            &format!("{prefix}.kv_b_proj"),
-            default_group_size,
-            default_bits,
-        );
-        let weight = tensors
-            .get(&format!("{prefix}.kv_b_proj.weight"))
-            .cloned()
-            .with_context(|| format!("missing {prefix}.kv_b_proj.weight"))?;
-        let scales = tensors
-            .get(&format!("{prefix}.kv_b_proj.scales"))
-            .cloned()
-            .with_context(|| format!("missing {prefix}.kv_b_proj.scales"))?;
-        let biases = tensors
-            .get(&format!("{prefix}.kv_b_proj.biases"))
-            .cloned()
-            .with_context(|| format!("missing {prefix}.kv_b_proj.biases"))?;
-        let dense = dequantize(&weight, &scales, &biases, group_size, bits)?;
-        let dense = dense.reshape(&[num_heads, qk_nope_head_dim + v_head_dim, kv_lora_rank])?;
-        let wk = dense
-            .index((std::ops::RangeFull, ..qk_nope_head_dim, std::ops::RangeFull))
-            .transpose_axes(&[0, 2, 1])?;
-        let wv = dense.index((std::ops::RangeFull, qk_nope_head_dim.., std::ops::RangeFull));
-        let (wk_q, wk_s, wk_b) = quantize_stacked_weights(&wk, group_size, bits)?;
-        let (wv_q, wv_s, wv_b) = quantize_stacked_weights(&wv, group_size, bits)?;
-        tensors.insert(format!("{prefix}.embed_q.weight"), wk_q);
-        tensors.insert(format!("{prefix}.embed_q.scales"), wk_s);
-        tensors.insert(format!("{prefix}.embed_q.biases"), wk_b);
-        tensors.insert(format!("{prefix}.unembed_out.weight"), wv_q);
-        tensors.insert(format!("{prefix}.unembed_out.scales"), wv_s);
-        tensors.insert(format!("{prefix}.unembed_out.biases"), wv_b);
-    }
-
-    Ok(())
-}
-
-fn slice_rows(tensor: &Array, start: i32, end: i32) -> Result<Array> {
-    Ok(tensor.index((start..end, std::ops::RangeFull)))
-}
-
-fn split_fused_qkv(
-    prefix: &str,
-    tensors: &mut HashMap<String, Array>,
-    q_rows: i32,
-    kv_rows: i32,
-) -> Result<()> {
-    if tensors.contains_key(&format!("{prefix}.q_proj.weight")) {
-        return Ok(());
-    }
-
-    let total_rows = q_rows + kv_rows + kv_rows;
-    for suffix in ["weight", "scales", "biases"] {
-        let key = format!("{prefix}.qkv_proj.{suffix}");
-        let fused = tensors
-            .get(&key)
-            .cloned()
-            .with_context(|| format!("missing {key}"))?;
-        let shape = fused.shape();
-        if shape.is_empty() || shape[0] != total_rows {
-            bail!(
-                "unexpected {key} shape {:?}; expected first dimension {}",
-                shape,
-                total_rows,
-            );
-        }
-        tensors.insert(
-            format!("{prefix}.q_proj.{suffix}"),
-            slice_rows(&fused, 0, q_rows)?,
-        );
-        tensors.insert(
-            format!("{prefix}.k_proj.{suffix}"),
-            slice_rows(&fused, q_rows, q_rows + kv_rows)?,
-        );
-        tensors.insert(
-            format!("{prefix}.v_proj.{suffix}"),
-            slice_rows(&fused, q_rows + kv_rows, total_rows)?,
-        );
-    }
-
-    Ok(())
-}
-
-fn split_fused_gate_up(
-    prefix: &str,
-    tensors: &mut HashMap<String, Array>,
-    hidden_rows: i32,
-) -> Result<()> {
-    if tensors.contains_key(&format!("{prefix}.gate_proj.weight")) {
-        return Ok(());
-    }
-
-    let total_rows = hidden_rows * 2;
-    for suffix in ["weight", "scales", "biases"] {
-        let key = format!("{prefix}.gate_up_proj.{suffix}");
-        let fused = tensors
-            .get(&key)
-            .cloned()
-            .with_context(|| format!("missing {key}"))?;
-        let shape = fused.shape();
-        if shape.is_empty() || shape[0] != total_rows {
-            bail!(
-                "unexpected {key} shape {:?}; expected first dimension {}",
-                shape,
-                total_rows,
-            );
-        }
-        tensors.insert(
-            format!("{prefix}.gate_proj.{suffix}"),
-            slice_rows(&fused, 0, hidden_rows)?,
-        );
-        tensors.insert(
-            format!("{prefix}.up_proj.{suffix}"),
-            slice_rows(&fused, hidden_rows, total_rows)?,
-        );
-    }
-
-    Ok(())
-}
-
-fn transform_phi3_tensors(
-    tensors: &mut HashMap<String, Array>,
-    prefixes: &TensorPrefixes,
-    config: &ModelConfig,
-) -> Result<()> {
-    let head_dim = config
-        .head_dim
-        .unwrap_or_else(|| config.hidden_size / config.num_attention_heads);
-    let q_rows = config.num_attention_heads * head_dim;
-    let kv_rows = config.num_key_value_heads * head_dim;
-    let mlp_rows = config.intermediate_size;
-
-    for i in 0..config.num_hidden_layers {
-        let attn_prefix = format!("{}.layers.{i}.self_attn", prefixes.model);
-        if tensors.contains_key(&format!("{attn_prefix}.qkv_proj.weight")) {
-            split_fused_qkv(&attn_prefix, tensors, q_rows, kv_rows)?;
-        }
-
-        let mlp_prefix = format!("{}.layers.{i}.mlp", prefixes.model);
-        if tensors.contains_key(&format!("{mlp_prefix}.gate_up_proj.weight")) {
-            split_fused_gate_up(&mlp_prefix, tensors, mlp_rows)?;
-        }
-    }
-
-    Ok(())
-}
-
 // ── Full model ──
 
 pub struct MlxModel {
@@ -1972,6 +1836,7 @@ pub struct MlxModel {
     final_logit_softcapping: Option<f32>,
     pub config: ModelConfig,
     pub tokenizer: tokenizers::Tokenizer,
+    pub tokenizer_spacing_patch: Option<TokenizerSpacingPatch>,
     pub prompt_template: crate::mlx::template::PromptTemplate,
     pub reasoning_family: ReasoningFamily,
     tokenwise_prefill: bool,
@@ -1993,6 +1858,7 @@ impl MlxModel {
         let config: ModelConfig =
             serde_json::from_value(effective_config_json).context("parsing config.json")?;
         let arch = model_architecture(&config_json);
+        let rope_traditional = uses_traditional_rope(&config_json);
 
         let quantized = config.quantization.as_ref();
         let default_group_size = quantized.map(|q| q.group_size).unwrap_or(0);
@@ -2030,23 +1896,15 @@ impl MlxModel {
             start.elapsed().as_secs_f64()
         );
         let prefixes = tensor_prefixes(&tensors)?;
-        if arch.is_deepseek_v3() || arch.is_kimi_linear() {
-            transform_deepseek_v3_tensors(
-                &mut tensors,
-                &prefixes,
-                &config,
-                &config_json,
-                default_group_size,
-                default_bits,
-            )?;
-        }
-        if config_json
-            .get("model_type")
-            .and_then(|value| value.as_str())
-            .is_some_and(|value| value.eq_ignore_ascii_case("phi3"))
-        {
-            transform_phi3_tensors(&mut tensors, &prefixes, &config)?;
-        }
+        apply_family_tensor_transforms(
+            arch,
+            &mut tensors,
+            &prefixes,
+            &config,
+            &config_json,
+            default_group_size,
+            default_bits,
+        )?;
 
         let load_qlinear = |prefix: &str| -> Result<QuantizedLinear> {
             let weight = tensors
@@ -2489,6 +2347,7 @@ impl MlxModel {
                         attn_logit_softcapping: None,
                         rope_dim: head_dim,
                         rope_theta: config.rope_theta,
+                        rope_traditional: false,
                         window_size: None,
                         kv_shared_source: None,
                     })
@@ -2743,6 +2602,7 @@ impl MlxModel {
                         attn_logit_softcapping: None,
                         rope_dim: head_dim,
                         rope_theta: config.rope_theta,
+                        rope_traditional: false,
                         window_size,
                         kv_shared_source: None,
                     }),
@@ -2874,6 +2734,7 @@ impl MlxModel {
                         .then_some(config.attn_logit_softcapping.unwrap_or(50.0)),
                     rope_dim,
                     rope_theta,
+                    rope_traditional,
                     window_size: None,
                     kv_shared_source,
                 }),
@@ -3003,7 +2864,7 @@ impl MlxModel {
             None
         };
 
-        let tokenizer = load_tokenizer(dir, &config_json)?;
+        let (tokenizer, tokenizer_spacing_patch) = load_tokenizer(dir, &config_json)?;
         let prompt_template = crate::mlx::template::PromptTemplate::detect(dir, &config_json);
 
         Ok(MlxModel {
@@ -3028,6 +2889,7 @@ impl MlxModel {
             final_logit_softcapping: config.final_logit_softcapping,
             config,
             tokenizer,
+            tokenizer_spacing_patch,
             prompt_template,
             reasoning_family: reasoning_family(&config_json),
             tokenwise_prefill: arch.is_gemma2() || arch.is_gemma4(),
@@ -3214,147 +3076,9 @@ impl MlxModel {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ModelArchitecture {
-    LlamaLike,
-    Olmo2,
-    DeepseekV3,
-    GptOss,
-    KimiLinear,
-    Lfm2,
-    Glm4,
-    Gemma2,
-    Gemma3,
-    Gemma4,
-}
-
-impl ModelArchitecture {
-    fn is_olmo2(self) -> bool {
-        matches!(self, Self::Olmo2)
-    }
-
-    fn is_deepseek_v3(self) -> bool {
-        matches!(self, Self::DeepseekV3)
-    }
-
-    fn is_glm4(self) -> bool {
-        matches!(self, Self::Glm4)
-    }
-
-    fn is_gpt_oss(self) -> bool {
-        matches!(self, Self::GptOss)
-    }
-
-    fn is_kimi_linear(self) -> bool {
-        matches!(self, Self::KimiLinear)
-    }
-
-    fn is_lfm2(self) -> bool {
-        matches!(self, Self::Lfm2)
-    }
-
-    fn is_gemma2(self) -> bool {
-        matches!(self, Self::Gemma2)
-    }
-
-    fn is_gemma3(self) -> bool {
-        matches!(self, Self::Gemma3)
-    }
-
-    fn is_gemma4(self) -> bool {
-        matches!(self, Self::Gemma4)
-    }
-
-    fn uses_gemma_norm_offset(self) -> bool {
-        self.is_gemma2() || self.is_gemma3()
-    }
-
-    fn uses_gemma_scaled_embeddings(self) -> bool {
-        self.is_gemma2() || self.is_gemma3() || self.is_gemma4()
-    }
-}
-
 struct TensorPrefixes {
     model: String,
     lm_head: Option<String>,
-}
-
-fn model_architecture(config: &Value) -> ModelArchitecture {
-    let model_type = config
-        .get("model_type")
-        .and_then(|value| value.as_str())
-        .or_else(|| {
-            config
-                .get("text_config")
-                .and_then(|value| value.get("model_type"))
-                .and_then(|value| value.as_str())
-        })
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-
-    if model_type.starts_with("glm4") {
-        ModelArchitecture::Glm4
-    } else if model_type.starts_with("gpt_oss") {
-        ModelArchitecture::GptOss
-    } else if model_type.starts_with("kimi_linear") {
-        ModelArchitecture::KimiLinear
-    } else if model_type.starts_with("deepseek_v3")
-        || model_type.starts_with("kimi_k2")
-        || model_type.starts_with("kimi_k25")
-    {
-        ModelArchitecture::DeepseekV3
-    } else if model_type.starts_with("olmo2") {
-        ModelArchitecture::Olmo2
-    } else if model_type.starts_with("lfm2") {
-        ModelArchitecture::Lfm2
-    } else if model_type.starts_with("gemma4") {
-        ModelArchitecture::Gemma4
-    } else if model_type.starts_with("gemma2") {
-        ModelArchitecture::Gemma2
-    } else if model_type.starts_with("gemma3") {
-        ModelArchitecture::Gemma3
-    } else {
-        ModelArchitecture::LlamaLike
-    }
-}
-
-fn reasoning_family(config: &Value) -> ReasoningFamily {
-    let model_type = config
-        .get("model_type")
-        .and_then(|value| value.as_str())
-        .or_else(|| {
-            config
-                .get("text_config")
-                .and_then(|value| value.get("model_type"))
-                .and_then(|value| value.as_str())
-        })
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let architectures = config
-        .get("architectures")
-        .and_then(|value| value.as_array())
-        .into_iter()
-        .flatten()
-        .filter_map(|value| value.as_str())
-        .map(|value| value.to_ascii_lowercase())
-        .collect::<Vec<_>>();
-
-    if model_type == "qwen3" || architectures.iter().any(|value| value.contains("qwen3")) {
-        return ReasoningFamily::Qwen3;
-    }
-    if model_type.starts_with("glm") || architectures.iter().any(|value| value.contains("glm")) {
-        return ReasoningFamily::Glm;
-    }
-    if model_type == "gpt_oss" || architectures.iter().any(|value| value.contains("gptoss")) {
-        return ReasoningFamily::GptOss;
-    }
-    if model_type.starts_with("lfm2") || architectures.iter().any(|value| value.contains("lfm2")) {
-        return ReasoningFamily::Lfm2;
-    }
-    if model_type.contains("kimi") || architectures.iter().any(|value| value.contains("kimi")) {
-        return ReasoningFamily::Kimi;
-    }
-    ReasoningFamily::None
 }
 
 fn effective_text_config_json(config: &Value) -> Value {
@@ -3530,53 +3254,6 @@ fn has_required_model_files(dir: &Path) -> bool {
     has_config && has_tokenizer && has_weights
 }
 
-fn config_supports_mlx(config: &Value) -> bool {
-    let architectures = config
-        .get("architectures")
-        .and_then(|value| value.as_array())
-        .into_iter()
-        .flatten()
-        .filter_map(|value| value.as_str());
-    let model_type = config.get("model_type").and_then(|value| value.as_str());
-
-    architectures.chain(model_type).any(|name| {
-        let name = name.to_ascii_lowercase();
-        matches!(
-            name.as_str(),
-            "llama"
-                | "glm4"
-                | "deepseek_v3"
-                | "lfm2"
-                | "phi3"
-                | "qwen2"
-                | "qwen3"
-                | "gpt_oss"
-                | "kimi_linear"
-                | "olmo2"
-                | "gemma2"
-                | "gemma3"
-                | "gemma3_text"
-                | "gemma4"
-                | "gemma4_text"
-                | "glm4forcausallm"
-                | "deepseekv3forcausallm"
-                | "lfm2forcausallm"
-                | "phi3forcausallm"
-                | "llamaforcausallm"
-                | "qwen2forcausallm"
-                | "qwen3forcausallm"
-                | "gptossforcausallm"
-                | "kimilinearforcausallm"
-                | "olmo2forcausallm"
-                | "gemma2forcausallm"
-                | "gemma3forcausallm"
-                | "gemma3forconditionalgeneration"
-                | "gemma4forcausallm"
-                | "gemma4forconditionalgeneration"
-        )
-    })
-}
-
 fn read_model_config(dir: &Path) -> Option<Value> {
     let text = std::fs::read_to_string(dir.join("config.json")).ok()?;
     serde_json::from_str(&text).ok()
@@ -3606,7 +3283,52 @@ fn patch_phi3_special_token_whitespace(tokenizer_json: &mut Value, config_json: 
     }
 }
 
-fn load_tokenizer(dir: &Path, config_json: &Value) -> Result<tokenizers::Tokenizer> {
+fn mistral_tokenizer_spacing_patch(
+    tokenizer: &tokenizers::Tokenizer,
+    tokenizer_json: &Value,
+    config_json: &Value,
+) -> Result<Option<TokenizerSpacingPatch>> {
+    let is_mistral = config_json
+        .get("model_type")
+        .and_then(|value| value.as_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("mistral"));
+    if !is_mistral {
+        return Ok(None);
+    }
+    let mut special_tokens = tokenizer_json
+        .get("added_tokens")
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .filter(|token| token.get("special").and_then(|value| value.as_bool()) == Some(true))
+        .filter_map(|token| {
+            Some((
+                token.get("content")?.as_str()?.to_string(),
+                token.get("id")?.as_u64()? as u32,
+            ))
+        })
+        .collect::<Vec<_>>();
+    if special_tokens.is_empty() {
+        return Ok(None);
+    }
+    special_tokens.sort_by(|(lhs, _), (rhs, _)| rhs.len().cmp(&lhs.len()));
+    let space_token_id = tokenizer
+        .encode(" ", false)
+        .map_err(|e| anyhow::anyhow!("loading mistral spacing patch: {e}"))?
+        .get_ids()
+        .first()
+        .copied()
+        .context("loading mistral spacing patch: tokenizer encoded space to zero tokens")?;
+    Ok(Some(TokenizerSpacingPatch {
+        special_tokens,
+        space_token_id,
+    }))
+}
+
+fn load_tokenizer(
+    dir: &Path,
+    config_json: &Value,
+) -> Result<(tokenizers::Tokenizer, Option<TokenizerSpacingPatch>)> {
     let tokenizer_path = dir.join("tokenizer.json");
     let mut tokenizer_json: Value = serde_json::from_str(
         &std::fs::read_to_string(&tokenizer_path).context("reading tokenizer.json")?,
@@ -3614,92 +3336,12 @@ fn load_tokenizer(dir: &Path, config_json: &Value) -> Result<tokenizers::Tokeniz
     .context("parsing tokenizer.json")?;
     patch_phi3_special_token_whitespace(&mut tokenizer_json, config_json);
 
-    tokenizers::Tokenizer::from_bytes(
+    let tokenizer = tokenizers::Tokenizer::from_bytes(
         serde_json::to_vec(&tokenizer_json).context("serializing patched tokenizer.json")?,
     )
-    .map_err(|e| anyhow::anyhow!("loading tokenizer: {e}"))
-}
-
-fn ensure_supported_mlx_model(dir: &Path, config: &Value) -> Result<()> {
-    if config_supports_mlx(config) {
-        return Ok(());
-    }
-    if let Some(architecture) = detect_architecture_from_safetensors_header(dir) {
-        tracing::info!(
-            "MLX loader: config.json did not identify a supported architecture, but safetensors headers matched {}",
-            architecture
-        );
-        return Ok(());
-    }
-
-    let model_type = config
-        .get("model_type")
-        .and_then(|value| value.as_str())
-        .unwrap_or("unknown");
-    let architectures = config
-        .get("architectures")
-        .and_then(|value| value.as_array())
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(|value| value.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        })
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "none".to_string());
-    bail!(
-        "unsupported MLX model architecture in {} (model_type={}, architectures={}); supported MLX models currently cover Llama/DeepSeekV3/GPT-OSS/Kimi-Linear/LFM2/GLM4/Qwen/Gemma2/Gemma3/Gemma4-style safetensors checkpoints",
-        dir.display(),
-        model_type,
-        architectures,
-    )
-}
-
-fn detect_architecture_from_safetensors_header(dir: &Path) -> Option<String> {
-    let path = if dir.join("model.safetensors").exists() {
-        dir.join("model.safetensors")
-    } else {
-        let text = std::fs::read_to_string(dir.join("model.safetensors.index.json")).ok()?;
-        let index: Value = serde_json::from_str(&text).ok()?;
-        let file = index
-            .get("weight_map")
-            .and_then(|value| value.as_object())?
-            .values()
-            .find_map(|value| value.as_str())?;
-        dir.join(file)
-    };
-
-    let mut file = File::open(path).ok()?;
-    let mut len_bytes = [0u8; 8];
-    file.read_exact(&mut len_bytes).ok()?;
-    let header_len = u64::from_le_bytes(len_bytes) as usize;
-    if header_len == 0 || header_len > 16 * 1024 * 1024 {
-        return None;
-    }
-    let mut header = vec![0u8; header_len];
-    file.read_exact(&mut header).ok()?;
-    let json: Value = serde_json::from_slice(&header).ok()?;
-    let map = json.as_object()?;
-
-    let keys: Vec<&str> = map
-        .keys()
-        .filter(|key| key.as_str() != "__metadata__")
-        .map(|key| key.as_str())
-        .collect();
-
-    if keys.iter().any(|key| key.starts_with("model.layers."))
-        && keys
-            .iter()
-            .any(|key| key.starts_with("model.embed_tokens."))
-        && keys
-            .iter()
-            .any(|key| key.contains(".self_attn.q_proj.") || key.contains(".self_attn.q_proj"))
-    {
-        return Some("llama_like".to_string());
-    }
-
-    None
+    .map_err(|e| anyhow::anyhow!("loading tokenizer: {e}"))?;
+    let spacing_patch = mistral_tokenizer_spacing_patch(&tokenizer, &tokenizer_json, config_json)?;
+    Ok((tokenizer, spacing_patch))
 }
 
 pub fn mlx_model_dir(path: &Path) -> Option<&Path> {
@@ -3795,6 +3437,10 @@ mod tests {
             "model_type": "llama",
             "architectures": ["LlamaForCausalLM"]
         });
+        let mistral: Value = serde_json::json!({
+            "model_type": "mistral",
+            "architectures": ["MistralForCausalLM"]
+        });
         let gemma2: Value = serde_json::json!({
             "model_type": "gemma2",
             "architectures": ["Gemma2ForCausalLM"]
@@ -3819,6 +3465,7 @@ mod tests {
         assert!(config_supports_mlx(&kimi_linear));
         assert!(config_supports_mlx(&olmo2));
         assert!(config_supports_mlx(&llama));
+        assert!(config_supports_mlx(&mistral));
         assert!(config_supports_mlx(&gemma2));
         assert!(config_supports_mlx(&gemma3));
         assert!(config_supports_mlx(&gemma4));
@@ -3895,9 +3542,11 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_architecture_error_mentions_model_type() {
-        let root =
-            std::env::temp_dir().join(format!("mesh-llm-mlx-unsupported-{}", std::process::id()));
+    fn mistral_is_accepted_as_llama_like_mlx_architecture() {
+        let root = std::env::temp_dir().join(format!(
+            "mesh-llm-mlx-mistral-supported-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let config = serde_json::json!({
@@ -3905,12 +3554,47 @@ mod tests {
             "architectures": ["MistralForCausalLM"]
         });
 
+        ensure_supported_mlx_model(&root, &config).unwrap();
+    }
+
+    #[test]
+    fn mistral_uses_traditional_rope() {
+        let config = serde_json::json!({
+            "model_type": "mistral",
+            "architectures": ["MistralForCausalLM"]
+        });
+        let explicit = serde_json::json!({
+            "model_type": "mistral",
+            "architectures": ["MistralForCausalLM"],
+            "rope_traditional": true
+        });
+        let llama = serde_json::json!({
+            "model_type": "llama",
+            "architectures": ["LlamaForCausalLM"]
+        });
+
+        assert!(!uses_traditional_rope(&config));
+        assert!(uses_traditional_rope(&explicit));
+        assert!(!uses_traditional_rope(&llama));
+    }
+
+    #[test]
+    fn unsupported_architecture_error_mentions_model_type() {
+        let root =
+            std::env::temp_dir().join(format!("mesh-llm-mlx-unsupported-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let config = serde_json::json!({
+            "model_type": "starcoder2",
+            "architectures": ["Starcoder2ForCausalLM"]
+        });
+
         let err = ensure_supported_mlx_model(&root, &config)
             .unwrap_err()
             .to_string();
         assert!(err.contains("unsupported MLX model architecture"));
-        assert!(err.contains("model_type=mistral"));
-        assert!(err.contains("MistralForCausalLM"));
+        assert!(err.contains("model_type=starcoder2"));
+        assert!(err.contains("Starcoder2ForCausalLM"));
     }
 
     #[test]
@@ -4548,7 +4232,16 @@ mod tests {
             Array::from_slice(&vec![0.0f32; 24 * 2], &[24, 2]),
         );
 
-        transform_phi3_tensors(&mut tensors, &prefixes, &config).unwrap();
+        families::apply_family_tensor_transforms(
+            ModelArchitecture::LlamaLike,
+            &mut tensors,
+            &prefixes,
+            &config,
+            &serde_json::json!({"model_type": "phi3"}),
+            2,
+            4,
+        )
+        .unwrap();
 
         assert_eq!(
             tensors["model.layers.0.self_attn.q_proj.weight"].shape(),
