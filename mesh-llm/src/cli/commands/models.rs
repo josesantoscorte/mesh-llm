@@ -384,7 +384,11 @@ pub async fn run_model_show(model_ref: &str, json_output: bool) -> Result<()> {
         );
     }
     if !json_output {
-        println!("🔎 {}", details.display_name);
+        if model_kind_code(details.kind) == "mlx" {
+            println!("🔎 {}", details.exact_ref);
+        } else {
+            println!("🔎 {}", details.display_name);
+        }
         if let Some(summary) = local_capacity_summary() {
             println!("{}", summary);
         }
