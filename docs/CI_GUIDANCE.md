@@ -95,9 +95,9 @@ The workflow design depends on the build scripts preserving the distinction betw
 - CI-only opt-outs should stay clearly scoped as CI-only behavior.
 - Release-oriented defaults should remain the safer defaults for shipping builds.
 
-## AMD naming
+## AMD / Nvidia / Intel naming
 
-AMD aliases are acceptable when they improve readability, but they should remain thin wrappers over the ROCm behavior rather than introducing new artifact semantics.
+Vendor aliases are acceptable when they improve readability, but they should remain thin wrappers over the ROCm / CUDA / oneAPI behavior rather than introducing new artifact semantics.
 
 ## Validation checklist
 
