@@ -1,8 +1,48 @@
 pub use mesh_client::models::capabilities::*;
 
 use super::build_hf_tokio_api;
+use super::catalog;
 use hf_hub::{Repo, RepoType};
 use serde_json::Value;
+use std::path::Path;
+
+pub fn infer_catalog_capabilities(model: &catalog::CatalogModel) -> ModelCapabilities {
+    let mut caps = ModelCapabilities::default();
+    if model.mmproj.is_some() {
+        caps.vision = CapabilityLevel::Supported;
+        caps.multimodal = true;
+    }
+    caps.moe = model.moe.is_some();
+    caps = merge_name_signals(
+        caps,
+        &[
+            model.name.as_str(),
+            model.file.as_str(),
+            model.description.as_str(),
+        ],
+    );
+    caps.normalize()
+}
+
+pub fn infer_local_model_capabilities(
+    model_name: &str,
+    path: &Path,
+    catalog_entry: Option<&catalog::CatalogModel>,
+) -> ModelCapabilities {
+    let mut caps = catalog_entry
+        .map(infer_catalog_capabilities)
+        .unwrap_or_default();
+    caps = merge_name_signals(
+        caps,
+        &[
+            model_name,
+            path.file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default(),
+        ],
+    );
+    caps.normalize()
+}
 
 pub async fn infer_remote_hf_capabilities(
     repo: &str,

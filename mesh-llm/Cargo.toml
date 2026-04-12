@@ -51,6 +51,7 @@ unicode-width = "0.2"
 axum = "0.8"
 serial_test = "3"
 mesh-client = { path = "../mesh-client" }
+tempfile = "3"
 
 [build-dependencies]
 prost-build = "0.14"
