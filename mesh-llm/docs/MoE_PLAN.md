@@ -14,7 +14,7 @@ All core phases are complete and integrated into mesh-llm.
 
 ### Ranking
 - **Published rankings**: `meshllm/moe-rankings` on Hugging Face is now the canonical shared ranking source for exact `repo + revision + distribution_id + analyzer_id`.
-- **Cached rankings**: local analysis results remain in the mesh-llm cache and are preferred only when they are stronger than or newer-equivalent to published data.
+- **Cached rankings**: local analysis results remain in the mesh-llm cache and are preferred when they are at least as strong as published data. Published rankings only replace local cache when they are stronger.
 - **Runtime resolution**: `mesh-llm moe plan` and `serve` check the local mesh-llm cache first, then the Hugging Face dataset, and prefer `full-*` over `micro-*`.
 - **HF cache behavior**: dataset artifacts stay in the Hugging Face cache when downloaded; they are not copied into `~/.cache/mesh-llm`.
 - **Dynamic analysis**: runtime can still materialize cached rankings via `micro-analyze` or full `moe-analyze`.

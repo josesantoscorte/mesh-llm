@@ -13,6 +13,7 @@ It is a planning document for the Rust CLI and runtime behavior. It builds on:
 - Reuse published rankings from `meshllm/moe-rankings` when available.
 - Prefer local cached rankings when they are strong enough.
 - Use Hugging Face when it has a stronger published artifact.
+- Keep local cache on ties; published data only wins when it is stronger.
 - Make planner and analyze output obvious, inspectable, and operationally friendly.
 - Allow users to contribute locally generated rankings back to `meshllm/moe-rankings`.
 
@@ -53,7 +54,7 @@ Final resolution rule:
 1. If `--ranking-file` is provided, use it directly.
 2. Otherwise inspect local cached rankings.
 3. Inspect `meshllm/moe-rankings`.
-4. If Hugging Face has a stronger artifact than local cache, use the Hugging Face artifact via the Hugging Face cache/download path. Do not copy it into `~/.cache/mesh-llm/...`.
+4. If Hugging Face has a stronger artifact than local cache, use the Hugging Face artifact via the Hugging Face cache/download path. Do not copy it into `~/.cache/mesh-llm/...`. If local and published artifacts have equal analyzer strength, keep the local cache.
 5. Otherwise use local cache.
 
 This means planner behavior is:
@@ -88,6 +89,7 @@ It should clearly report:
   - override
   - local cache current
   - Hugging Face stronger than local
+  - local wins on equal analyzer strength
 - source revision
 
 Planner output should also answer:

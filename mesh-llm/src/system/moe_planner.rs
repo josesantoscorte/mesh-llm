@@ -301,6 +301,27 @@ pub(crate) fn local_submit_ranking(
     })
 }
 
+pub(crate) fn validate_ranking(model: &MoeModelContext, ranking: &ResolvedRanking) -> Result<()> {
+    let loaded = moe::load_cached_ranking(&ranking.path)
+        .ok_or_else(|| anyhow::anyhow!("Could not parse ranking {}", ranking.path.display()))?;
+    let artifact = moe::SharedRankingArtifact {
+        kind: ranking_kind_for_analyzer(&ranking.analyzer_id),
+        origin: moe::SharedRankingOrigin::LegacyCache,
+        ranking: loaded,
+        micro_prompt_count: None,
+        micro_tokens: None,
+        micro_layer_scope: None,
+    };
+    moe::validate_shared_ranking_artifact(&model.path, &artifact)?;
+    load_analyze_mass_profile(&ranking.path).with_context(|| {
+        format!(
+            "Ranking {} must include gate-mass columns",
+            ranking.path.display()
+        )
+    })?;
+    Ok(())
+}
+
 fn infer_analyzer_from_ranking_path(path: &Path) -> Option<&'static str> {
     let text = path.to_string_lossy().to_ascii_lowercase();
     if text.contains("/full-v1/") || text.contains("\\full-v1\\") {
@@ -330,6 +351,14 @@ fn infer_analyzer_from_ranking_path(path: &Path) -> Option<&'static str> {
     None
 }
 
+fn ranking_kind_for_analyzer(analyzer_id: &str) -> moe::SharedRankingKind {
+    if analyzer_id.starts_with("micro") {
+        moe::SharedRankingKind::MicroAnalyze
+    } else {
+        moe::SharedRankingKind::Analyze
+    }
+}
+
 fn sibling_metadata_path(path: &Path) -> Option<PathBuf> {
     let parent = path.parent()?;
     let metadata = parent.join("metadata.json");
@@ -350,6 +379,8 @@ pub(crate) fn resolve_runtime_ranking(
         .as_ref()
         .is_some_and(|ranking| ranking_method_priority(ranking) >= 2)
     {
+        // A local full-v1 ranking is treated as the current best tie-break because
+        // we do not have a comparable freshness signal for local cache entries.
         return Ok(local_legacy);
     }
 
@@ -433,6 +464,7 @@ async fn resolve_best_ranking(
         .as_ref()
         .is_some_and(|ranking| ranking_method_priority(ranking) >= 2)
     {
+        // Prefer local full-v1 on tie: remote is only selected when it is stronger.
         return Ok(local_legacy.expect("checked is_some above"));
     }
 
