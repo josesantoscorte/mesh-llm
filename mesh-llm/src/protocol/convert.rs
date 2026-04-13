@@ -21,16 +21,24 @@ fn split_optional_csv(values: Option<&str>) -> Vec<Option<String>> {
 
 fn join_optional_csv(values: &[Option<String>]) -> Option<String> {
     if values.is_empty() {
-        None
-    } else {
-        Some(
-            values
-                .iter()
-                .map(|value| value.clone().unwrap_or_default())
-                .collect::<Vec<_>>()
-                .join(","),
-        )
+        return None;
     }
+
+    let has_present_value = values
+        .iter()
+        .any(|value| value.as_deref().is_some_and(|value| !value.trim().is_empty()));
+
+    if !has_present_value {
+        return None;
+    }
+
+    Some(
+        values
+            .iter()
+            .map(|value| value.clone().unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join(","),
+    )
 }
 
 fn local_owner_attestation_to_proto(
