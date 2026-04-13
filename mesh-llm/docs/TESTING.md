@@ -120,9 +120,12 @@ runs.
 
 ```bash
 mesh-llm gpus
+mesh-llm gpus --json | jq .
+mesh-llm gpu benchmark --json | jq .
 ```
 
 - Prints local GPU entries with stable IDs, backend devices, VRAM, unified-memory status, and cached bandwidth when a fingerprint is available
+- `--json` emits machine-readable inventory and benchmark payloads suitable for automation
 
 ### 0a. Startup config smoke
 
@@ -153,6 +156,39 @@ mesh-llm serve
 - If `[[models]]` is empty, `mesh-llm serve` should print a `⚠️` warning, show help, and exit cleanly
 - Explicit `--model` or `--gguf` should ignore configured `[[models]]`
 - Explicit `--ctx-size` should override configured `ctx_size`
+
+### 0b. Pinned startup smoke
+
+First inspect the valid local IDs:
+
+```bash
+mesh-llm gpus
+mesh-llm gpus --json | jq .
+```
+
+Then create `~/.mesh-llm/config.toml` with a real pinnable stable ID from that output (for example `pci:*`, `uuid:*`, or `metal:*`, not fallback IDs like `index:*` or backend-device names):
+
+```toml
+version = 1
+
+[gpu]
+assignment = "pinned"
+
+[[models]]
+model = "Qwen2.5-3B"
+gpu_id = "pci:0000:65:00.0"
+```
+
+Start the node:
+
+```bash
+mesh-llm serve
+```
+
+- Startup should succeed only when `gpu_id` matches a valid local pinnable stable ID from `mesh-llm gpus`
+- If the pinned ID is missing, ambiguous, unsupported, or stale, startup should fail closed before local launch
+- Explicit `mesh-llm serve --model ...` should still bypass configured `[[models]]` and therefore bypass config-owned pinned IDs
+- Do not use GPU indexes, `index:*`, or backend-device names like `CUDA0` / `HIP0` / `MTL0` as `gpu_id`
 
 ## Single-model permutations
 

@@ -24,7 +24,7 @@ If a model fits on one machine, it runs there. If it does not, Mesh LLM automati
 Install the latest release:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/michaelneale/mesh-llm/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Mesh-LLM/mesh-llm/main/install.sh | bash
 ```
 
 Then start a node:
@@ -82,7 +82,7 @@ This starts serving a model, opens the local API and console, and prints an invi
 ### 3. Build from source
 
 ```bash
-git clone https://github.com/michaelneale/mesh-llm
+git clone https://github.com/Mesh-LLM/mesh-llm
 cd mesh-llm
 just build
 ```
@@ -190,9 +190,13 @@ Different nodes serve different models. The API proxy routes by the `model` fiel
 ### Inspect local GPUs
 ```bash
 mesh-llm gpus
+mesh-llm gpus --json
+mesh-llm gpu benchmark --json
 ```
 
-Prints local GPU entries, backend device names, stable IDs, VRAM, and cached bandwidth if a benchmark fingerprint is already available.
+`mesh-llm gpus` prints local GPU entries, backend device names, stable IDs, VRAM, unified-memory state, and cached bandwidth when a benchmark fingerprint is already available. Add `--json` for machine-readable inventory output, or run `mesh-llm gpu benchmark --json` to refresh the local fingerprint and print the benchmark result as JSON.
+
+Use only pinnable `Stable ID` / `stable_id` values from `mesh-llm gpus` or `mesh-llm gpus --json` for pinned startup config. Stable-ID fallback values such as `index:*` or backend-device names like `CUDA0` / `HIP0` / `MTL0` can still be printed for inventory purposes, but they are not valid pin targets.
 
 ### Startup config
 
@@ -202,15 +206,17 @@ Prints local GPU entries, backend device names, stable IDs, VRAM, and cached ban
 version = 1
 
 [gpu]
-assignment = "auto"
+assignment = "pinned"
 
 [[models]]
 model = "Qwen3-8B-Q4_K_M"
+gpu_id = "pci:0000:65:00.0"
 
 [[models]]
 model = "bartowski/Qwen2.5-VL-7B-Instruct-GGUF/qwen2.5-vl-7b-instruct-q4_k_m.gguf"
 mmproj = "bartowski/Qwen2.5-VL-7B-Instruct-GGUF/mmproj-f16.gguf"
 ctx_size = 8192
+gpu_id = "uuid:GPU-12345678"
 
 [[plugin]]
 name = "blackboard"
@@ -237,6 +243,13 @@ Precedence rules:
 - Explicit `--ctx-size` overrides configured `ctx_size` for the selected startup models.
 - Plugin entries still live in the same file.
 
+Pinned startup notes:
+
+- `assignment = "pinned"` requires every configured `[[models]]` entry to include a `gpu_id`.
+- Valid `gpu_id` values come from the pinnable stable IDs reported by `mesh-llm gpus` / `mesh-llm gpus --json`, not fallback inventory IDs.
+- Pinned configs fail closed when a configured ID is missing, ambiguous, unsupported on the local backend, or no longer resolves on the current machine.
+- Explicit `--model` / `--gguf` still bypass configured `[[models]]`, so they also bypass config-owned pinned `gpu_id` values.
+
 ### No-arg behavior
 ```bash
 mesh-llm                                   # no args — prints --help and exits
@@ -248,7 +261,7 @@ Does not start the console or bind any ports. Use the CLI flags shown in `--help
 To install it as a per-user background service:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/michaelneale/mesh-llm/main/install.sh | bash -s -- --service
+curl -fsSL https://raw.githubusercontent.com/Mesh-LLM/mesh-llm/main/install.sh | bash -s -- --service
 ```
 
 Service installs are user-scoped:
@@ -290,7 +303,7 @@ sudo loginctl enable-linger "$USER"
 mesh-llm serve --model Qwen2.5-32B    # dashboard at http://localhost:3131
 ```
 
-Live topology, VRAM bars per node, model picker, built-in chat. Everything comes from `/api/status` (JSON) and `/api/events` (SSE).
+Live topology, per-node GPU capacity, model picker, and built-in chat. Everything comes from `/api/status` (JSON) and `/api/events` (SSE).
 
 ## Multimodal Support
 
@@ -544,7 +557,7 @@ The installer currently targets macOS and Linux release bundles. Windows coming 
 To force a specific bundled flavor during install:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/michaelneale/mesh-llm/main/install.sh | MESH_LLM_INSTALL_FLAVOR=vulkan bash
+curl -fsSL https://raw.githubusercontent.com/Mesh-LLM/mesh-llm/main/install.sh | MESH_LLM_INSTALL_FLAVOR=vulkan bash
 ```
 
 Installed release bundles use flavor-specific llama.cpp binaries:
@@ -558,10 +571,16 @@ To update a bundle install to the latest release:
 mesh-llm update
 ```
 
+To install a specific bundled release tag:
+
+```bash
+mesh-llm update --version v0.X.Y
+```
+
 If you build from source, always use `just`:
 
 ```bash
-git clone https://github.com/michaelneale/mesh-llm
+git clone https://github.com/Mesh-LLM/mesh-llm
 cd mesh-llm
 just build
 ```

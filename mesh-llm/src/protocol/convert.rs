@@ -304,6 +304,10 @@ pub(crate) fn local_ann_to_proto_ann(
         hostname: ann.hostname.clone(),
         is_soc: ann.is_soc,
         gpu_vram: ann.gpu_vram.clone(),
+        gpu_reserved_bytes: ann.gpu_reserved_bytes.clone(),
+        gpu_mem_bandwidth_gbps: ann.gpu_mem_bandwidth_gbps.clone(),
+        gpu_compute_tflops_fp32: ann.gpu_compute_tflops_fp32.clone(),
+        gpu_compute_tflops_fp16: ann.gpu_compute_tflops_fp16.clone(),
         available_models: ann.available_models.clone(),
         serving_models: ann.serving_models.clone(),
         requested_models: ann.requested_models.clone(),
@@ -335,7 +339,7 @@ pub(crate) fn build_gossip_frame(
     sender_id: EndpointId,
 ) -> crate::proto::node::GossipFrame {
     let peers: Vec<crate::proto::node::PeerAnnouncement> =
-        anns.iter().map(|ann| local_ann_to_proto_ann(ann)).collect();
+        anns.iter().map(local_ann_to_proto_ann).collect();
     crate::proto::node::GossipFrame {
         gen: NODE_PROTOCOL_GENERATION,
         sender_id: sender_id.as_bytes().to_vec(),
@@ -395,7 +399,10 @@ pub(crate) fn proto_ann_to_local(
         hostname: pa.hostname.clone(),
         is_soc: pa.is_soc,
         gpu_vram: pa.gpu_vram.clone(),
-        gpu_bandwidth_gbps: None,
+        gpu_reserved_bytes: pa.gpu_reserved_bytes.clone(),
+        gpu_mem_bandwidth_gbps: pa.gpu_mem_bandwidth_gbps.clone(),
+        gpu_compute_tflops_fp32: pa.gpu_compute_tflops_fp32.clone(),
+        gpu_compute_tflops_fp16: pa.gpu_compute_tflops_fp16.clone(),
         available_model_metadata: Vec::new(),
         experts_summary: pa.experts_summary.clone(),
         available_model_sizes: HashMap::new(),
@@ -492,6 +499,14 @@ pub(crate) fn mesh_config_to_proto(
     config: &crate::plugin::MeshConfig,
 ) -> crate::proto::node::NodeConfigSnapshot {
     use crate::plugin::GpuAssignment;
+    fn configured_model_ref(declared_ref: &str) -> crate::proto::node::ConfiguredModelRef {
+        crate::proto::node::ConfiguredModelRef {
+            declared_ref: declared_ref.to_string(),
+            source_kind: None,
+            revision: None,
+        }
+    }
+
     let assignment = match config.gpu.assignment {
         GpuAssignment::Auto => crate::proto::node::GpuAssignment::Auto as i32,
         GpuAssignment::Pinned => crate::proto::node::GpuAssignment::Pinned as i32,
@@ -503,6 +518,9 @@ pub(crate) fn mesh_config_to_proto(
             model: m.model.clone(),
             mmproj: m.mmproj.clone(),
             ctx_size: m.ctx_size,
+            gpu_id: m.gpu_id.clone(),
+            model_ref: Some(configured_model_ref(&m.model)),
+            mmproj_ref: m.mmproj.as_deref().map(configured_model_ref),
         })
         .collect();
     let plugins = config
@@ -529,6 +547,19 @@ pub(crate) fn proto_config_to_mesh(
     use crate::plugin::{
         GpuAssignment, GpuConfig, MeshConfig, ModelConfigEntry, PluginConfigEntry,
     };
+    fn declared_ref_or_none(
+        configured: Option<&crate::proto::node::ConfiguredModelRef>,
+    ) -> Option<String> {
+        configured.and_then(|configured| {
+            let declared_ref = configured.declared_ref.trim();
+            if declared_ref.is_empty() {
+                None
+            } else {
+                Some(declared_ref.to_string())
+            }
+        })
+    }
+
     let assignment = match snapshot.gpu.as_ref().map(|g| g.assignment) {
         Some(v) if v == crate::proto::node::GpuAssignment::Pinned as i32 => GpuAssignment::Pinned,
         _ => GpuAssignment::Auto,
@@ -537,9 +568,10 @@ pub(crate) fn proto_config_to_mesh(
         .models
         .iter()
         .map(|m| ModelConfigEntry {
-            model: m.model.clone(),
-            mmproj: m.mmproj.clone(),
+            model: declared_ref_or_none(m.model_ref.as_ref()).unwrap_or_else(|| m.model.clone()),
+            mmproj: declared_ref_or_none(m.mmproj_ref.as_ref()).or_else(|| m.mmproj.clone()),
             ctx_size: m.ctx_size,
+            gpu_id: m.gpu_id.clone(),
         })
         .collect();
     let plugins = snapshot

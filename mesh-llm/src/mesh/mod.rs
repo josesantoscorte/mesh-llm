@@ -4,7 +4,7 @@
 //! one QUIC connection per peer. Bi-streams are multiplexed by first byte:
 //! 0x01 = gossip, 0x02 = tunnel (RPC), 0x03 = tunnel map, 0x04 = tunnel (HTTP).
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use base64::Engine;
 use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
@@ -53,6 +53,98 @@ fn current_time_unix_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn preflight_pushed_config_for_current_node(config: &crate::plugin::MeshConfig) -> Result<()> {
+    let survey = crate::system::hardware::query(&[
+        crate::system::hardware::Metric::GpuName,
+        crate::system::hardware::Metric::GpuFacts,
+    ]);
+    preflight_pushed_config_for_current_node_with_gpus(config, &survey.gpus)
+}
+
+fn preflight_pushed_config_for_current_node_with_gpus(
+    config: &crate::plugin::MeshConfig,
+    gpus: &[crate::system::hardware::GpuFacts],
+) -> Result<()> {
+    if config.gpu.assignment != crate::plugin::GpuAssignment::Pinned {
+        return Ok(());
+    }
+
+    for model in &config.models {
+        let gpu = crate::system::hardware::resolve_pinned_gpu(model.gpu_id.as_deref(), gpus)
+            .map_err(anyhow::Error::new)
+            .with_context(|| {
+                format!(
+                    "pushed config model '{}' failed pinned GPU preflight",
+                    model.model
+                )
+            })?;
+
+        let stable_id = gpu
+            .stable_id
+            .as_deref()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "pushed config model '{}' resolved pinned GPU at index {} without a stable_id",
+                    model.model,
+                    gpu.index
+                )
+            })
+            .with_context(|| {
+                format!(
+                    "pushed config model '{}' failed pinned GPU preflight",
+                    model.model
+                )
+            })?;
+
+        if gpu.backend_device.is_none() {
+            return Err(anyhow::anyhow!(
+                "pushed config model '{}' resolved pinned GPU '{}' at index {} without a backend_device",
+                model.model,
+                stable_id,
+                gpu.index
+            ))
+            .with_context(|| {
+                format!(
+                    "pushed config model '{}' failed pinned GPU preflight",
+                    model.model
+                )
+            });
+        }
+    }
+
+    Ok(())
+}
+
+const MIN_PINNED_GPU_CONFIG_PEER_VERSION: &str = "0.59.0";
+
+fn config_uses_pinned_gpu(config: &crate::plugin::MeshConfig) -> bool {
+    config.gpu.assignment == crate::plugin::GpuAssignment::Pinned
+}
+
+fn peer_supports_pinned_gpu_config(peer_version: Option<&str>) -> bool {
+    let Ok(min_version) = semver::Version::parse(MIN_PINNED_GPU_CONFIG_PEER_VERSION) else {
+        return false;
+    };
+    let Some(peer_version) = peer_version else {
+        return false;
+    };
+    let Ok(peer_version) = semver::Version::parse(peer_version) else {
+        return false;
+    };
+
+    peer_version >= min_version
+        || (peer_version.major == min_version.major
+            && peer_version.minor == min_version.minor
+            && peer_version.patch == min_version.patch)
+}
+
+fn pinned_gpu_config_peer_error(peer_version: Option<&str>) -> String {
+    let advertised = peer_version.unwrap_or("unknown");
+    format!(
+        "pinned gpu config sync requires mesh-llm >= {MIN_PINNED_GPU_CONFIG_PEER_VERSION}; subscriber advertised {advertised}"
+    )
 }
 
 fn endpoint_id_hex(id: EndpointId) -> String {
@@ -198,22 +290,6 @@ pub fn infer_local_served_model_descriptor(
         &crate::models::find_model_path(model_name),
         is_primary,
     )
-}
-
-pub fn backfill_legacy_descriptors(ann: &mut PeerAnnouncement) {
-    if ann.served_model_descriptors.is_empty() {
-        let primary_model_name = ann
-            .serving_models
-            .first()
-            .map(String::as_str)
-            .unwrap_or_default()
-            .to_string();
-        ann.served_model_descriptors = infer_remote_served_descriptors(
-            &primary_model_name,
-            &ann.serving_models,
-            ann.model_source.as_deref(),
-        );
-    }
 }
 
 fn infer_remote_served_descriptors(
@@ -566,191 +642,6 @@ fn import_remote_moe_rankings(descriptors: &[ServedModelDescriptor]) -> bool {
     imported
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct HeartbeatFailurePolicy {
-    allow_recent_inbound_grace: bool,
-    failure_threshold: u32,
-}
-
-fn descriptors_share_exact_moe_identity(
-    local: &[ServedModelDescriptor],
-    remote: &[ServedModelDescriptor],
-) -> bool {
-    local.iter().any(|local_descriptor| {
-        local_descriptor
-            .topology
-            .as_ref()
-            .and_then(|topology| topology.moe.as_ref())
-            .is_some()
-            && remote.iter().any(|remote_descriptor| {
-                remote_descriptor
-                    .topology
-                    .as_ref()
-                    .and_then(|topology| topology.moe.as_ref())
-                    .is_some()
-                    && identities_match_exact(
-                        &local_descriptor.identity,
-                        &remote_descriptor.identity,
-                    )
-            })
-    })
-}
-
-fn heartbeat_failure_policy_for_peer(
-    local_descriptors: &[ServedModelDescriptor],
-    local_runtime: &[ModelRuntimeDescriptor],
-    peer: &PeerInfo,
-) -> HeartbeatFailurePolicy {
-    if descriptors_share_exact_moe_identity(local_descriptors, &peer.served_model_descriptors) {
-        if exact_moe_starting_during_convergence(local_descriptors, local_runtime, peer) {
-            return HeartbeatFailurePolicy {
-                allow_recent_inbound_grace: true,
-                // Split convergence can spend minutes in split generation + shard
-                // load. During that window, prefer serving continuity over fast
-                // heartbeat-only fail-down; request-path failures still remove
-                // dead shard peers immediately.
-                failure_threshold: 4,
-            };
-        }
-        HeartbeatFailurePolicy {
-            allow_recent_inbound_grace: false,
-            // Shared MoE peers should fail down faster than generic peers, but a
-            // single heartbeat miss is too aggressive on relay-heavy or flaky
-            // links. Request-path shard failures still trigger immediate
-            // fail-down; heartbeat-only loss needs a second miss to avoid
-            // tearing down a healthy split on one transient blip.
-            failure_threshold: 2,
-        }
-    } else {
-        HeartbeatFailurePolicy {
-            allow_recent_inbound_grace: true,
-            failure_threshold: 2,
-        }
-    }
-}
-
-const MOE_RECOVERY_PROBATION_SECS: u64 = 30;
-
-fn runtime_model_is_starting(runtimes: &[ModelRuntimeDescriptor], model_name: &str) -> bool {
-    runtimes
-        .iter()
-        .any(|runtime| runtime.model_name == model_name && !runtime.ready)
-}
-
-fn exact_moe_starting_during_convergence(
-    local_descriptors: &[ServedModelDescriptor],
-    local_runtime: &[ModelRuntimeDescriptor],
-    peer: &PeerInfo,
-) -> bool {
-    local_descriptors.iter().any(|local_descriptor| {
-        let local_moe = local_descriptor
-            .topology
-            .as_ref()
-            .and_then(|topology| topology.moe.as_ref())
-            .is_some();
-        if !local_moe {
-            return false;
-        }
-
-        peer.served_model_descriptors
-            .iter()
-            .any(|remote_descriptor| {
-                let remote_moe = remote_descriptor
-                    .topology
-                    .as_ref()
-                    .and_then(|topology| topology.moe.as_ref())
-                    .is_some();
-                if !remote_moe
-                    || !identities_match_exact(
-                        &local_descriptor.identity,
-                        &remote_descriptor.identity,
-                    )
-                {
-                    return false;
-                }
-
-                let model_name = &local_descriptor.identity.model_name;
-                runtime_model_is_starting(local_runtime, model_name)
-                    || runtime_model_is_starting(&peer.served_model_runtime, model_name)
-            })
-    })
-}
-
-fn moe_recovery_ready_at(
-    recovered_at: Option<std::time::Instant>,
-    now: std::time::Instant,
-) -> bool {
-    recovered_at
-        .map(|recovered_at| {
-            now.duration_since(recovered_at).as_secs() >= MOE_RECOVERY_PROBATION_SECS
-        })
-        .unwrap_or(true)
-}
-
-pub(crate) fn descriptors_share_exact_moe_identity_for_model(
-    local: &[ServedModelDescriptor],
-    remote: &[ServedModelDescriptor],
-    model_name: &str,
-) -> Option<bool> {
-    let local_moe: Vec<&ServedModelDescriptor> = local
-        .iter()
-        .filter(|descriptor| {
-            descriptor.identity.model_name == model_name
-                && descriptor
-                    .topology
-                    .as_ref()
-                    .and_then(|topology| topology.moe.as_ref())
-                    .is_some()
-        })
-        .collect();
-    let remote_moe: Vec<&ServedModelDescriptor> = remote
-        .iter()
-        .filter(|descriptor| {
-            descriptor.identity.model_name == model_name
-                && descriptor
-                    .topology
-                    .as_ref()
-                    .and_then(|topology| topology.moe.as_ref())
-                    .is_some()
-        })
-        .collect();
-    if local_moe.is_empty() || remote_moe.is_empty() {
-        return None;
-    }
-    Some(local_moe.iter().any(|local_descriptor| {
-        remote_moe.iter().any(|remote_descriptor| {
-            identities_match_exact(&local_descriptor.identity, &remote_descriptor.identity)
-        })
-    }))
-}
-
-pub(crate) fn peer_is_eligible_for_active_moe(
-    local_descriptors: &[ServedModelDescriptor],
-    peer: &PeerInfo,
-    model_name: &str,
-) -> bool {
-    let declares_model = peer.is_assigned_model(model_name)
-        || peer
-            .requested_models
-            .iter()
-            .any(|requested| requested == model_name);
-    if !declares_model || matches!(peer.role, NodeRole::Client) {
-        return false;
-    }
-
-    let identity_matches = descriptors_share_exact_moe_identity_for_model(
-        local_descriptors,
-        &peer.served_model_descriptors,
-        model_name,
-    )
-    .unwrap_or(true);
-    if !identity_matches {
-        return false;
-    }
-
-    moe_recovery_ready_at(peer.moe_recovered_at, std::time::Instant::now())
-}
-
 fn parse_hf_ref_parts(input: &str) -> Option<(String, Option<String>, String)> {
     let parts: Vec<&str> = input.splitn(3, '/').collect();
     if parts.len() != 3 {
@@ -807,24 +698,6 @@ fn peer_info_to_mesh_peer(peer: &PeerInfo) -> crate::plugin::proto::MeshPeer {
         hosted_models: peer.hosted_models.clone(),
         hosted_models_known: Some(peer.hosted_models_known),
     }
-}
-
-fn peer_meaningfully_changed(old: &PeerInfo, new: &PeerInfo) -> bool {
-    old.addr != new.addr
-        || old.role != new.role
-        || old.models != new.models
-        || old.vram_bytes != new.vram_bytes
-        || old.rtt_ms != new.rtt_ms
-        || old.model_source != new.model_source
-        || old.serving_models != new.serving_models
-        || old.hosted_models_known != new.hosted_models_known
-        || old.hosted_models != new.hosted_models
-        || old.available_models != new.available_models
-        || old.requested_models != new.requested_models
-        || old.served_model_descriptors != new.served_model_descriptors
-        || old.served_model_runtime != new.served_model_runtime
-        || old.version != new.version
-        || old.owner_summary != new.owner_summary
 }
 
 fn policy_accepts_peer(policy: TrustPolicy, owner_summary: &OwnershipSummary) -> bool {
@@ -942,7 +815,17 @@ pub(crate) struct PeerAnnouncementV0 {
     #[serde(default)]
     gpu_vram: Option<String>,
     #[serde(default)]
-    gpu_bandwidth_gbps: Option<String>,
+    gpu_reserved_bytes: Option<String>,
+    #[serde(
+        default,
+        rename = "gpu_bandwidth_gbps",
+        alias = "gpu_mem_bandwidth_gbps"
+    )]
+    gpu_mem_bandwidth_gbps: Option<String>,
+    #[serde(default)]
+    gpu_compute_tflops_fp32: Option<String>,
+    #[serde(default)]
+    gpu_compute_tflops_fp16: Option<String>,
     #[serde(default)]
     available_model_sizes: HashMap<String, u64>,
     #[serde(skip_serializing, skip_deserializing, default)]
@@ -951,147 +834,17 @@ pub(crate) struct PeerAnnouncementV0 {
     served_model_runtime: Vec<ModelRuntimeDescriptor>,
 }
 
-impl PeerAnnouncementV0 {
-    pub(crate) fn into_internal(self) -> PeerAnnouncement {
-        let serving_models = if !self.serving_models.is_empty() {
-            self.serving_models.clone()
-        } else {
-            self.serving.clone().into_iter().collect()
-        };
-        PeerAnnouncement {
-            addr: self.addr,
-            role: self.role,
-            models: self.models,
-            vram_bytes: self.vram_bytes,
-            model_source: self.model_source,
-            serving_models,
-            hosted_models: None,
-            available_models: self.available_models,
-            requested_models: self.requested_models,
-            version: self.version,
-            model_demand: self.model_demand,
-            mesh_id: self.mesh_id,
-            gpu_name: self.gpu_name,
-            hostname: self.hostname,
-            is_soc: self.is_soc,
-            gpu_vram: self.gpu_vram,
-            gpu_bandwidth_gbps: self.gpu_bandwidth_gbps,
-            available_model_metadata: vec![],
-            experts_summary: None,
-            available_model_sizes: self.available_model_sizes,
-            served_model_descriptors: self.served_model_descriptors,
-            served_model_runtime: self.served_model_runtime,
-            owner_attestation: None,
-        }
-    }
-}
-
-impl From<&PeerAnnouncement> for PeerAnnouncementV0 {
-    fn from(ann: &PeerAnnouncement) -> Self {
-        Self {
-            addr: ann.addr.clone(),
-            role: ann.role.clone(),
-            models: ann.models.clone(),
-            vram_bytes: ann.vram_bytes,
-            model_source: ann.model_source.clone(),
-            serving: ann.serving_models.first().cloned(),
-            serving_models: ann.serving_models.clone(),
-            available_models: ann.available_models.clone(),
-            requested_models: ann.requested_models.clone(),
-            version: ann.version.clone(),
-            model_demand: ann.model_demand.clone(),
-            mesh_id: ann.mesh_id.clone(),
-            gpu_name: ann.gpu_name.clone(),
-            hostname: ann.hostname.clone(),
-            is_soc: ann.is_soc,
-            gpu_vram: ann.gpu_vram.clone(),
-            gpu_bandwidth_gbps: ann.gpu_bandwidth_gbps.clone(),
-            available_model_sizes: ann.available_model_sizes.clone(),
-            served_model_descriptors: ann.served_model_descriptors.clone(),
-            served_model_runtime: ann.served_model_runtime.clone(),
-        }
-    }
-}
-
-fn apply_transitive_ann(
-    existing: &mut PeerInfo,
-    addr: &EndpointAddr,
-    ann: &PeerAnnouncement,
-) -> bool {
-    let ann_hosted_models = ann.hosted_models.clone().unwrap_or_default();
-    let serving_changed = existing.serving_models != ann.serving_models
-        || existing.hosted_models != ann_hosted_models
-        || existing.hosted_models_known != ann.hosted_models.is_some();
-    existing.serving_models = ann.serving_models.clone();
-    existing.hosted_models = ann_hosted_models;
-    existing.hosted_models_known = ann.hosted_models.is_some();
-    existing.role = ann.role.clone();
-    existing.vram_bytes = ann.vram_bytes;
-    // Only advance addr if the transitive announcement is at least as path-rich,
-    // so a direct peer's richer address is not overwritten by a weaker transitive one.
-    if !addr.addrs.is_empty() && addr.addrs.len() >= existing.addr.addrs.len() {
-        existing.addr = addr.clone();
-    }
-    if ann.version.is_some() {
-        existing.version = ann.version.clone();
-    }
-    if ann.gpu_name.is_some() {
-        existing.gpu_name = ann.gpu_name.clone();
-    }
-    if ann.hostname.is_some() {
-        existing.hostname = ann.hostname.clone();
-    }
-    if ann.is_soc.is_some() {
-        existing.is_soc = ann.is_soc;
-    }
-    if ann.gpu_vram.is_some() {
-        existing.gpu_vram = ann.gpu_vram.clone();
-    }
-    if ann.gpu_bandwidth_gbps.is_some() {
-        existing.gpu_bandwidth_gbps = ann.gpu_bandwidth_gbps.clone();
-    }
-    existing.models = ann.models.clone();
-    existing.available_models.clear();
-    existing.requested_models = ann.requested_models.clone();
-    existing.owner_attestation = ann.owner_attestation.clone();
-    if ann.model_source.is_some() {
-        existing.model_source = ann.model_source.clone();
-    }
-    existing.served_model_descriptors = ann.served_model_descriptors.clone();
-    existing.served_model_runtime = ann.served_model_runtime.clone();
-    if ann.experts_summary.is_some() {
-        existing.experts_summary = ann.experts_summary.clone();
-    }
-    serving_changed
-}
-
 /// Merge two demand maps. For each model, take max of last_active and request_count.
-pub fn merge_demand(
-    ours: &mut HashMap<String, ModelDemand>,
-    theirs: &HashMap<String, ModelDemand>,
-) {
-    for (model, their_demand) in theirs {
-        let entry = ours.entry(model.clone()).or_default();
-        entry.last_active = entry.last_active.max(their_demand.last_active);
-        entry.request_count = entry.request_count.max(their_demand.request_count);
-    }
-}
-
 /// Role a node plays in the mesh.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub enum NodeRole {
     /// Provides GPU compute via rpc-server for a specific model.
+    #[default]
     Worker,
     /// Runs llama-server for a specific model, orchestrates inference, provides HTTP API.
     Host { http_port: u16 },
     /// Lite client — no compute, accesses the API via tunnel.
     Client,
-}
-
-impl Default for NodeRole {
-    fn default() -> Self {
-        NodeRole::Worker
-    }
 }
 
 /// Gossip payload — extends EndpointAddr with role metadata.
@@ -1115,7 +868,10 @@ pub(crate) struct PeerAnnouncement {
     pub(crate) hostname: Option<String>,
     pub(crate) is_soc: Option<bool>,
     pub(crate) gpu_vram: Option<String>,
-    pub(crate) gpu_bandwidth_gbps: Option<String>,
+    pub(crate) gpu_reserved_bytes: Option<String>,
+    pub(crate) gpu_mem_bandwidth_gbps: Option<String>,
+    pub(crate) gpu_compute_tflops_fp32: Option<String>,
+    pub(crate) gpu_compute_tflops_fp16: Option<String>,
     pub(crate) available_model_metadata: Vec<crate::proto::node::CompactModelMetadata>,
     pub(crate) experts_summary: Option<crate::proto::node::ExpertsSummary>,
     pub(crate) available_model_sizes: HashMap<String, u64>,
@@ -1145,8 +901,15 @@ pub struct PeerInfo {
     /// Models this node has requested the mesh to serve
     pub requested_models: Vec<String>,
     /// Last time we directly communicated with this peer (gossip, heartbeat, tunnel).
-    /// Peers not seen in PEER_STALE_SECS are pruned from gossip and eventually removed.
+    /// Only updated by direct bi-directional gossip exchanges, heartbeat probes,
+    /// and inbound connections — never by transitive mentions.
+    /// Used by PeerDown silencing to require independent proof-of-life.
     pub last_seen: std::time::Instant,
+    /// Last time a bridge peer mentioned this peer in gossip.
+    /// Updated on every transitive gossip update. Used together with `last_seen`
+    /// for pruning and `collect_announcements`: a peer is included/kept as long
+    /// as either timestamp is fresh.
+    pub last_mentioned: std::time::Instant,
     /// When this peer returned after being considered dead. MoE scale-up should
     /// wait briefly before treating the peer as eligible again.
     pub moe_recovered_at: Option<std::time::Instant>,
@@ -1158,7 +921,10 @@ pub struct PeerInfo {
     pub hostname: Option<String>,
     pub is_soc: Option<bool>,
     pub gpu_vram: Option<String>,
-    pub gpu_bandwidth_gbps: Option<String>,
+    pub gpu_reserved_bytes: Option<String>,
+    pub gpu_mem_bandwidth_gbps: Option<String>,
+    pub gpu_compute_tflops_fp32: Option<String>,
+    pub gpu_compute_tflops_fp16: Option<String>,
     pub available_model_metadata: Vec<crate::proto::node::CompactModelMetadata>,
     pub experts_summary: Option<crate::proto::node::ExpertsSummary>,
     pub available_model_sizes: HashMap<String, u64>,
@@ -1204,13 +970,17 @@ impl PeerInfo {
             available_models: ann.available_models.clone(),
             requested_models: ann.requested_models.clone(),
             last_seen: std::time::Instant::now(),
+            last_mentioned: std::time::Instant::now(),
             moe_recovered_at: None,
             version: ann.version.clone(),
             gpu_name: ann.gpu_name.clone(),
             hostname: ann.hostname.clone(),
             is_soc: ann.is_soc,
             gpu_vram: ann.gpu_vram.clone(),
-            gpu_bandwidth_gbps: ann.gpu_bandwidth_gbps.clone(),
+            gpu_reserved_bytes: ann.gpu_reserved_bytes.clone(),
+            gpu_mem_bandwidth_gbps: ann.gpu_mem_bandwidth_gbps.clone(),
+            gpu_compute_tflops_fp32: ann.gpu_compute_tflops_fp32.clone(),
+            gpu_compute_tflops_fp16: ann.gpu_compute_tflops_fp16.clone(),
             available_model_metadata: ann.available_model_metadata.clone(),
             experts_summary: ann.experts_summary.clone(),
             available_model_sizes: ann.available_model_sizes.clone(),
@@ -1239,6 +1009,22 @@ impl PeerInfo {
         } else {
             self.is_assigned_model(model)
         }
+    }
+
+    pub fn accepts_http_inference(&self) -> bool {
+        matches!(self.role, NodeRole::Host { .. })
+    }
+
+    pub fn http_routable_models(&self) -> Vec<String> {
+        if self.accepts_http_inference() {
+            self.routable_models()
+        } else {
+            Vec::new()
+        }
+    }
+
+    pub fn routes_http_model(&self, model: &str) -> bool {
+        self.accepts_http_inference() && self.routes_model(model)
     }
 
     pub fn moe_recovery_ready(&self) -> bool {
@@ -1368,7 +1154,7 @@ async fn stun_public_addr(advertised_port: u16) -> Option<std::net::SocketAddr> 
                     }
 
                     // Attributes are padded to 4-byte boundary
-                    i += 4 + (attr_len + 3) & !3;
+                    i += (4 + (attr_len + 3)) & !3;
                 }
             }
             _ => continue,
@@ -1418,7 +1204,10 @@ pub struct Node {
     pub hostname: Option<String>,
     pub is_soc: Option<bool>,
     pub gpu_vram: Option<String>,
-    pub gpu_bandwidth_gbps: Arc<tokio::sync::Mutex<Option<Vec<f64>>>>,
+    pub gpu_reserved_bytes: Option<String>,
+    pub gpu_mem_bandwidth_gbps: Arc<tokio::sync::Mutex<Option<Vec<f64>>>>,
+    pub gpu_compute_tflops_fp32: Arc<tokio::sync::Mutex<Option<Vec<f64>>>>,
+    pub gpu_compute_tflops_fp16: Arc<tokio::sync::Mutex<Option<Vec<f64>>>>,
     config_state: Arc<tokio::sync::Mutex<crate::runtime::config_state::ConfigState>>,
     config_revision_tx: Arc<tokio::sync::watch::Sender<u64>>,
 }
@@ -1523,24 +1312,6 @@ pub(crate) fn resolve_peer_leaving(
             got: frame.peer_id.len(),
         })?;
     Ok(EndpointId::from(pk))
-}
-
-/// Applies the reachability-confirmation rule for a `PeerDown` claim.
-/// Returns `Some(dead_id)` if `dead_id != self_id` AND `should_remove` is `true` (peer confirmed gone).
-/// Returns `None` if `dead_id == self_id` (never self-evict) or `should_remove` is `false` (peer still reachable).
-pub(crate) fn resolve_peer_down(
-    self_id: EndpointId,
-    dead_id: EndpointId,
-    should_remove: bool,
-) -> Option<EndpointId> {
-    if dead_id == self_id {
-        return None;
-    }
-    if should_remove {
-        Some(dead_id)
-    } else {
-        None
-    }
 }
 
 /// Channels returned by Node::start for inbound tunnel streams.
@@ -1693,6 +1464,17 @@ impl Node {
                     .join(","),
             )
         };
+        let gpu_reserved_bytes = if hw.gpu_reserved.iter().all(Option::is_none) {
+            None
+        } else {
+            Some(
+                hw.gpu_reserved
+                    .iter()
+                    .map(|value| value.map(|v| v.to_string()).unwrap_or_default())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            )
+        };
         if let Some(max_gb) = max_vram_gb {
             let max_bytes = (max_gb * 1e9) as u64;
             if max_bytes < vram {
@@ -1795,7 +1577,10 @@ impl Node {
             hostname,
             is_soc,
             gpu_vram,
-            gpu_bandwidth_gbps: Arc::new(tokio::sync::Mutex::new(None)),
+            gpu_reserved_bytes,
+            gpu_mem_bandwidth_gbps: Arc::new(tokio::sync::Mutex::new(None)),
+            gpu_compute_tflops_fp32: Arc::new(tokio::sync::Mutex::new(None)),
+            gpu_compute_tflops_fp16: Arc::new(tokio::sync::Mutex::new(None)),
             config_state: Arc::new(tokio::sync::Mutex::new(config_state_init)),
             config_revision_tx: {
                 let (tx, _rx) = tokio::sync::watch::channel(config_revision_init);
@@ -1819,7 +1604,6 @@ impl Node {
         ))
     }
 
-    #[cfg(test)]
     #[cfg(test)]
     pub async fn new_for_tests(role: NodeRole) -> Result<Self> {
         use iroh::endpoint::QuicTransportConfig;
@@ -1891,7 +1675,10 @@ impl Node {
             hostname: None,
             is_soc: Some(false),
             gpu_vram: None,
-            gpu_bandwidth_gbps: Arc::new(tokio::sync::Mutex::new(None)),
+            gpu_reserved_bytes: None,
+            gpu_mem_bandwidth_gbps: Arc::new(tokio::sync::Mutex::new(None)),
+            gpu_compute_tflops_fp32: Arc::new(tokio::sync::Mutex::new(None)),
+            gpu_compute_tflops_fp16: Arc::new(tokio::sync::Mutex::new(None)),
             config_state: Arc::new(tokio::sync::Mutex::new(
                 crate::runtime::config_state::ConfigState::default(),
             )),
@@ -1993,9 +1780,17 @@ impl Node {
         });
     }
 
+    /// Decode an invite token into an [`EndpointAddr`] without connecting.
+    /// Returns `Err` if the token is not valid base64 or not valid JSON.
+    pub fn decode_invite_token(invite_token: &str) -> Result<EndpointAddr> {
+        let json = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(invite_token)
+            .context("invalid invite token encoding")?;
+        serde_json::from_slice(&json).context("invalid invite token JSON")
+    }
+
     pub async fn join(&self, invite_token: &str) -> Result<()> {
-        let json = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(invite_token)?;
-        let addr: EndpointAddr = serde_json::from_slice(&json)?;
+        let addr = Self::decode_invite_token(invite_token)?;
         // Clear dead status — explicit join should always attempt connection
         self.state.lock().await.dead_peers.remove(&addr.id);
         self.connect_to_peer(addr).await
@@ -2308,7 +2103,7 @@ impl Node {
             // If RTT dropped from above the split threshold (80ms) to below it
             // (e.g. relay → direct), trigger a re-election so the peer can now
             // be included in split mode.
-            let was_above = old_rtt.map_or(false, |r| r > MAX_SPLIT_RTT_MS);
+            let was_above = old_rtt.is_some_and(|r| r > MAX_SPLIT_RTT_MS);
             if was_above && rtt_ms <= MAX_SPLIT_RTT_MS {
                 eprintln!(
                     "📡 Peer {} RTT improved ({}ms → {}ms) — re-electing for split",
@@ -2496,322 +2291,6 @@ impl Node {
 
     pub async fn requested_models(&self) -> Vec<String> {
         self.requested_models.lock().await.clone()
-    }
-
-    /// Start a background task that periodically checks peer health.
-    /// Probes each peer by attempting a gossip exchange. If the probe fails
-    /// (connection dead, peer unresponsive), removes the peer immediately
-    /// rather than waiting for QUIC idle timeout.
-    /// Start a slow heartbeat (60s) that gossips with a random subset of peers.
-    /// At small mesh sizes (≤5 peers), talks to everyone. At larger sizes,
-    /// picks K random peers per cycle. Information propagates infectiously —
-    /// changes reach all nodes in O(log N) cycles.
-    /// Death detection primarily happens on the data path (tunnel fails →
-    /// broadcast_peer_down), not via heartbeat.
-    pub fn start_heartbeat(&self) {
-        let node = self.clone();
-        tokio::spawn(async move {
-            let mut fail_counts: std::collections::HashMap<EndpointId, u32> =
-                std::collections::HashMap::new();
-
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-
-                let mut peers_and_conns: Vec<(EndpointId, Option<Connection>)> = {
-                    let state = node.state.lock().await;
-                    state
-                        .peers
-                        .keys()
-                        .map(|id| {
-                            let conn = state.connections.get(id).cloned();
-                            (*id, conn)
-                        })
-                        .collect()
-                };
-                tracing::debug!("Heartbeat tick: {} peers to check", peers_and_conns.len());
-
-                // Random-K gossip: pick a subset at larger mesh sizes.
-                // At ≤5 peers, talk to everyone (backward compat with current behavior).
-                // At larger sizes, pick 5 random peers per cycle.
-                const GOSSIP_K: usize = 5;
-                if peers_and_conns.len() > GOSSIP_K {
-                    use rand::seq::SliceRandom;
-                    peers_and_conns.shuffle(&mut rand::rng());
-                    peers_and_conns.truncate(GOSSIP_K);
-                }
-
-                for (peer_id, conn) in peers_and_conns {
-                    let hb_start = std::time::Instant::now();
-                    let alive = if let Some(conn) = conn {
-                        // Gossip as heartbeat — syncs state but won't re-discover dead peers
-                        let result = tokio::time::timeout(
-                            std::time::Duration::from_secs(10),
-                            node.initiate_gossip_inner(conn, peer_id, false),
-                        )
-                        .await
-                        .map(|r| r.is_ok())
-                        .unwrap_or(false);
-                        tracing::debug!(
-                            "Heartbeat gossip {} = {} ({}ms)",
-                            peer_id.fmt_short(),
-                            if result { "ok" } else { "fail" },
-                            hb_start.elapsed().as_millis()
-                        );
-                        result
-                    } else {
-                        // No connection — try to reconnect using stored address
-                        let addr = {
-                            let state = node.state.lock().await;
-                            state.peers.get(&peer_id).map(|p| p.addr.clone())
-                        };
-                        if let Some(addr) = addr {
-                            match tokio::time::timeout(
-                                std::time::Duration::from_secs(10),
-                                connect_mesh(&node.endpoint, addr),
-                            )
-                            .await
-                            {
-                                Ok(Ok(new_conn)) => {
-                                    eprintln!(
-                                        "💚 Heartbeat: reconnected to {}",
-                                        peer_id.fmt_short()
-                                    );
-                                    node.state
-                                        .lock()
-                                        .await
-                                        .connections
-                                        .insert(peer_id, new_conn.clone());
-                                    // Spawn dispatch_streams for the new connection
-                                    let n2 = node.clone();
-                                    let nc = new_conn.clone();
-                                    tokio::spawn(async move {
-                                        n2.dispatch_streams(nc, peer_id).await;
-                                    });
-                                    // Try gossip on the new connection
-                                    tokio::time::timeout(
-                                        std::time::Duration::from_secs(10),
-                                        node.initiate_gossip_inner(new_conn, peer_id, false),
-                                    )
-                                    .await
-                                    .map(|r| r.is_ok())
-                                    .unwrap_or(false)
-                                }
-                                _ => false,
-                            }
-                        } else {
-                            false
-                        }
-                    };
-
-                    if alive {
-                        if fail_counts.contains_key(&peer_id) {
-                            eprintln!(
-                                "💚 Heartbeat: {} recovered (was {}/2)",
-                                peer_id.fmt_short(),
-                                fail_counts.get(&peer_id).unwrap_or(&0)
-                            );
-                            // Clear dead_peers if peer came back
-                            node.state.lock().await.dead_peers.remove(&peer_id);
-                        }
-                        fail_counts.remove(&peer_id);
-                    } else {
-                        let (recently_seen, failure_policy) = {
-                            let state = node.state.lock().await;
-                            let peer = state.peers.get(&peer_id).cloned();
-                            drop(state);
-                            let local_descriptors =
-                                node.served_model_descriptors.lock().await.clone();
-                            let local_runtime = node.model_runtime_descriptors.lock().await.clone();
-                            let policy = peer
-                                .as_ref()
-                                .map(|peer| {
-                                    heartbeat_failure_policy_for_peer(
-                                        &local_descriptors,
-                                        &local_runtime,
-                                        peer,
-                                    )
-                                })
-                                .unwrap_or(HeartbeatFailurePolicy {
-                                    allow_recent_inbound_grace: true,
-                                    failure_threshold: 2,
-                                });
-                            let recently_seen = peer
-                                .as_ref()
-                                .map(|peer| peer.last_seen.elapsed().as_secs() < PEER_STALE_SECS)
-                                .unwrap_or(false);
-                            (recently_seen, policy)
-                        };
-                        // Check if peer has contacted US recently (inbound gossip).
-                        // If so, peer is alive — we just can't reach them outbound (NAT).
-                        if recently_seen && failure_policy.allow_recent_inbound_grace {
-                            // Peer is alive via inbound, don't count as failure
-                            if fail_counts.contains_key(&peer_id) {
-                                eprintln!("💚 Heartbeat: {} outbound failed but seen recently (inbound alive)", peer_id.fmt_short());
-                                fail_counts.remove(&peer_id);
-                            }
-                        } else {
-                            let count = fail_counts.entry(peer_id).or_default();
-                            *count += 1;
-                            if *count >= failure_policy.failure_threshold {
-                                // Generic peers require 2 misses so a single timeout doesn't
-                                // evict an otherwise-alive inbound-only peer. Shared MoE peers
-                                // are stricter: one missed heartbeat should trigger re-election.
-                                node.state.lock().await.dead_peers.insert(peer_id);
-                                eprintln!(
-                                    "💔 Heartbeat: {} unreachable ({} failure{}), removing + broadcasting death",
-                                    peer_id.fmt_short(),
-                                    count,
-                                    if *count == 1 { "" } else { "s" }
-                                );
-                                fail_counts.remove(&peer_id);
-                                node.handle_peer_death(peer_id).await;
-                            } else {
-                                eprintln!(
-                                    "💛 Heartbeat: {} unreachable ({}/{}), will retry",
-                                    peer_id.fmt_short(),
-                                    count,
-                                    failure_policy.failure_threshold
-                                );
-                            }
-                        }
-                    }
-                }
-
-                // Prune stale peers: no direct contact in 2× the stale window.
-                // These are ghost records propagated via gossip from other nodes
-                // but never directly verified by us.
-                let prune_cutoff =
-                    std::time::Instant::now() - std::time::Duration::from_secs(PEER_STALE_SECS * 2);
-                let stale_peers: Vec<EndpointId> = {
-                    let state = node.state.lock().await;
-                    state
-                        .peers
-                        .iter()
-                        .filter(|(_, p)| p.last_seen < prune_cutoff)
-                        .map(|(id, _)| *id)
-                        .collect()
-                };
-                for stale_id in stale_peers {
-                    eprintln!(
-                        "🧹 Pruning stale peer {} (no direct contact in {}s)",
-                        stale_id.fmt_short(),
-                        PEER_STALE_SECS * 2
-                    );
-                    node.remove_peer(stale_id).await;
-                    // Also close any lingering connection
-                    node.state.lock().await.connections.remove(&stale_id);
-                }
-
-                // GC expired demand entries to prevent unbounded map growth
-                node.gc_demand().await;
-            }
-        });
-    }
-
-    /// Handle a peer death: remove from state, broadcast to all other peers.
-    pub async fn handle_peer_death(&self, dead_id: EndpointId) {
-        eprintln!(
-            "⚠️  Peer {} died — removing and broadcasting",
-            dead_id.fmt_short()
-        );
-        {
-            let mut state = self.state.lock().await;
-            // Keep the connection alive — if the peer recovers, their inbound
-            // gossip will arrive on the existing connection and trigger recovery
-            // via handle_gossip_stream → add_peer → clear dead_peers.
-            // Don't remove: state.connections.remove(&dead_id);
-            state.dead_peers.insert(dead_id);
-        }
-        self.remove_peer(dead_id).await;
-        self.broadcast_peer_down(dead_id).await;
-    }
-
-    /// Broadcast that a peer is down to all connected peers.
-    async fn broadcast_peer_down(&self, dead_id: EndpointId) {
-        let conns: Vec<(EndpointId, Connection)> = {
-            let state = self.state.lock().await;
-            state
-                .connections
-                .iter()
-                .filter(|(id, _)| **id != dead_id)
-                .map(|(id, c)| (*id, c.clone()))
-                .collect()
-        };
-        let dead_bytes = dead_id.as_bytes().to_vec();
-        for (peer_id, conn) in conns {
-            let bytes = dead_bytes.clone();
-            let protocol = connection_protocol(&conn);
-            tokio::spawn(async move {
-                let res = async {
-                    let (mut send, _recv) = conn.open_bi().await?;
-                    send.write_all(&[STREAM_PEER_DOWN]).await?;
-                    match protocol {
-                        ControlProtocol::ProtoV1 => {
-                            let proto_msg = crate::proto::node::PeerDown {
-                                peer_id: bytes,
-                                gen: NODE_PROTOCOL_GENERATION,
-                            };
-                            write_len_prefixed(&mut send, &proto_msg.encode_to_vec()).await?;
-                        }
-                        ControlProtocol::JsonV0 => {
-                            send.write_all(&bytes).await?;
-                        }
-                    }
-                    send.finish()?;
-                    Ok::<_, anyhow::Error>(())
-                }
-                .await;
-                if let Err(e) = res {
-                    tracing::debug!(
-                        "Failed to broadcast peer_down to {}: {e}",
-                        peer_id.fmt_short()
-                    );
-                }
-            });
-        }
-    }
-
-    /// Announce clean shutdown to all peers.
-    pub async fn broadcast_leaving(&self) {
-        let my_id_bytes = self.endpoint.id().as_bytes().to_vec();
-        let conns: Vec<(EndpointId, Connection)> = {
-            let state = self.state.lock().await;
-            state
-                .connections
-                .iter()
-                .map(|(id, c)| (*id, c.clone()))
-                .collect()
-        };
-        for (peer_id, conn) in conns {
-            let bytes = my_id_bytes.clone();
-            let protocol = connection_protocol(&conn);
-            tokio::spawn(async move {
-                let res = async {
-                    let (mut send, _recv) = conn.open_bi().await?;
-                    send.write_all(&[STREAM_PEER_LEAVING]).await?;
-                    match protocol {
-                        ControlProtocol::ProtoV1 => {
-                            let proto_msg = crate::proto::node::PeerLeaving {
-                                peer_id: bytes,
-                                gen: NODE_PROTOCOL_GENERATION,
-                            };
-                            write_len_prefixed(&mut send, &proto_msg.encode_to_vec()).await?;
-                        }
-                        ControlProtocol::JsonV0 => {
-                            send.write_all(&bytes).await?;
-                        }
-                    }
-                    send.finish()?;
-                    Ok::<_, anyhow::Error>(())
-                }
-                .await;
-                if let Err(e) = res {
-                    tracing::debug!("Failed to send leaving to {}: {e}", peer_id.fmt_short());
-                }
-            });
-        }
-        // Give broadcasts a moment to flush
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
 
     async fn forward_plugin_event(&self, event: crate::plugin::PluginMeshEvent) -> Result<()> {
@@ -3157,7 +2636,11 @@ impl Node {
             .collect()
     }
 
-    /// Get all models currently being served in the mesh (loaded in VRAM somewhere).
+    /// Get all models currently reachable via the mesh HTTP/API ingress.
+    ///
+    /// This is intentionally stricter than "loaded in VRAM somewhere": split
+    /// workers may contribute compute for a model but cannot accept chat
+    /// requests directly.
     pub async fn models_being_served(&self) -> Vec<String> {
         let my_hosted_models = self.hosted_models.lock().await.clone();
         let peer_data: Vec<_> = {
@@ -3169,7 +2652,7 @@ impl Node {
             served.insert(s.clone());
         }
         for peer in &peer_data {
-            for m in peer.routable_models() {
+            for m in peer.http_routable_models() {
                 served.insert(m.clone());
             }
         }
@@ -3187,7 +2670,7 @@ impl Node {
         let mut hosts: Vec<EndpointId> = state
             .peers
             .values()
-            .filter(|p| p.routes_model(model))
+            .filter(|p| p.routes_http_model(model))
             .map(|p| p.id)
             .collect();
         hosts.sort();
@@ -3210,7 +2693,7 @@ impl Node {
         state
             .peers
             .values()
-            .find(|p| !p.routable_models().is_empty())
+            .find(|p| !p.http_routable_models().is_empty())
             .cloned()
     }
 
@@ -3238,7 +2721,7 @@ impl Node {
 
         // Include peers that are serving through their local API proxies
         for peer in &peer_data {
-            for model in peer.routable_models() {
+            for model in peer.http_routable_models() {
                 hosts.push(RouteEntry {
                     model,
                     node_id: format!("{}", peer.id.fmt_short()),
@@ -3539,21 +3022,43 @@ impl Node {
 
     async fn _dispatch_streams(&self, conn: Connection, remote: EndpointId) {
         let protocol = connection_protocol(&conn);
+        let connection_stable_id = conn.stable_id();
         loop {
             let (send, mut recv) = match conn.accept_bi().await {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::info!("Connection to {} closed: {e}", remote.fmt_short());
-                    // Remove the stale connection
+                    // Remove the stale connection only if it still owns the
+                    // tracked slot. A newer connection may already have
+                    // replaced it.
                     {
                         let mut state = self.state.lock().await;
-                        state.connections.remove(&remote);
+                        if should_remove_connection(
+                            state.connections.get(&remote).map(|conn| conn.stable_id()),
+                            connection_stable_id,
+                        ) {
+                            state.connections.remove(&remote);
+                        }
                     }
                     // Try to reconnect — if the peer is still alive, re-learn their role
-                    let addr = {
+                    let (addr, replaced_by_newer_conn) = {
                         let state = self.state.lock().await;
-                        state.peers.get(&remote).map(|p| p.addr.clone())
+                        (
+                            state.peers.get(&remote).map(|p| p.addr.clone()),
+                            state
+                                .connections
+                                .get(&remote)
+                                .map(|tracked| tracked.stable_id())
+                                .is_some_and(|tracked| tracked != connection_stable_id),
+                        )
                     };
+                    if replaced_by_newer_conn {
+                        tracing::debug!(
+                            "Connection to {} already replaced by a newer stream dispatcher",
+                            remote.fmt_short()
+                        );
+                        break;
+                    }
                     if let Some(addr) = addr {
                         tracing::info!("Attempting reconnect to {}...", remote.fmt_short());
                         match tokio::time::timeout(
@@ -3635,7 +3140,6 @@ impl Node {
             match stream_type {
                 STREAM_GOSSIP => {
                     let node = self.clone();
-                    let protocol = protocol;
                     tokio::spawn(async move {
                         if let Err(e) = node
                             .handle_gossip_stream(remote, protocol, send, recv)
@@ -3653,7 +3157,6 @@ impl Node {
                 }
                 STREAM_TUNNEL_MAP => {
                     let node = self.clone();
-                    let protocol = protocol;
                     tokio::spawn(async move {
                         if let Err(e) = node.handle_tunnel_map_stream(remote, protocol, recv).await
                         {
@@ -3672,7 +3175,6 @@ impl Node {
                 }
                 STREAM_ROUTE_REQUEST => {
                     let node = self.clone();
-                    let protocol = protocol;
                     tokio::spawn(async move {
                         if protocol == ControlProtocol::ProtoV1 {
                             let proto_buf = match read_len_prefixed(&mut recv).await {
@@ -3722,7 +3224,6 @@ impl Node {
                 }
                 STREAM_PEER_DOWN => {
                     let node = self.clone();
-                    let protocol = protocol;
                     tokio::spawn(async move {
                         let peer_id_arr: [u8; 32] = match protocol {
                             ControlProtocol::ProtoV1 => {
@@ -3783,41 +3284,106 @@ impl Node {
                             }
                         };
                         let dead_id = EndpointId::from(pk);
-                        let conn_opt = {
+
+                        // Check existing state before deciding.
+                        let (conn_opt, peer_addr, recently_seen) = {
                             let state = node.state.lock().await;
-                            state.connections.get(&dead_id).cloned()
+                            let conn = state.connections.get(&dead_id).cloned();
+                            let peer = state.peers.get(&dead_id);
+                            let addr = peer.map(|p| p.addr.clone());
+                            let seen = peer
+                                .map(|p| p.last_seen.elapsed().as_secs() < PEER_STALE_SECS)
+                                .unwrap_or(false);
+                            (conn, addr, seen)
                         };
-                        let should_remove = if let Some(conn) = conn_opt {
-                            tokio::time::timeout(std::time::Duration::from_secs(3), conn.open_bi())
-                                .await
-                                .is_err()
-                        } else {
-                            true
-                        };
-                        if let Some(id) =
-                            resolve_peer_down(node.endpoint.id(), dead_id, should_remove)
-                        {
+
+                        // If we've heard from this peer recently via direct gossip,
+                        // they're alive from our perspective — ignore the death report
+                        // regardless of whether we have a connection (the connection
+                        // may be broken/stale while the peer is genuinely alive on
+                        // a different path).
+                        if recently_seen {
                             eprintln!(
-                                "⚠️  Peer {} reported dead by {}, confirmed, removing",
-                                id.fmt_short(),
-                                remote.fmt_short()
-                            );
-                            let mut state = node.state.lock().await;
-                            state.connections.remove(&id);
-                            drop(state);
-                            node.remove_peer(id).await;
-                        } else if dead_id != node.endpoint.id() {
-                            eprintln!(
-                                "ℹ️  Peer {} reported dead by {} but still reachable, ignoring",
+                                "ℹ️  Peer {} reported dead by {} but seen recently (direct alive), ignoring",
                                 dead_id.fmt_short(),
                                 remote.fmt_short()
                             );
+                        } else {
+                            let should_remove = if let Some(conn) = conn_opt {
+                                // Have a connection — probe it. Treat both
+                                // timeout and open_bi() error as unreachable.
+                                match tokio::time::timeout(
+                                    std::time::Duration::from_secs(3),
+                                    conn.open_bi(),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(_)) => false, // stream opened — peer is alive
+                                    _ => true,          // timeout or error — unreachable
+                                }
+                            } else if let Some(addr) = peer_addr {
+                                // No connection but we know the peer — try to reach them
+                                // before trusting the reporter's claim.
+                                match tokio::time::timeout(
+                                    std::time::Duration::from_secs(5),
+                                    connect_mesh(&node.endpoint, addr),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(new_conn)) => {
+                                        // Peer is reachable — restore connection.
+                                        eprintln!(
+                                            "ℹ️  Peer {} reported dead by {} but we reached them, keeping",
+                                            dead_id.fmt_short(),
+                                            remote.fmt_short()
+                                        );
+                                        let mut state = node.state.lock().await;
+                                        // Only insert if no other task raced and
+                                        // established a connection while we were probing.
+                                        if let std::collections::hash_map::Entry::Vacant(entry) =
+                                            state.connections.entry(dead_id)
+                                        {
+                                            entry.insert(new_conn.clone());
+                                            drop(state);
+                                            let n2 = node.clone();
+                                            tokio::spawn(async move {
+                                                n2.dispatch_streams(new_conn, dead_id).await;
+                                            });
+                                        } else {
+                                            drop(state);
+                                        }
+                                        false
+                                    }
+                                    _ => true, // genuinely unreachable
+                                }
+                            } else {
+                                // Unknown peer — trust the reporter.
+                                true
+                            };
+                            if let Some(id) =
+                                resolve_peer_down(node.endpoint.id(), dead_id, should_remove)
+                            {
+                                eprintln!(
+                                    "⚠️  Peer {} reported dead by {}, confirmed, removing",
+                                    id.fmt_short(),
+                                    remote.fmt_short()
+                                );
+                                let mut state = node.state.lock().await;
+                                state.connections.remove(&id);
+                                drop(state);
+                                node.remove_peer(id).await;
+                            } else if dead_id != node.endpoint.id() {
+                                eprintln!(
+                                    "ℹ️  Peer {} reported dead by {} but still reachable, ignoring",
+                                    dead_id.fmt_short(),
+                                    remote.fmt_short()
+                                );
+                            }
                         }
                     });
                 }
                 STREAM_PEER_LEAVING => {
                     let node = self.clone();
-                    let protocol = protocol;
                     tokio::spawn(async move {
                         let leaving_id = match protocol {
                             ControlProtocol::ProtoV1 => {
@@ -4037,8 +3603,31 @@ impl Node {
             return Ok(());
         }
 
+        let subscriber_version = {
+            let state = self.state.lock().await;
+            state
+                .peers
+                .get(&remote)
+                .and_then(|peer| peer.version.clone())
+        };
+
         let snapshot = {
             let state = self.config_state.lock().await;
+            if config_uses_pinned_gpu(state.config())
+                && !peer_supports_pinned_gpu_config(subscriber_version.as_deref())
+            {
+                let error_snapshot = crate::proto::node::ConfigSnapshotResponse {
+                    gen: NODE_PROTOCOL_GENERATION,
+                    node_id: vec![],
+                    revision: 0,
+                    config_hash: vec![],
+                    config: None,
+                    hostname: None,
+                    error: Some(pinned_gpu_config_peer_error(subscriber_version.as_deref())),
+                };
+                write_len_prefixed(&mut send, &error_snapshot.encode_to_vec()).await?;
+                return Ok(());
+            }
             let proto_cfg = mesh_config_to_proto(state.config());
             ConfigSnapshotResponse {
                 gen: NODE_PROTOCOL_GENERATION,
@@ -4061,6 +3650,16 @@ impl Node {
                     }
                     let notification = {
                         let state = self.config_state.lock().await;
+                        if config_uses_pinned_gpu(state.config())
+                            && !peer_supports_pinned_gpu_config(subscriber_version.as_deref())
+                        {
+                            tracing::warn!(
+                                "closing config subscribe stream to {}: {}",
+                                remote.fmt_short(),
+                                pinned_gpu_config_peer_error(subscriber_version.as_deref())
+                            );
+                            break;
+                        }
                         let proto_cfg = mesh_config_to_proto(state.config());
                         ConfigUpdateNotification {
                             gen: NODE_PROTOCOL_GENERATION,
@@ -4075,12 +3674,11 @@ impl Node {
                     }
                 }
                 inbound = read_len_prefixed(&mut recv) => {
-                    match inbound {
-                        Ok(_) => tracing::debug!(
+                    if inbound.is_ok() {
+                        tracing::debug!(
                             "config subscribe from {} sent unexpected extra frame; closing stream",
                             remote.fmt_short()
-                        ),
-                        Err(_) => {}
+                        );
                     }
                     break;
                 }
@@ -4234,19 +3832,27 @@ impl Node {
         };
         let mesh_config = proto_config_to_mesh(config_snapshot);
 
-        // 6. Apply via CAS — use spawn_blocking so synchronous disk I/O in apply()
-        //    does not block the Tokio async runtime while the mutex is held.
+        // 6. Preflight + apply via CAS — use spawn_blocking so blocking hardware
+        //    probes and synchronous disk I/O do not run on the Tokio async runtime.
         let config_state = Arc::clone(&self.config_state);
         let expected_revision = push.expected_revision;
-        let (result, current_revision, current_hash) = tokio::task::spawn_blocking(move || {
+        let apply_result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            preflight_pushed_config_for_current_node(&mesh_config)?;
             let mut state = config_state.blocking_lock();
             let result = state.apply(mesh_config, expected_revision);
             let current_revision = state.revision();
             let current_hash = *state.config_hash();
-            (result, current_revision, current_hash)
+            Ok((result, current_revision, current_hash))
         })
         .await
         .map_err(|e| anyhow::anyhow!("config apply task panicked: {e}"))?;
+        let (result, current_revision, current_hash) = match apply_result {
+            Ok(values) => values,
+            Err(err) => {
+                send_push_error(&mut send, &err.to_string()).await?;
+                return Ok(());
+            }
+        };
 
         // 7. Build + send response
         use crate::proto::node::ConfigApplyMode as ProtoApplyMode;
@@ -4363,24 +3969,21 @@ impl Node {
             // Keep the request stream's send half alive while subscribed so the
             // remote side does not treat immediate EOF as an unsubscribe.
             let _send = send;
-            loop {
-                match read_len_prefixed(&mut recv).await {
-                    Ok(buf) => match ConfigUpdateNotification::decode(buf.as_slice()) {
-                        Ok(notif) => {
-                            if let Err(e) = notif.validate_frame() {
-                                tracing::warn!("ConfigUpdateNotification validation error: {e}");
-                                break;
-                            }
-                            if notif_tx.send(notif).is_err() {
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!("ConfigUpdateNotification decode error: {e}");
+            while let Ok(buf) = read_len_prefixed(&mut recv).await {
+                match ConfigUpdateNotification::decode(buf.as_slice()) {
+                    Ok(notif) => {
+                        if let Err(e) = notif.validate_frame() {
+                            tracing::warn!("ConfigUpdateNotification validation error: {e}");
                             break;
                         }
-                    },
-                    Err(_) => break,
+                        if notif_tx.send(notif).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("ConfigUpdateNotification decode error: {e}");
+                        break;
+                    }
                 }
             }
         });
@@ -4480,186 +4083,6 @@ impl Node {
         Ok(())
     }
 
-    /// Open a gossip stream on an existing connection to exchange peer info.
-    async fn initiate_gossip(&self, conn: Connection, remote: EndpointId) -> Result<()> {
-        self.initiate_gossip_inner(conn, remote, true).await
-    }
-
-    async fn initiate_gossip_inner(
-        &self,
-        conn: Connection,
-        remote: EndpointId,
-        discover_peers: bool,
-    ) -> Result<()> {
-        let protocol = connection_protocol(&conn);
-        let t0 = std::time::Instant::now();
-        let (mut send, mut recv) = conn.open_bi().await?;
-        send.write_all(&[STREAM_GOSSIP]).await?;
-
-        let our_announcements = self.collect_announcements().await;
-        write_gossip_payload(&mut send, protocol, &our_announcements, self.endpoint.id()).await?;
-        send.finish()?;
-
-        let rtt_ms = t0.elapsed().as_millis() as u32;
-        let buf = read_len_prefixed(&mut recv).await?;
-        let their_announcements = decode_gossip_payload(protocol, remote, &buf)?;
-
-        let _ = recv.read_to_end(0).await;
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        for (addr, ann) in &their_announcements {
-            let peer_id = addr.id;
-            if peer_id == self.endpoint.id() {
-                continue;
-            }
-            if peer_id == remote {
-                if let Some(ref their_id) = ann.mesh_id {
-                    self.set_mesh_id(their_id.clone()).await;
-                }
-                self.merge_remote_demand(&ann.model_demand);
-                self.add_peer(remote, addr.clone(), ann).await;
-                self.update_peer_rtt(remote, rtt_ms).await;
-            } else {
-                self.update_transitive_peer(peer_id, addr, ann).await;
-            }
-        }
-
-        // Also check the connection's actual path info — the gossip round-trip
-        // time above may reflect relay latency even if a direct path is now active.
-        {
-            let conn = self.state.lock().await.connections.get(&remote).cloned();
-            if let Some(conn) = conn {
-                let mut paths = conn.paths();
-                let path_list = iroh::Watcher::get(&mut paths);
-                for path_info in path_list {
-                    if path_info.is_selected() {
-                        let path_rtt_ms = match path_info.rtt() {
-                            Some(rtt) => rtt.as_millis() as u32,
-                            None => continue,
-                        };
-                        let path_type = if path_info.is_ip() { "direct" } else { "relay" };
-                        if path_rtt_ms > 0 && path_rtt_ms < rtt_ms {
-                            eprintln!(
-                                "📡 Peer {} RTT: {}ms ({}) [path info]",
-                                remote.fmt_short(),
-                                path_rtt_ms,
-                                path_type
-                            );
-                            self.update_peer_rtt(remote, path_rtt_ms).await;
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-
-        if discover_peers {
-            for (addr, _) in &their_announcements {
-                let peer_id = addr.id;
-                if peer_id != self.endpoint.id() {
-                    let has_conn = self.state.lock().await.connections.contains_key(&peer_id);
-                    if !has_conn {
-                        if let Err(e) = Box::pin(self.connect_to_peer(addr.clone())).await {
-                            tracing::debug!(
-                                "Could not connect to discovered peer {}: {e}",
-                                peer_id.fmt_short()
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn handle_gossip_stream(
-        &self,
-        remote: EndpointId,
-        protocol: ControlProtocol,
-        mut send: iroh::endpoint::SendStream,
-        mut recv: iroh::endpoint::RecvStream,
-    ) -> Result<()> {
-        tracing::info!("Inbound gossip from {}", remote.fmt_short());
-
-        {
-            let mut state = self.state.lock().await;
-            if state.dead_peers.remove(&remote) {
-                eprintln!(
-                    "🔄 Dead peer {} is gossiping — clearing dead status",
-                    remote.fmt_short()
-                );
-            }
-        }
-
-        let buf = read_len_prefixed(&mut recv).await?;
-        let their_announcements = decode_gossip_payload(protocol, remote, &buf)?;
-
-        let our_announcements = self.collect_announcements().await;
-        write_gossip_payload(&mut send, protocol, &our_announcements, self.endpoint.id()).await?;
-        send.finish()?;
-
-        let _ = recv.read_to_end(0).await;
-
-        for (addr, ann) in &their_announcements {
-            let peer_id = addr.id;
-            if peer_id == self.endpoint.id() {
-                continue;
-            }
-            if peer_id == remote {
-                if let Some(ref their_id) = ann.mesh_id {
-                    self.set_mesh_id(their_id.clone()).await;
-                }
-                self.merge_remote_demand(&ann.model_demand);
-                self.add_peer(remote, addr.clone(), ann).await;
-            } else {
-                self.update_transitive_peer(peer_id, addr, ann).await;
-            }
-        }
-
-        {
-            let conn = self.state.lock().await.connections.get(&remote).cloned();
-            if let Some(conn) = conn {
-                let mut paths = conn.paths();
-                let path_list = iroh::Watcher::get(&mut paths);
-                for path_info in path_list {
-                    if path_info.is_selected() {
-                        let rtt_ms = match path_info.rtt() {
-                            Some(rtt) => rtt.as_millis() as u32,
-                            None => continue,
-                        };
-                        let path_type = if path_info.is_ip() { "direct" } else { "relay" };
-                        if rtt_ms > 0 {
-                            eprintln!(
-                                "📡 Peer {} RTT: {}ms ({})",
-                                remote.fmt_short(),
-                                rtt_ms,
-                                path_type
-                            );
-                            self.update_peer_rtt(remote, rtt_ms).await;
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-
-        for (addr, _) in their_announcements {
-            let peer_id = addr.id;
-            if peer_id == self.endpoint.id() {
-                continue;
-            }
-            let already_known = self.state.lock().await.peers.contains_key(&peer_id);
-            if !already_known {
-                if let Err(e) = Box::pin(self.connect_to_peer(addr)).await {
-                    tracing::warn!("Failed to discover peer: {e}");
-                }
-            }
-        }
-
-        Ok(())
-    }
-
     async fn handle_tunnel_map_stream(
         &self,
         remote: EndpointId,
@@ -4696,367 +4119,6 @@ impl Node {
         );
 
         Ok(())
-    }
-
-    async fn remove_peer(&self, id: EndpointId) {
-        let mut state = self.state.lock().await;
-        // Always clear any rejection-tracking entry so the map stays bounded.
-        state.policy_rejected_peers.remove(&id);
-        if let Some(peer) = state.peers.remove(&id) {
-            tracing::info!(
-                "Peer removed: {} (total: {})",
-                id.fmt_short(),
-                state.peers.len()
-            );
-            let count = state.peers.len();
-            drop(state);
-            let _ = self.peer_change_tx.send(count);
-            self.emit_plugin_mesh_event(
-                crate::plugin::proto::mesh_event::Kind::PeerDown,
-                Some(&peer),
-                String::new(),
-            )
-            .await;
-        }
-    }
-
-    async fn add_peer(&self, id: EndpointId, addr: EndpointAddr, ann: &PeerAnnouncement) {
-        let imported_ranking = import_remote_moe_rankings(&ann.served_model_descriptors);
-        let trust_store = self.trust_store.lock().await.clone();
-        let owner_summary = verify_node_ownership(
-            ann.owner_attestation.as_ref(),
-            id.as_bytes(),
-            &trust_store,
-            self.trust_policy,
-            current_time_unix_ms(),
-        );
-        if !policy_accepts_peer(self.trust_policy, &owner_summary) {
-            let mut state = self.state.lock().await;
-            let last_status = state.policy_rejected_peers.get(&id).cloned();
-            if last_status.as_ref() != Some(&owner_summary.status) {
-                tracing::warn!(
-                    "Rejecting peer {} due to owner policy: {:?}",
-                    id.fmt_short(),
-                    owner_summary.status
-                );
-                state
-                    .policy_rejected_peers
-                    .insert(id, owner_summary.status.clone());
-            }
-            if state.peers.remove(&id).is_some() {
-                let _ = self.peer_change_tx.send(state.peers.len());
-            }
-            return;
-        }
-        let mut state = self.state.lock().await;
-        // Peer accepted — clear any prior rejection record so future rejections log again.
-        state.policy_rejected_peers.remove(&id);
-        if id == self.endpoint.id() {
-            return;
-        }
-        let now = std::time::Instant::now();
-        // If this peer was previously dead, clear it — add_peer is only called
-        // after a successful gossip exchange, which is proof of life.
-        let recovered = state.dead_peers.remove(&id);
-        if recovered {
-            eprintln!(
-                "🔄 Peer {} back from the dead (successful gossip)",
-                id.fmt_short()
-            );
-        }
-        if let Some(existing) = state.peers.get_mut(&id) {
-            let old_peer = existing.clone();
-            let role_changed = existing.role != ann.role;
-            let ann_hosted_models = ann.hosted_models.clone().unwrap_or_default();
-            let serving_changed = existing.serving_models != ann.serving_models
-                || existing.hosted_models != ann_hosted_models
-                || existing.hosted_models_known != ann.hosted_models.is_some();
-            if role_changed {
-                tracing::info!(
-                    "Peer {} role updated: {:?} → {:?}",
-                    id.fmt_short(),
-                    existing.role,
-                    ann.role
-                );
-                existing.role = ann.role.clone();
-            }
-            // Update addr if the new one has more info
-            if !addr.addrs.is_empty() {
-                existing.addr = addr;
-            }
-            existing.models = ann.models.clone();
-            existing.vram_bytes = ann.vram_bytes;
-            if ann.model_source.is_some() {
-                existing.model_source = ann.model_source.clone();
-            }
-            existing.serving_models = ann.serving_models.clone();
-            existing.hosted_models = ann_hosted_models;
-            existing.hosted_models_known = ann.hosted_models.is_some();
-            existing.available_models.clear();
-            existing.requested_models = ann.requested_models.clone();
-            existing.last_seen = now;
-            if recovered {
-                existing.moe_recovered_at = Some(now);
-            }
-            existing.owner_attestation = ann.owner_attestation.clone();
-            existing.owner_summary = owner_summary.clone();
-            existing.served_model_descriptors = ann.served_model_descriptors.clone();
-            existing.served_model_runtime = ann.served_model_runtime.clone();
-            if ann.version.is_some() {
-                existing.version = ann.version.clone();
-            }
-            existing.gpu_name = ann.gpu_name.clone();
-            existing.hostname = ann.hostname.clone();
-            existing.is_soc = ann.is_soc;
-            existing.gpu_vram = ann.gpu_vram.clone();
-            existing.gpu_bandwidth_gbps = ann.gpu_bandwidth_gbps.clone();
-            if ann.experts_summary.is_some() {
-                existing.experts_summary = ann.experts_summary.clone();
-            }
-            let updated_peer = existing.clone();
-            let changed = peer_meaningfully_changed(&old_peer, &updated_peer)
-                || old_peer.gpu_name != updated_peer.gpu_name
-                || old_peer.hostname != updated_peer.hostname
-                || old_peer.is_soc != updated_peer.is_soc
-                || old_peer.gpu_vram != updated_peer.gpu_vram
-                || old_peer.gpu_bandwidth_gbps != updated_peer.gpu_bandwidth_gbps;
-            if role_changed || serving_changed {
-                let count = state.peers.len();
-                drop(state);
-                let _ = self.peer_change_tx.send(count);
-                if changed {
-                    self.emit_plugin_mesh_event(
-                        crate::plugin::proto::mesh_event::Kind::PeerUpdated,
-                        Some(&updated_peer),
-                        String::new(),
-                    )
-                    .await;
-                }
-            } else {
-                drop(state);
-                if changed {
-                    self.emit_plugin_mesh_event(
-                        crate::plugin::proto::mesh_event::Kind::PeerUpdated,
-                        Some(&updated_peer),
-                        String::new(),
-                    )
-                    .await;
-                }
-            }
-            if imported_ranking {
-                self.refresh_served_model_descriptors().await;
-            }
-            return;
-        }
-        tracing::info!(
-            "Peer added: {} role={:?} vram={:.1}GB assigned={:?} catalog={:?} (total: {})",
-            id.fmt_short(),
-            ann.role,
-            ann.vram_bytes as f64 / 1e9,
-            ann.serving_models.first(),
-            ann.available_models,
-            state.peers.len() + 1
-        );
-        let mut peer = PeerInfo::from_announcement(id, addr, ann, owner_summary);
-        if recovered {
-            peer.moe_recovered_at = Some(now);
-        }
-        state.peers.insert(id, peer.clone());
-        let count = state.peers.len();
-        drop(state);
-        let _ = self.peer_change_tx.send(count);
-        self.emit_plugin_mesh_event(
-            crate::plugin::proto::mesh_event::Kind::PeerUp,
-            Some(&peer),
-            String::new(),
-        )
-        .await;
-        if imported_ranking {
-            self.refresh_served_model_descriptors().await;
-        }
-    }
-
-    /// Update a peer learned transitively through gossip (not directly connected).
-    /// Updates assigned/hosted state so models_being_served() includes their models,
-    /// but does NOT refresh last_seen — transitive peers still get pruned if the
-    /// bridge node stops mentioning them. Does NOT trigger peer_change events
-    /// for new transitive peers (avoids re-election storms at scale).
-    async fn update_transitive_peer(
-        &self,
-        id: EndpointId,
-        addr: &EndpointAddr,
-        ann: &PeerAnnouncement,
-    ) {
-        let imported_ranking = import_remote_moe_rankings(&ann.served_model_descriptors);
-        let trust_store = self.trust_store.lock().await.clone();
-        let owner_summary = verify_node_ownership(
-            ann.owner_attestation.as_ref(),
-            id.as_bytes(),
-            &trust_store,
-            self.trust_policy,
-            current_time_unix_ms(),
-        );
-        if !policy_accepts_peer(self.trust_policy, &owner_summary) {
-            let mut state = self.state.lock().await;
-            if state.peers.remove(&id).is_some() {
-                let _ = self.peer_change_tx.send(state.peers.len());
-            }
-            return;
-        }
-        let mut state = self.state.lock().await;
-        if id == self.endpoint.id() {
-            return;
-        }
-        if state.dead_peers.contains(&id) {
-            return;
-        }
-        if let Some(existing) = state.peers.get_mut(&id) {
-            let old_peer = existing.clone();
-            let serving_changed = apply_transitive_ann(existing, addr, ann);
-            existing.owner_summary = owner_summary;
-            let updated_peer = existing.clone();
-            let changed = peer_meaningfully_changed(&old_peer, &updated_peer);
-            if serving_changed {
-                let count = state.peers.len();
-                drop(state);
-                let _ = self.peer_change_tx.send(count);
-                if changed {
-                    self.emit_plugin_mesh_event(
-                        crate::plugin::proto::mesh_event::Kind::PeerUpdated,
-                        Some(&updated_peer),
-                        String::new(),
-                    )
-                    .await;
-                }
-            } else {
-                drop(state);
-                if changed {
-                    self.emit_plugin_mesh_event(
-                        crate::plugin::proto::mesh_event::Kind::PeerUpdated,
-                        Some(&updated_peer),
-                        String::new(),
-                    )
-                    .await;
-                }
-            }
-            if imported_ranking {
-                self.refresh_served_model_descriptors().await;
-            }
-        } else {
-            // New transitive peer — add with last_seen = now but no peer_change event.
-            // It will get pruned after PEER_STALE_SECS*2 if never directly contacted.
-            let peer = PeerInfo::from_announcement(id, addr.clone(), ann, owner_summary);
-            state.peers.insert(id, peer.clone());
-            drop(state);
-            self.emit_plugin_mesh_event(
-                crate::plugin::proto::mesh_event::Kind::PeerUp,
-                Some(&peer),
-                String::new(),
-            )
-            .await;
-            if imported_ranking {
-                self.refresh_served_model_descriptors().await;
-            }
-        }
-    }
-
-    async fn collect_announcements(&self) -> Vec<PeerAnnouncement> {
-        // Snapshot all locks independently — never hold multiple locks simultaneously.
-        let my_role = self.role.lock().await.clone();
-        let my_models = self.models.lock().await.clone();
-        let my_source = self.model_source.lock().await.clone();
-        let my_serving_models = self.serving_models.lock().await.clone();
-        let my_served_model_descriptors = self.served_model_descriptors.lock().await.clone();
-        let my_model_runtime_descriptors = self.model_runtime_descriptors.lock().await.clone();
-        let my_hosted_models = self.hosted_models.lock().await.clone();
-        let my_available = self.available_models.lock().await.clone();
-        let my_requested = self.requested_models.lock().await.clone();
-        let my_mesh_id = self.mesh_id.lock().await.clone();
-        let my_owner_attestation = self.owner_attestation.lock().await.clone();
-        let my_demand = self.get_demand();
-        let stale_cutoff =
-            std::time::Instant::now() - std::time::Duration::from_secs(PEER_STALE_SECS);
-        // Gossip wire encoding strips available_model_metadata and available_model_sizes,
-        // and remote ingest ignores them. Avoid an expensive scan_local_inventory_snapshot()
-        // on the hot gossip path.
-        let my_model_metadata: Vec<_> = Vec::new();
-        let my_model_sizes: HashMap<_, _> = HashMap::new();
-        let mut announcements: Vec<PeerAnnouncement> = {
-            let state = self.state.lock().await;
-            state
-                .peers
-                .values()
-                .filter(|p| p.last_seen >= stale_cutoff)
-                .map(|p| PeerAnnouncement {
-                    addr: p.addr.clone(),
-                    role: p.role.clone(),
-                    models: p.models.clone(),
-                    vram_bytes: p.vram_bytes,
-                    model_source: p.model_source.clone(),
-                    serving_models: p.serving_models.clone(),
-                    hosted_models: p.hosted_models_known.then(|| p.hosted_models.clone()),
-                    available_models: p.available_models.clone(),
-                    requested_models: p.requested_models.clone(),
-                    version: p.version.clone(),
-                    model_demand: HashMap::new(),
-                    mesh_id: None,
-                    gpu_name: p.gpu_name.clone(),
-                    hostname: p.hostname.clone(),
-                    is_soc: p.is_soc,
-                    gpu_vram: p.gpu_vram.clone(),
-                    gpu_bandwidth_gbps: p.gpu_bandwidth_gbps.clone(),
-                    available_model_metadata: p.available_model_metadata.clone(),
-                    experts_summary: p.experts_summary.clone(),
-                    available_model_sizes: p.available_model_sizes.clone(),
-                    served_model_descriptors: p.served_model_descriptors.clone(),
-                    served_model_runtime: p.served_model_runtime.clone(),
-                    owner_attestation: p.owner_attestation.clone(),
-                })
-                .collect()
-        };
-        announcements.push(PeerAnnouncement {
-            addr: self.endpoint.addr(),
-            role: my_role,
-            models: my_models,
-            vram_bytes: self.vram_bytes,
-            model_source: my_source,
-            serving_models: my_serving_models,
-            hosted_models: Some(my_hosted_models),
-            available_models: my_available,
-            requested_models: my_requested,
-            version: Some(crate::VERSION.to_string()),
-            model_demand: my_demand,
-            mesh_id: my_mesh_id,
-            gpu_name: if self.enumerate_host {
-                self.gpu_name.clone()
-            } else {
-                None
-            },
-            hostname: if self.enumerate_host {
-                self.hostname.clone()
-            } else {
-                None
-            },
-            is_soc: self.is_soc,
-            gpu_vram: if self.enumerate_host {
-                self.gpu_vram.clone()
-            } else {
-                None
-            },
-            gpu_bandwidth_gbps: self.gpu_bandwidth_gbps.lock().await.as_ref().map(|v| {
-                v.iter()
-                    .map(|f| format!("{:.2}", f))
-                    .collect::<Vec<_>>()
-                    .join(",")
-            }),
-            available_model_metadata: my_model_metadata,
-            experts_summary: None,
-            available_model_sizes: my_model_sizes,
-            served_model_descriptors: my_served_model_descriptors,
-            served_model_runtime: my_model_runtime_descriptors,
-            owner_attestation: my_owner_attestation,
-        });
-        announcements
     }
 }
 
@@ -9467,7 +8529,6 @@ mod tests {
         Ok(())
     }
 }
-
 /// Generate a mesh ID for a new mesh.
 /// Named meshes: `sha256("mesh-llm:" + name + ":" + nostr_pubkey)` — deterministic, unique per creator.
 /// Unnamed meshes: random UUID, persisted to `~/.mesh-llm/mesh-id`.
@@ -9688,75 +8749,22 @@ fn ensure_private_node_key_file(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+mod gossip;
+mod heartbeat;
+#[allow(unused_imports)]
+use gossip::{apply_transitive_ann, peer_meaningfully_changed};
+pub use gossip::{backfill_legacy_descriptors, merge_demand};
+#[allow(unused_imports)]
+use heartbeat::{
+    heartbeat_failure_policy_for_peer, should_remove_connection, HeartbeatFailurePolicy,
+    MOE_RECOVERY_PROBATION_SECS,
+};
+pub(crate) use heartbeat::{
+    moe_recovery_ready_at, peer_is_eligible_for_active_moe, resolve_peer_down,
+};
+
 #[cfg(test)]
-mod public_identity_tests {
-    use super::*;
-    use std::fs;
+mod tests;
 
-    /// Test that mark_was_public / was_previously_public / clear_public_identity
-    /// work correctly.  Uses the real ~/.mesh-llm/ directory (same approach as
-    /// the rotate_keys tests) and restores originals afterward.
-    #[test]
-    fn public_to_private_transition_clears_identity() {
-        let dir = dirs::home_dir().unwrap().join(".mesh-llm");
-        fs::create_dir_all(&dir).ok();
-
-        // Files we may touch:
-        let paths: Vec<std::path::PathBuf> =
-            ["key", "nostr.nsec", "mesh-id", "last-mesh", "was-public"]
-                .iter()
-                .map(|n| dir.join(n))
-                .collect();
-
-        // Save originals so we can restore after the test.
-        let originals: Vec<Option<Vec<u8>>> = paths
-            .iter()
-            .map(|p| {
-                if p.exists() {
-                    Some(fs::read(p).unwrap())
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        // --- Scenario 1: no marker → was_previously_public is false ---
-        let _ = fs::remove_file(dir.join("was-public"));
-        assert!(!was_previously_public(), "should be false when no marker");
-
-        // --- Scenario 2: mark as public → marker exists ---
-        mark_was_public();
-        assert!(was_previously_public(), "should be true after marking");
-
-        // Plant some identity files to verify clear removes them.
-        fs::write(dir.join("key"), b"test-key").unwrap();
-        fs::write(dir.join("nostr.nsec"), b"test-nsec").unwrap();
-        fs::write(dir.join("mesh-id"), b"test-mesh-id").unwrap();
-        fs::write(dir.join("last-mesh"), b"test-last-mesh").unwrap();
-
-        // --- Scenario 3: clear_public_identity removes everything ---
-        clear_public_identity();
-        for name in &["key", "nostr.nsec", "mesh-id", "last-mesh", "was-public"] {
-            assert!(
-                !dir.join(name).exists(),
-                "{name} should be deleted after clear"
-            );
-        }
-        assert!(
-            !was_previously_public(),
-            "marker should be gone after clear"
-        );
-
-        // --- Scenario 4: clear on already-clean directory is fine ---
-        clear_public_identity(); // should not panic
-
-        // Restore originals.
-        for (path, orig) in paths.iter().zip(originals.iter()) {
-            if let Some(data) = orig {
-                fs::write(path, data).ok();
-            } else {
-                let _ = fs::remove_file(path);
-            }
-        }
-    }
-}
+#[cfg(test)]
+mod public_identity_tests;
