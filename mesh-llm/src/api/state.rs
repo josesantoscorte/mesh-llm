@@ -1,5 +1,5 @@
 use crate::mesh;
-use crate::network::affinity;
+use crate::network::{affinity, perf};
 use crate::plugin;
 use serde::Serialize;
 use std::sync::Arc;
@@ -42,6 +42,7 @@ pub(super) struct ApiInner {
     pub(super) node: mesh::Node,
     pub(super) plugin_manager: plugin::PluginManager,
     pub(super) affinity_router: affinity::AffinityRouter,
+    pub(super) perf_tracker: perf::InferenceTracker,
     pub(super) is_host: bool,
     pub(super) is_client: bool,
     pub(super) llama_ready: bool,

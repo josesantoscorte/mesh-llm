@@ -1,6 +1,6 @@
 use super::{RuntimeModelPayload, RuntimeProcessPayload};
 use crate::crypto::{OwnershipStatus, OwnershipSummary};
-use crate::network::affinity;
+use crate::network::{affinity, perf};
 use crate::system::hardware::expand_gpu_names;
 use serde::Serialize;
 
@@ -140,6 +140,7 @@ pub(super) struct StatusPayload {
     pub(super) my_is_soc: Option<bool>,
     pub(super) gpus: Vec<GpuEntry>,
     pub(super) routing_affinity: affinity::AffinityStatsSnapshot,
+    pub(super) inference_perf: perf::InferencePerfSnapshot,
 }
 
 #[derive(Serialize)]

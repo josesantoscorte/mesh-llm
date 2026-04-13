@@ -468,7 +468,7 @@ mod tests {
     use super::*;
     use crate::api::MeshApi;
     use crate::mesh::{Node, NodeRole};
-    use crate::network::affinity;
+    use crate::network::{affinity, perf};
     use crate::plugin::{self};
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
@@ -571,6 +571,7 @@ mod tests {
             0,
             plugin_manager,
             affinity::AffinityRouter::default(),
+            perf::InferenceTracker::default(),
         )
     }
 

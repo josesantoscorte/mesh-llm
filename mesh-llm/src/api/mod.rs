@@ -37,7 +37,7 @@ use self::status::{
 };
 use crate::inference::election;
 use crate::mesh;
-use crate::network::{affinity, nostr, proxy};
+use crate::network::{affinity, nostr, perf, proxy};
 use crate::plugin;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
@@ -215,12 +215,14 @@ impl MeshApi {
         model_size_bytes: u64,
         plugin_manager: plugin::PluginManager,
         affinity_router: affinity::AffinityRouter,
+        perf_tracker: perf::InferenceTracker,
     ) -> Self {
         MeshApi {
             inner: Arc::new(Mutex::new(ApiInner {
                 node,
                 plugin_manager,
                 affinity_router,
+                perf_tracker,
                 is_host: false,
                 is_client: false,
                 llama_ready: false,
@@ -736,6 +738,7 @@ impl MeshApi {
             my_vram_gb,
             inflight_requests,
             routing_affinity,
+            inference_perf,
             model_name,
             model_size_bytes,
             llama_ready,
@@ -757,6 +760,7 @@ impl MeshApi {
                 inner.node.vram_bytes() as f64 / 1e9,
                 inner.node.inflight_requests(),
                 inner.affinity_router.stats_snapshot(),
+                inner.perf_tracker.snapshot(),
                 inner.model_name.clone(),
                 inner.model_size_bytes,
                 inner.llama_ready,
@@ -944,6 +948,7 @@ impl MeshApi {
                 )
             },
             routing_affinity,
+            inference_perf,
         }
     }
 
@@ -1608,6 +1613,7 @@ mod tests {
             0,
             plugin_manager,
             affinity::AffinityRouter::default(),
+            perf::InferenceTracker::default(),
         )
     }
 
@@ -1629,6 +1635,7 @@ mod tests {
             0,
             plugin_manager,
             affinity::AffinityRouter::default(),
+            perf::InferenceTracker::default(),
         )
     }
 

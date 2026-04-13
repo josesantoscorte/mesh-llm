@@ -30,6 +30,7 @@ async fn spawn_api_proxy_test_harness(
         Some(listener),
         false,
         affinity::AffinityRouter::default(),
+        perf::InferenceTracker::default(),
     ));
     (addr, handle)
 }
@@ -54,6 +55,7 @@ async fn spawn_api_proxy_test_harness_with_plugin_manager(
         Some(listener),
         false,
         affinity::AffinityRouter::default(),
+        perf::InferenceTracker::default(),
     ));
     (addr, handle)
 }

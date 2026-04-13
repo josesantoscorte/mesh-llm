@@ -8,6 +8,7 @@ use crate::mesh;
 use crate::network::affinity::{
     prepare_remote_targets_for_request, AffinityRouter, PreparedTargets,
 };
+use crate::network::perf;
 use crate::network::router;
 use crate::plugin;
 use anyhow::{anyhow, bail, Context, Result};
@@ -78,7 +79,11 @@ pub enum PipelineProxyResult {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RouteAttemptResult {
-    Delivered { status_code: u16 },
+    Delivered {
+        status_code: u16,
+        /// Observed time-to-first-token in milliseconds (only for 2xx responses).
+        ttft_ms: Option<u64>,
+    },
     RetryableUnavailable,
     RetryableContextOverflow,
 }
@@ -1320,6 +1325,7 @@ async fn relay_translated_responses_stream<R: AsyncRead + Unpin>(
         let _ = tcp_stream.shutdown().await;
         return Ok(RouteAttemptResult::Delivered {
             status_code: probe.status_code,
+            ttft_ms: None,
         });
     }
 
@@ -1434,6 +1440,7 @@ async fn relay_translated_responses_stream<R: AsyncRead + Unpin>(
     let _ = tcp_stream.shutdown().await;
     Ok(RouteAttemptResult::Delivered {
         status_code: probe.status_code,
+        ttft_ms: None,
     })
 }
 
@@ -1454,6 +1461,7 @@ async fn relay_translated_responses_json<R: AsyncRead + Unpin>(
         let _ = tcp_stream.shutdown().await;
         return Ok(RouteAttemptResult::Delivered {
             status_code: probe.status_code,
+            ttft_ms: None,
         });
     }
 
@@ -1469,6 +1477,7 @@ async fn relay_translated_responses_json<R: AsyncRead + Unpin>(
     let _ = tcp_stream.shutdown().await;
     Ok(RouteAttemptResult::Delivered {
         status_code: probe.status_code,
+        ttft_ms: None,
     })
 }
 
@@ -1643,6 +1652,7 @@ async fn relay_probed_response<R: AsyncRead + Unpin>(
     let _ = tcp_stream.shutdown().await;
     Ok(RouteAttemptResult::Delivered {
         status_code: probe.status_code,
+        ttft_ms: None,
     })
 }
 
@@ -1658,6 +1668,7 @@ async fn route_local_attempt(
         Ok(mut upstream) => {
             let _inflight = node.begin_inflight_request();
             let _ = upstream.set_nodelay(true);
+            let ttft_start = std::time::Instant::now();
             if let Err(err) = upstream.write_all(prefetched).await {
                 tracing::warn!(
                     "API proxy: failed to forward buffered request to local llama-server on {port}: {err}"
@@ -1666,6 +1677,7 @@ async fn route_local_attempt(
             }
             match probe_http_response_local(&mut upstream).await {
                 Ok(probe) => {
+                    let ttft_ms = ttft_start.elapsed().as_millis() as u64;
                     let status_code = probe.status_code;
                     match relay_probed_response(
                         tcp_stream,
@@ -1676,10 +1688,24 @@ async fn route_local_attempt(
                     )
                     .await
                     {
-                        Ok(result) => result,
+                        Ok(_result) => RouteAttemptResult::Delivered {
+                            status_code,
+                            ttft_ms: if (200..300).contains(&status_code) {
+                                Some(ttft_ms)
+                            } else {
+                                None
+                            },
+                        },
                         Err(err) => {
                             tracing::debug!("API proxy (local) ended after commit: {err}");
-                            RouteAttemptResult::Delivered { status_code }
+                            RouteAttemptResult::Delivered {
+                                status_code,
+                                ttft_ms: if (200..300).contains(&status_code) {
+                                    Some(ttft_ms)
+                                } else {
+                                    None
+                                },
+                            }
                         }
                     }
                 }
@@ -1708,6 +1734,7 @@ async fn route_remote_attempt(
 ) -> RouteAttemptResult {
     match node.open_http_tunnel(host_id).await {
         Ok((mut quic_send, mut quic_recv)) => {
+            let ttft_start = std::time::Instant::now();
             if let Err(err) = quic_send.write_all(prefetched).await {
                 tracing::warn!(
                     "API proxy: failed to forward buffered request to host {}: {err}",
@@ -1717,6 +1744,7 @@ async fn route_remote_attempt(
             }
             match probe_http_response(&mut quic_recv).await {
                 Ok(probe) => {
+                    let ttft_ms = ttft_start.elapsed().as_millis() as u64;
                     let status_code = probe.status_code;
                     match relay_probed_response(
                         tcp_stream,
@@ -1727,10 +1755,24 @@ async fn route_remote_attempt(
                     )
                     .await
                     {
-                        Ok(result) => result,
+                        Ok(_result) => RouteAttemptResult::Delivered {
+                            status_code,
+                            ttft_ms: if (200..300).contains(&status_code) {
+                                Some(ttft_ms)
+                            } else {
+                                None
+                            },
+                        },
                         Err(err) => {
                             tracing::debug!("API proxy (remote) ended after commit: {err}");
-                            RouteAttemptResult::Delivered { status_code }
+                            RouteAttemptResult::Delivered {
+                                status_code,
+                                ttft_ms: if (200..300).contains(&status_code) {
+                                    Some(ttft_ms)
+                                } else {
+                                    None
+                                },
+                            }
                         }
                     }
                 }
@@ -1826,7 +1868,10 @@ async fn route_http_endpoint_attempt(
                             tracing::debug!(
                                 "API proxy (external endpoint) ended after commit: {err}"
                             );
-                            RouteAttemptResult::Delivered { status_code }
+                            RouteAttemptResult::Delivered {
+                                status_code,
+                                ttft_ms: None,
+                            }
                         }
                     }
                 }
@@ -1936,6 +1981,7 @@ pub async fn handle_mesh_request(
     tcp_stream: TcpStream,
     track_demand: bool,
     affinity: AffinityRouter,
+    perf_tracker: perf::InferenceTracker,
 ) {
     let mut tcp_stream = tcp_stream;
     let plugin_manager = node.plugin_manager().await;
@@ -2103,13 +2149,19 @@ pub async fn handle_mesh_request(
         )
         .await
         {
-            RouteAttemptResult::Delivered { status_code } => {
+            RouteAttemptResult::Delivered {
+                status_code,
+                ttft_ms,
+            } => {
                 if should_learn_affinity(status_code) {
+                    let target = election::InferenceTarget::Remote(*target_host);
                     if let (Some(name), Some(prefix_hash)) =
                         (effective_model.as_ref(), prepared.learn_prefix_hash)
                     {
-                        let target = election::InferenceTarget::Remote(*target_host);
                         affinity.learn_target(name, prefix_hash, &target);
+                    }
+                    if let (Some(name), Some(ms)) = (effective_model.as_ref(), ttft_ms) {
+                        perf_tracker.record_ttft(name, &target, ms);
                     }
                 }
                 release_request_objects(&node, &request.request_object_request_ids).await;
@@ -2216,10 +2268,19 @@ type RouteModelRequestFn = for<'a> fn(
     &'a [u8],
     ResponseAdapter,
     &'a AffinityRouter,
+    &'a perf::InferenceTracker,
 ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
 
 pub const ROUTE_MODEL_REQUEST: RouteModelRequestFn =
-    |node, tcp_stream, targets, model, parsed_body, prefetched, response_adapter, affinity| {
+    |node,
+     tcp_stream,
+     targets,
+     model,
+     parsed_body,
+     prefetched,
+     response_adapter,
+     affinity,
+     perf_tracker| {
         Box::pin(async move {
             let mut tcp_stream = tcp_stream;
             let ordered_candidates =
@@ -2287,10 +2348,16 @@ pub const ROUTE_MODEL_REQUEST: RouteModelRequestFn =
                 )
                 .await
                 {
-                    RouteAttemptResult::Delivered { status_code } => {
+                    RouteAttemptResult::Delivered {
+                        status_code,
+                        ttft_ms,
+                    } => {
                         if should_learn_affinity(status_code) {
                             if let Some(prefix_hash) = selection.learn_prefix_hash {
                                 affinity.learn_target(model, prefix_hash, &target);
+                            }
+                            if let Some(ms) = ttft_ms {
+                                perf_tracker.record_ttft(model, &target, ms);
                             }
                         }
                         return true;

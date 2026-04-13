@@ -23,7 +23,7 @@ use crate::mesh;
 use crate::mesh::NodeRole;
 use crate::models;
 use crate::models::catalog;
-use crate::network::{affinity, nostr, router, tunnel};
+use crate::network::{affinity, nostr, perf, router, tunnel};
 use crate::plugin;
 use crate::system::{autoupdate, benchmark, hardware};
 use anyhow::{Context, Result};
@@ -1468,6 +1468,7 @@ async fn run_auto(
     }
 
     let affinity_router = affinity::AffinityRouter::new();
+    let perf_tracker = perf::InferenceTracker::new();
 
     // Start bootstrap proxy if joining an existing mesh.
     // This gives instant API access via tunnel while our GPU loads.
@@ -1477,8 +1478,17 @@ async fn run_auto(
         let boot_node = node.clone();
         let boot_port = api_port;
         let boot_affinity = affinity_router.clone();
+        let boot_perf = perf_tracker.clone();
         tokio::spawn(async move {
-            bootstrap_proxy(boot_node, boot_port, stop_rx, cli.listen_all, boot_affinity).await;
+            bootstrap_proxy(
+                boot_node,
+                boot_port,
+                stop_rx,
+                cli.listen_all,
+                boot_affinity,
+                boot_perf,
+            )
+            .await;
         });
         Some(stop_tx)
     } else {
@@ -1647,6 +1657,7 @@ async fn run_auto(
     let proxy_node = node.clone();
     let proxy_rx = target_rx.clone();
     let proxy_affinity = affinity_router.clone();
+    let proxy_perf = perf_tracker.clone();
     let api_control_tx = control_tx.clone();
     tokio::spawn(async move {
         api_proxy(
@@ -1657,6 +1668,7 @@ async fn run_auto(
             existing_listener,
             cli.listen_all,
             proxy_affinity,
+            proxy_perf,
         )
         .await;
     });
@@ -1672,6 +1684,7 @@ async fn run_auto(
             model_size_bytes,
             plugin_manager.clone(),
             affinity_router.clone(),
+            perf_tracker.clone(),
         );
         cs.set_primary_backend("llama".into()).await;
         cs.set_runtime_control(control_tx.clone()).await;
@@ -2249,6 +2262,7 @@ async fn run_passive(
 ) -> Result<Option<String>> {
     let local_port = cli.port;
     let affinity_router = affinity::AffinityRouter::new();
+    let perf_tracker = perf::InferenceTracker::new();
     node.set_display_name(node_display_name(cli, &node)).await;
 
     // Nostr publishing (if --publish, for standby GPU nodes advertising capacity)
@@ -2321,6 +2335,7 @@ async fn run_passive(
             0,
             plugin_manager,
             affinity_router.clone(),
+            perf_tracker.clone(),
         );
         cs.set_nostr_relays(nostr_relays(&cli.nostr_relay)).await;
         cs.set_nostr_discovery(cli.nostr_discovery).await;
@@ -2386,8 +2401,9 @@ async fn run_passive(
                 tracing::info!("Connection from {addr}");
                 let node = node.clone();
                 let affinity = affinity_router.clone();
+                let perf = perf_tracker.clone();
                 tokio::spawn(crate::network::proxy::handle_mesh_request(
-                    node, tcp_stream, true, affinity,
+                    node, tcp_stream, true, affinity, perf,
                 ));
             }
             Some(model_name) = promote_rx.recv() => {

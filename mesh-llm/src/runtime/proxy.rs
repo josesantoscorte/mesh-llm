@@ -1,7 +1,7 @@
 use crate::api;
 use crate::inference::{election, pipeline};
 use crate::mesh;
-use crate::network::{affinity, proxy, router};
+use crate::network::{affinity, perf, proxy, router};
 
 /// Model-aware API proxy. Parses the "model" field from POST request bodies
 /// and routes to the correct host. Falls back to the first available target
@@ -14,6 +14,7 @@ pub(super) async fn api_proxy(
     existing_listener: Option<tokio::net::TcpListener>,
     listen_all: bool,
     affinity: affinity::AffinityRouter,
+    perf_tracker: perf::InferenceTracker,
 ) {
     let listener = match existing_listener {
         Some(l) => l,
@@ -39,6 +40,7 @@ pub(super) async fn api_proxy(
         let targets = target_rx.borrow().clone();
         let node = node.clone();
         let affinity = affinity.clone();
+        let perf_tracker = perf_tracker.clone();
         let control_tx = control_tx.clone();
         tokio::spawn(async move {
             let mut tcp_stream = tcp_stream;
@@ -329,6 +331,7 @@ pub(super) async fn api_proxy(
                                 &request.raw,
                                 request.response_adapter,
                                 &affinity,
+                                &perf_tracker,
                             )
                             .await;
                             proxy::release_request_objects(
@@ -370,6 +373,7 @@ pub(super) async fn bootstrap_proxy(
     mut stop_rx: tokio::sync::mpsc::Receiver<tokio::sync::oneshot::Sender<tokio::net::TcpListener>>,
     listen_all: bool,
     affinity: affinity::AffinityRouter,
+    perf_tracker: perf::InferenceTracker,
 ) {
     let addr = if listen_all { "0.0.0.0" } else { "127.0.0.1" };
     let listener = match tokio::net::TcpListener::bind(format!("{addr}:{port}")).await {
@@ -392,7 +396,8 @@ pub(super) async fn bootstrap_proxy(
                 let _ = tcp_stream.set_nodelay(true);
                 let node = node.clone();
                 let affinity = affinity.clone();
-                tokio::spawn(proxy::handle_mesh_request(node, tcp_stream, true, affinity));
+                let perf = perf_tracker.clone();
+                tokio::spawn(proxy::handle_mesh_request(node, tcp_stream, true, affinity, perf));
             }
             resp_tx = stop_rx.recv() => {
                 if let Some(tx) = resp_tx {
