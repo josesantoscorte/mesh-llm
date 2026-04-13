@@ -1219,11 +1219,12 @@ mod auto_pack_tests {
 #[cfg(test)]
 mod scoring_tests {
     use super::*;
+    use base64::Engine;
     use iroh::{EndpointAddr, EndpointId, SecretKey};
 
     pub(super) fn valid_invite_token(_label: &str) -> String {
         let addr = EndpointAddr {
-            id: EndpointId::from(SecretKey::generate(&mut rand::rng()).public()),
+            id: EndpointId::from(SecretKey::generate(&mut ::rand::rng()).public()),
             addrs: Default::default(),
         };
         let json = serde_json::to_vec(&addr).expect("endpoint addr should serialize");
