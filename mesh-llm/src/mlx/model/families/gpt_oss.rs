@@ -1,4 +1,8 @@
-use super::super::{ModelConfig, TensorPrefixes};
+use super::super::layer::Layer;
+use super::super::{
+    rms_norm_kind, Attention, AttentionKind, GptOssMoE, MlpKind, ModelConfig, QuantizedLinear,
+    QuantizedSwitchLinear, TensorPrefixes,
+};
 use anyhow::{Context, Result};
 use mlx_rs::Array;
 use std::collections::HashMap;
@@ -86,4 +90,67 @@ pub(crate) fn transform_gpt_oss_tensors(
     }
 
     Ok(())
+}
+
+pub(crate) fn build_gpt_oss_layer<FQ, FS>(
+    tensors: &HashMap<String, Array>,
+    p: &str,
+    config: &ModelConfig,
+    head_dim: i32,
+    window_size: Option<i32>,
+    load_qlinear: &FQ,
+    load_switch_linear: &FS,
+) -> Result<Layer>
+where
+    FQ: Fn(&str) -> Result<QuantizedLinear>,
+    FS: Fn(&str) -> Result<QuantizedSwitchLinear>,
+{
+    Ok(Layer {
+        attn: AttentionKind::Standard(Attention {
+            q_proj: load_qlinear(&format!("{p}.self_attn.q_proj"))?,
+            k_proj: load_qlinear(&format!("{p}.self_attn.k_proj"))?,
+            v_proj: load_qlinear(&format!("{p}.self_attn.v_proj"))?,
+            o_proj: load_qlinear(&format!("{p}.self_attn.o_proj"))?,
+            q_norm: None,
+            k_norm: None,
+            v_norm: None,
+            num_heads: config.num_attention_heads,
+            num_kv_heads: config.num_key_value_heads,
+            head_dim,
+            scale: 1.0 / (head_dim as f32).sqrt(),
+            attn_logit_softcapping: None,
+            rope_dim: head_dim,
+            rope_theta: config.rope_theta,
+            rope_traditional: false,
+            window_size,
+            kv_shared_source: None,
+        }),
+        mlp: MlpKind::GptOssMoE(GptOssMoE {
+            switch_gate_proj: load_switch_linear(&format!("{p}.mlp.experts.gate_proj"))?,
+            switch_up_proj: load_switch_linear(&format!("{p}.mlp.experts.up_proj"))?,
+            switch_down_proj: load_switch_linear(&format!("{p}.mlp.experts.down_proj"))?,
+            router: load_qlinear(&format!("{p}.mlp.router"))?,
+            top_k: config.num_experts_per_tok.unwrap_or(1),
+        }),
+        attn_in_norm: Some(rms_norm_kind(
+            tensors
+                .get(&format!("{p}.input_layernorm.weight"))
+                .cloned()
+                .with_context(|| format!("missing {p}.input_layernorm.weight"))?,
+            config.rms_norm_eps,
+            false,
+        )),
+        attn_out_norm: None,
+        mlp_in_norm: Some(rms_norm_kind(
+            tensors
+                .get(&format!("{p}.post_attention_layernorm.weight"))
+                .cloned()
+                .with_context(|| format!("missing {p}.post_attention_layernorm.weight"))?,
+            config.rms_norm_eps,
+            false,
+        )),
+        mlp_out_norm: None,
+        per_layer_input: None,
+        layer_scalar: None,
+    })
 }
