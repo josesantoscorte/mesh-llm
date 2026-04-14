@@ -36,4 +36,9 @@ pub(super) async fn bootstrap_proxy(
 }
 
 #[cfg(test)]
+pub(super) fn callable_models(targets: &election::ModelTargets) -> Vec<String> {
+    crate::network::openai::ingress::callable_models(targets)
+}
+
+#[cfg(test)]
 mod tests;

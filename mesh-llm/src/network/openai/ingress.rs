@@ -53,7 +53,7 @@ pub(crate) async fn api_proxy(
             {
                 Ok(mut request) => {
                     if proxy::is_models_list_request(&request.method, &request.path) {
-                        let mut models: Vec<String> = targets.targets.keys().cloned().collect();
+                        let mut models = callable_models(&targets);
                         if let Some(plugin_manager) = plugin_manager.as_ref() {
                             if let Ok(mut external_models) = plugin_manager.inference_models().await
                             {
@@ -139,8 +139,7 @@ pub(crate) async fn api_proxy(
                         request.ensure_body_json();
                         if let Some(body_json) = request.body_json.as_ref() {
                             let cl = router::classify(body_json);
-                            let mut available_models: Vec<String> =
-                                targets.targets.keys().cloned().collect();
+                            let mut available_models = callable_models(&targets);
                             if let Some(plugin_manager) = plugin_manager.as_ref() {
                                 if let Ok(external_models) = plugin_manager.inference_models().await
                                 {
@@ -431,4 +430,19 @@ fn first_available_target(targets: &election::ModelTargets) -> election::Inferen
         }
     }
     election::InferenceTarget::None
+}
+
+pub(crate) fn callable_models(targets: &election::ModelTargets) -> Vec<String> {
+    let mut models: Vec<String> = targets
+        .targets
+        .iter()
+        .filter_map(|(name, hosts)| {
+            hosts
+                .iter()
+                .any(|target| !matches!(target, election::InferenceTarget::None))
+                .then(|| name.clone())
+        })
+        .collect();
+    models.sort();
+    models
 }
