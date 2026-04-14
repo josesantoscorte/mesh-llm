@@ -110,9 +110,7 @@ fn wait_for_status(port: u16, timeout: Duration) -> Result<String, FixtureError>
                     .map_err(|e| FixtureError::InvalidStatusResponse(e.to_string()))?;
                 let token = body["token"]
                     .as_str()
-                    .ok_or_else(|| {
-                        FixtureError::InvalidStatusResponse("missing token".into())
-                    })?
+                    .ok_or_else(|| FixtureError::InvalidStatusResponse("missing token".into()))?
                     .to_string();
                 return Ok(token);
             }
