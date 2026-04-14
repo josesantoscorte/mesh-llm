@@ -1,4 +1,14 @@
+use super::attention::apply_rope;
+use super::config::{
+    attention_window_size_for_layer, kv_shared_source_for_layer, normalized_model_config_json,
+};
+use super::family::{
+    ensure_supported_mlx_model, model_architecture, uses_traditional_rope, ModelArchitecture,
+};
 use super::*;
+use serde_json::Value;
+use serial_test::serial;
+use std::collections::HashMap;
 
 #[test]
 fn mlx_model_dir_accepts_directory_and_known_files() {
@@ -1244,6 +1254,7 @@ fn dense_model_config_is_allowed_without_quantization_block() {
 }
 
 #[test]
+#[serial]
 fn dense_embeddings_can_project_logits_through_as_linear() {
     let weight = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], &[3, 2]);
     let embedding = QuantizedEmbedding {
@@ -1298,6 +1309,7 @@ fn assert_arrays_close(actual: &Array, expected: &Array, tol: f32) {
 }
 
 #[test]
+#[serial]
 fn attention_kv_cache_matches_no_cache_for_incremental_decode() {
     let attn = Attention {
         q_proj: dense_linear(&[1.0, 0.0, 0.0, 1.0], 2, 2),
@@ -1336,6 +1348,7 @@ fn attention_kv_cache_matches_no_cache_for_incremental_decode() {
 }
 
 #[test]
+#[serial]
 fn attention_quantized_kv_cache_stays_close_to_dense_cache() {
     let dim = 32i32;
     let attn = Attention {
@@ -1386,6 +1399,7 @@ fn attention_quantized_kv_cache_stays_close_to_dense_cache() {
 }
 
 #[test]
+#[serial]
 fn attention_quantized_kv_cache_threshold_migrates_after_dense_prefix() {
     let dim = 32i32;
     let attn = Attention {
@@ -1445,6 +1459,7 @@ fn attention_quantized_kv_cache_threshold_migrates_after_dense_prefix() {
 }
 
 #[test]
+#[serial]
 fn rotating_kv_cache_cannot_trim_before_retained_window() {
     let mut cache = KVCache::new_rotating(2, 0);
     let k = Array::from_slice(&[1.0f32, 2.0], &[1, 1, 1, 2]);
@@ -1461,6 +1476,7 @@ fn rotating_kv_cache_cannot_trim_before_retained_window() {
 }
 
 #[test]
+#[serial]
 fn rotating_kv_cache_rewind_and_append_preserves_temporal_order() {
     let mut cache = KVCache::new_rotating(3, 0);
     for token in [1.0f32, 2.0, 3.0] {
@@ -1482,6 +1498,7 @@ fn rotating_kv_cache_rewind_and_append_preserves_temporal_order() {
 }
 
 #[test]
+#[serial]
 fn standard_kv_cache_trim_materializes_prefix() {
     let mut cache = KVCache::new();
     let k = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[1, 1, 2, 2]);
@@ -1499,6 +1516,7 @@ fn standard_kv_cache_trim_materializes_prefix() {
 }
 
 #[test]
+#[serial]
 fn quantized_kv_cache_trim_materializes_prefix() {
     let mut cache = KVCache::new_quantized(64, 8, 0);
     let k_data: Vec<f32> = (0..(3 * 64)).map(|i| (i as f32 / 64.0) - 1.0).collect();
@@ -1515,6 +1533,7 @@ fn quantized_kv_cache_trim_materializes_prefix() {
 }
 
 #[test]
+#[serial]
 fn attention_sliding_window_cache_matches_no_cache_for_incremental_decode() {
     let attn = Attention {
         q_proj: dense_linear(&[1.0, 0.0, 0.0, 1.0], 2, 2),
@@ -1553,6 +1572,7 @@ fn attention_sliding_window_cache_matches_no_cache_for_incremental_decode() {
 }
 
 #[test]
+#[serial]
 fn phi3_tensor_transform_splits_fused_attention_and_mlp_weights() {
     let prefixes = TensorPrefixes {
         model: "model".to_string(),
@@ -1637,6 +1657,7 @@ fn phi3_tensor_transform_splits_fused_attention_and_mlp_weights() {
 }
 
 #[test]
+#[serial]
 fn gpt_oss_tensor_transform_splits_interleaved_expert_gate_up_tensors() {
     let prefixes = TensorPrefixes {
         model: "model".to_string(),
@@ -1731,6 +1752,7 @@ fn gpt_oss_tensor_transform_splits_interleaved_expert_gate_up_tensors() {
 }
 
 #[test]
+#[serial]
 fn gemma3_tensor_transform_drops_multimodal_tensors_and_tied_lm_head() {
     let prefixes = TensorPrefixes {
         model: "language_model.model".to_string(),
@@ -1786,6 +1808,7 @@ fn gemma3_tensor_transform_drops_multimodal_tensors_and_tied_lm_head() {
 }
 
 #[test]
+#[serial]
 fn gemma4_tensor_transform_normalizes_text_prefixes_and_drops_multimodal_tensors() {
     let prefixes = TensorPrefixes {
         model: "language_model.model".to_string(),
@@ -1850,6 +1873,7 @@ fn gemma4_tensor_transform_normalizes_text_prefixes_and_drops_multimodal_tensors
 }
 
 #[test]
+#[serial]
 fn olmo2_tensor_transform_drops_rotary_inv_freq_tensors() {
     let prefixes = TensorPrefixes {
         model: "model".to_string(),
@@ -1900,6 +1924,7 @@ fn olmo2_tensor_transform_drops_rotary_inv_freq_tensors() {
 }
 
 #[test]
+#[serial]
 fn llama_like_tensor_transform_drops_inv_freq_and_tied_lm_head() {
     let prefixes = TensorPrefixes {
         model: "model".to_string(),

@@ -117,10 +117,10 @@ impl CachedKv {
 }
 
 pub struct KVCache {
-    keys: Option<Array>,
-    values: Option<Array>,
-    qkeys: Option<QuantizedCacheArrays>,
-    qvalues: Option<QuantizedCacheArrays>,
+    pub(super) keys: Option<Array>,
+    pub(super) values: Option<Array>,
+    pub(super) qkeys: Option<QuantizedCacheArrays>,
+    pub(super) qvalues: Option<QuantizedCacheArrays>,
     start_offset: usize,
     offset: usize,
     idx: usize,
@@ -179,7 +179,7 @@ impl KVCache {
         self.offset.saturating_sub(self.start_offset)
     }
 
-    fn retained_start(&self) -> usize {
+    pub(super) fn retained_start(&self) -> usize {
         self.start_offset
     }
 

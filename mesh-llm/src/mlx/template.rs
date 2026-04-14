@@ -566,10 +566,14 @@ fn normalize_hf_messages(template: &str, messages: Value) -> Value {
     let Some(messages) = messages.as_array() else {
         return messages;
     };
-    let fill_tool_calls = message_field_mentioned(template, "tool_calls");
-    let fill_tool_call_id = message_field_mentioned(template, "tool_call_id");
-    let fill_name = message_field_mentioned(template, "name");
-    let fill_tool_responses = message_field_mentioned(template, "tool_responses");
+    let fill_tool_calls = message_field_mentioned(template, "tool_calls")
+        && !message_field_membership_checked(template, "tool_calls");
+    let fill_tool_call_id = message_field_mentioned(template, "tool_call_id")
+        && !message_field_membership_checked(template, "tool_call_id");
+    let fill_name = message_field_mentioned(template, "name")
+        && !message_field_membership_checked(template, "name");
+    let fill_tool_responses = message_field_mentioned(template, "tool_responses")
+        && !message_field_membership_checked(template, "tool_responses");
     let trim_assistant_history = is_old_qwen_reasoning_template(template);
 
     Value::Array(
@@ -610,6 +614,11 @@ fn message_field_mentioned(template: &str, field: &str) -> bool {
     template.contains(&format!("message['{field}']"))
         || template.contains(&format!("message[\"{field}\"]"))
         || template.contains(&format!("message.{field}"))
+}
+
+fn message_field_membership_checked(template: &str, field: &str) -> bool {
+    template.contains(&format!("'{field}' in message"))
+        || template.contains(&format!("\"{field}\" in message"))
 }
 
 fn absent_tools_value(template: &str) -> Value {

@@ -30,6 +30,7 @@ pub(crate) fn transform_llama_like_tensors(
 pub(crate) fn build_standard_layer<FQ>(
     tensors: &HashMap<String, Array>,
     p: &str,
+    layer_index: usize,
     arch: ModelArchitecture,
     config: &ModelConfig,
     layer_type: Option<&str>,
@@ -54,11 +55,6 @@ pub(crate) fn build_standard_layer<FQ>(
 where
     FQ: Fn(&str) -> Result<QuantizedLinear>,
 {
-    let layer_index = p
-        .rsplit('.')
-        .nth(1)
-        .and_then(|s| s.parse::<usize>().ok())
-        .context("failed to parse standard layer index")?;
     let is_full_attention = arch.is_gemma4() && matches!(layer_type, Some("full_attention"));
     let layer_head_dim = if is_full_attention {
         config.global_head_dim.unwrap_or(head_dim)

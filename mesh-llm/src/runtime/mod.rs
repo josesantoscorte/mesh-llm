@@ -2878,6 +2878,7 @@ mod tests {
             resolved_path: PathBuf::from("/tmp/Qwen3-8B-Q4_K_M.gguf"),
             mmproj_path: None,
             ctx_size: Some(8192),
+            backend_hint: StartupBackendHint::Auto,
             gpu_id: specs[0].gpu_id.clone(),
             pinned_gpu: None,
         }];
@@ -2932,6 +2933,7 @@ mod tests {
             resolved_path: PathBuf::from("/tmp/Qwen3-8B-Q4_K_M.gguf"),
             mmproj_path: None,
             ctx_size: None,
+            backend_hint: StartupBackendHint::Auto,
             gpu_id: specs[0].gpu_id.clone(),
             pinned_gpu: None,
         }];
@@ -2958,6 +2960,7 @@ mod tests {
             model_ref: PathBuf::from("Qwen3-8B-Q4_K_M"),
             mmproj_ref: None,
             ctx_size: None,
+            backend_hint: StartupBackendHint::Auto,
             gpu_id: None,
             config_owned: true,
         }];
@@ -2966,6 +2969,7 @@ mod tests {
             resolved_path: PathBuf::from("/tmp/Qwen3-8B-Q4_K_M.gguf"),
             mmproj_path: None,
             ctx_size: None,
+            backend_hint: StartupBackendHint::Auto,
             gpu_id: None,
             pinned_gpu: None,
         }];
@@ -2992,6 +2996,7 @@ mod tests {
             model_ref: PathBuf::from("Qwen3-8B-Q4_K_M"),
             mmproj_ref: None,
             ctx_size: Some(4096),
+            backend_hint: StartupBackendHint::Auto,
             gpu_id: Some("uuid:GPU-123".into()),
             config_owned: true,
         }];
@@ -3000,6 +3005,7 @@ mod tests {
             resolved_path: PathBuf::from("/tmp/Qwen3-8B-Q4_K_M.gguf"),
             mmproj_path: None,
             ctx_size: Some(4096),
+            backend_hint: StartupBackendHint::Auto,
             gpu_id: Some("uuid:GPU-123".into()),
             pinned_gpu: None,
         }];
@@ -3027,6 +3033,7 @@ mod tests {
             model_ref: PathBuf::from("Qwen3-8B-Q4_K_M"),
             mmproj_ref: None,
             ctx_size: Some(4096),
+            backend_hint: StartupBackendHint::Auto,
             gpu_id: Some("uuid:GPU-123".into()),
             config_owned: true,
         }];
@@ -3035,6 +3042,7 @@ mod tests {
             resolved_path: PathBuf::from("/tmp/Qwen3-8B-Q4_K_M.gguf"),
             mmproj_path: None,
             ctx_size: Some(4096),
+            backend_hint: StartupBackendHint::Auto,
             gpu_id: Some("uuid:GPU-123".into()),
             pinned_gpu: None,
         }];
@@ -3061,6 +3069,7 @@ mod tests {
             model_ref: PathBuf::from("Qwen3-8B-Q4_K_M"),
             mmproj_ref: None,
             ctx_size: None,
+            backend_hint: StartupBackendHint::Auto,
             gpu_id: Some("pci:0000:b3:00.0".into()),
             config_owned: true,
         }];
@@ -3069,6 +3078,7 @@ mod tests {
             resolved_path: PathBuf::from("/tmp/Qwen3-8B-Q4_K_M.gguf"),
             mmproj_path: None,
             ctx_size: None,
+            backend_hint: StartupBackendHint::Auto,
             gpu_id: Some("pci:0000:b3:00.0".into()),
             pinned_gpu: None,
         }];
@@ -3097,6 +3107,7 @@ mod tests {
             resolved_path: PathBuf::from("/tmp/Qwen3-8B-Q4_K_M.gguf"),
             mmproj_path: None,
             ctx_size: Some(8192),
+            backend_hint: StartupBackendHint::Auto,
             gpu_id: Some("pci:0000:65:00.0".into()),
             pinned_gpu: Some(StartupPinnedGpuTarget {
                 index: 0,
@@ -3119,6 +3130,7 @@ mod tests {
             resolved_path: PathBuf::from("/tmp/Qwen3-8B-Q4_K_M.gguf"),
             mmproj_path: None,
             ctx_size: Some(8192),
+            backend_hint: StartupBackendHint::Auto,
             gpu_id: Some("pci:0000:65:00.0".into()),
             pinned_gpu: Some(StartupPinnedGpuTarget {
                 index: 0,
@@ -3140,6 +3152,7 @@ mod tests {
             resolved_path: PathBuf::from("/tmp/Qwen3-8B-Q4_K_M.gguf"),
             mmproj_path: None,
             ctx_size: Some(8192),
+            backend_hint: StartupBackendHint::Auto,
             gpu_id: Some("pci:0000:65:00.0".into()),
             pinned_gpu: Some(StartupPinnedGpuTarget {
                 index: 0,

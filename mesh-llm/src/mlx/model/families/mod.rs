@@ -171,6 +171,7 @@ where
 pub(crate) fn build_standard_layer<FQ>(
     tensors: &HashMap<String, Array>,
     p: &str,
+    layer_index: usize,
     arch: ModelArchitecture,
     config: &ModelConfig,
     layer_type: Option<&str>,
@@ -198,6 +199,7 @@ where
     llama_like::build_standard_layer(
         tensors,
         p,
+        layer_index,
         arch,
         config,
         layer_type,

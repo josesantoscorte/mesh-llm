@@ -388,6 +388,7 @@ impl MlxModel {
             layers.push(build_standard_layer(
                 &tensors,
                 &p,
+                i as usize,
                 arch,
                 &config,
                 layer_type,
