@@ -409,6 +409,15 @@ pub async fn download_hf_repo_file(
     revision: Option<&str>,
     file: &str,
 ) -> Result<PathBuf> {
+    download_hf_repo_file_with_progress(repo, revision, file, true).await
+}
+
+pub async fn download_hf_repo_file_with_progress(
+    repo: &str,
+    revision: Option<&str>,
+    file: &str,
+    _progress: bool,
+) -> Result<PathBuf> {
     let revision = revision.unwrap_or("main").to_string();
     let asset = HfAsset {
         repo: repo.to_string(),
@@ -429,6 +438,13 @@ pub async fn download_hf_repo_file(
 }
 
 pub async fn download_model(model: &CatalogModel) -> Result<PathBuf> {
+    download_model_with_progress(model, true).await
+}
+
+pub async fn download_model_with_progress(
+    model: &CatalogModel,
+    _progress: bool,
+) -> Result<PathBuf> {
     let hf_assets: Option<Vec<HfAsset>> = std::iter::once(model.url.as_str())
         .chain(model.extra_files.iter().map(|asset| asset.url.as_str()))
         .chain(model.mmproj.iter().map(|asset| asset.url.as_str()))

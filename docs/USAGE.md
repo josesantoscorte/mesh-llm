@@ -2,12 +2,20 @@
 
 This page keeps the longer operational reference out of the top-level README.
 
+For command-by-command CLI usage, model resolution rules, and JSON automation examples, see [CLI.md](./CLI.md).
+
 ## Installation details
 
 Install the latest release bundle:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/michaelneale/mesh-llm/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Mesh-LLM/mesh-llm/main/install.sh | bash
+```
+
+To opt into the latest published prerelease bundle instead:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Mesh-LLM/mesh-llm/main/install.sh | bash -s -- --pre-release
 ```
 
 The installer probes your machine, recommends a flavor, and asks what to install.
@@ -15,7 +23,7 @@ The installer probes your machine, recommends a flavor, and asks what to install
 For a non-interactive install, set the flavor explicitly:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/michaelneale/mesh-llm/main/install.sh | MESH_LLM_INSTALL_FLAVOR=vulkan bash
+curl -fsSL https://raw.githubusercontent.com/Mesh-LLM/mesh-llm/main/install.sh | MESH_LLM_INSTALL_FLAVOR=vulkan bash
 ```
 
 Release bundles install flavor-specific llama.cpp binaries:
@@ -35,7 +43,7 @@ mesh-llm serve --llama-flavor vulkan --model Qwen2.5-32B
 Source builds must use `just`:
 
 ```bash
-git clone https://github.com/michaelneale/mesh-llm
+git clone https://github.com/Mesh-LLM/mesh-llm
 cd mesh-llm
 just build
 ```
@@ -75,7 +83,7 @@ Bare `mesh-llm serve` loads startup models from `[[models]]` in `~/.mesh-llm/con
 To install Mesh LLM as a per-user background service:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/michaelneale/mesh-llm/main/install.sh | bash -s -- --service
+curl -fsSL https://raw.githubusercontent.com/Mesh-LLM/mesh-llm/main/install.sh | bash -s -- --service
 ```
 
 Service installs are user-scoped:
@@ -268,9 +276,11 @@ mesh-llm models updates Qwen/Qwen3-8B-GGUF
 
 ```bash
 mesh-llm gpus
+mesh-llm gpus --json
+mesh-llm gpu benchmark --json
 ```
 
-This prints the local GPU inventory with stable IDs, backend device names, VRAM, unified-memory status, and cached bandwidth if a benchmark fingerprint is already present.
+This prints the local GPU inventory with stable IDs, backend device names, VRAM, unified-memory status, and cached bandwidth when a benchmark fingerprint is already present. Add `--json` for machine-readable inventory output, or run `mesh-llm gpu benchmark --json` to refresh the cached fingerprint and print the benchmark summary as JSON.
 
 ## Local runtime control
 

@@ -1,7 +1,13 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
 
-import { App, ChatPage } from "./App";
+import {
+  App,
+  attachmentForMessage,
+  ChatPage,
+  describeImageAttachmentForPrompt,
+  describeRenderedPagesAsText,
+} from "./App";
 
 function buildProps(
   overrides: Partial<Parameters<typeof ChatPage>[0]> = {},
@@ -32,13 +38,12 @@ function buildProps(
     setSelectedModel: vi.fn(),
     selectedModelNodeCount: 1,
     selectedModelVramGb: 12,
-    selectedModelVision: true,
     selectedModelAudio: true,
     selectedModelMultimodal: true,
     composerError: null,
     setComposerError: vi.fn(),
     attachmentSendIssue: null,
-    imageDescriptionInProgress: false,
+    attachmentPreparationMessage: null,
     pendingAttachments: [],
     setPendingAttachments: vi.fn(),
     conversations: [
@@ -99,7 +104,8 @@ const statusTemplate = {
   gpus: [] as unknown[],
 };
 
-const modelsPayload = { mesh_models: [] };
+let statusPayload = createStatusPayload();
+let modelsPayload = { mesh_models: [] as Array<Record<string, unknown>> };
 const mockFetch = vi.fn();
 
 function createStatusPayload() {
@@ -132,7 +138,7 @@ function setupFetchMock() {
   mockFetch.mockImplementation((input: RequestInfo | URL) => {
     const url = getRequestUrl(input);
     if (url.endsWith("/api/status")) {
-      return Promise.resolve(createResponse(createStatusPayload()));
+      return Promise.resolve(createResponse(statusPayload));
     }
     if (url.endsWith("/api/models")) {
       return Promise.resolve(createResponse(modelsPayload));
@@ -195,6 +201,8 @@ beforeAll(() => {
 });
 
 beforeEach(() => {
+  statusPayload = createStatusPayload();
+  modelsPayload = { mesh_models: [] };
   setupFetchMock();
   Object.defineProperty(window, "EventSource", {
     configurable: true,
@@ -248,6 +256,58 @@ describe("ChatPage", () => {
     expect(screen.getByTestId("composer-error")).toHaveTextContent(
       "Selected model does not support the attached media.",
     );
+  });
+
+  it("shows attachment preparation progress and disables send", () => {
+    render(
+      <ChatPage
+        {...buildProps({
+          attachmentPreparationMessage: "Preparing PDF in browser…",
+          pendingAttachments: [
+            {
+              id: "att-pdf",
+              kind: "file",
+              dataUrl: "data:application/pdf;base64,abc",
+              mimeType: "application/pdf",
+              fileName: "scan.pdf",
+              status: "uploading",
+            },
+          ],
+        })}
+      />,
+    );
+
+    expect(screen.getByText("Preparing PDF in browser…")).toBeInTheDocument();
+    expect(screen.getByTestId("chat-send")).toBeDisabled();
+  });
+
+  it("shows failed image-description state with retry affordance", () => {
+    render(
+      <ChatPage
+        {...buildProps({
+          pendingAttachments: [
+            {
+              id: "att-image-failed",
+              kind: "image",
+              dataUrl: "data:image/png;base64,abc",
+              mimeType: "image/png",
+              fileName: "legacy.png",
+              status: "failed",
+              extractionSummary: "Image description failed — retry or send placeholder text",
+              error: "Image description failed: model init failed",
+            },
+          ],
+        })}
+      />,
+    );
+
+    expect(screen.getByText("Retry")).toBeInTheDocument();
+    expect(
+      screen.getByText("Image description failed: model init failed"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("Image description failed — retry or send placeholder text"),
+    ).toBeInTheDocument();
   });
 
   it("shows Queue button label and calls onSubmit when isSending=true", () => {
@@ -330,6 +390,32 @@ describe("App routing and status", () => {
     const networkLink = await screen.findByRole("link", { name: "Network" });
     expect(networkLink).toHaveAttribute("aria-current", "page");
     await waitFor(() => expect(window.location.pathname).toBe("/dashboard"));
+    expect(screen.queryByRole("button", { name: /New chat/i })).not.toBeInTheDocument();
+  });
+
+  it("mobile unknown path fallback also syncs dashboard state", async () => {
+    const previousInnerWidth = window.innerWidth;
+    Object.defineProperty(window, "innerWidth", {
+      configurable: true,
+      writable: true,
+      value: 640,
+    });
+    setPath("/unknown-path");
+
+    try {
+      render(<App />);
+
+      const networkLink = await screen.findByRole("link", { name: "Network" });
+      expect(networkLink).toHaveAttribute("aria-current", "page");
+      await waitFor(() => expect(window.location.pathname).toBe("/dashboard"));
+      expect(screen.queryByRole("button", { name: /New chat/i })).not.toBeInTheDocument();
+    } finally {
+      Object.defineProperty(window, "innerWidth", {
+        configurable: true,
+        writable: true,
+        value: previousInnerWidth,
+      });
+    }
   });
 
   it("/dashboard route renders without redirecting to /config", async () => {
@@ -339,6 +425,7 @@ describe("App routing and status", () => {
     const networkLink = await screen.findByRole("link", { name: "Network" });
     expect(networkLink).toHaveAttribute("aria-current", "page");
     await waitFor(() => expect(window.location.pathname).toBe("/dashboard"));
+    expect(screen.queryByRole("button", { name: /New chat/i })).not.toBeInTheDocument();
   });
 
   it("/chat route renders chat section content", async () => {
@@ -348,6 +435,10 @@ describe("App routing and status", () => {
     const chatLink = await screen.findByRole("link", { name: "Chat" });
     expect(chatLink).toHaveAttribute("aria-current", "page");
     await screen.findByRole("button", { name: /New chat/i });
+    await waitFor(() => expect(window.location.pathname).toBe("/chat"));
+    expect(
+      screen.queryByRole("link", { current: "page", name: "Network" }),
+    ).not.toBeInTheDocument();
   });
 
   it("boots /api/status on mount and consumes status payload", async () => {
@@ -360,5 +451,133 @@ describe("App routing and status", () => {
       ),
     );
     await screen.findByText("Mesh LLM v1.0.0");
+  });
+
+  it("keeps client chat disabled until /api/models reports a warm model", async () => {
+    statusPayload = {
+      ...createStatusPayload(),
+      is_client: true,
+      is_host: false,
+      llama_ready: false,
+      model_name: "ghost-model",
+      hosted_models: [],
+      serving_models: [],
+    };
+    setPath("/chat");
+    render(<App />);
+
+    const input = await screen.findByTestId("chat-input");
+    await waitFor(() =>
+      expect(mockFetch.mock.calls.some((call) => call[0] === "/api/models")).toBe(
+        true,
+      ),
+    );
+    expect(input).toBeDisabled();
+    expect(input).toHaveAttribute("placeholder", "Waiting for a warm model...");
+    expect(screen.getByTestId("chat-send")).toBeDisabled();
+  });
+});
+
+describe("describeRenderedPagesAsText", () => {
+  it("combines page descriptions and preserves failures as placeholders", async () => {
+    const onProgress = vi.fn();
+    const describe = vi
+      .fn<
+        (dataUrl: string) => Promise<{
+          combinedText: string;
+          description: string;
+          ocrText: string;
+        }>
+      >()
+      .mockResolvedValueOnce({
+        combinedText: "First page OCR",
+        description: "First page OCR",
+        ocrText: "First page OCR",
+      })
+      .mockRejectedValueOnce(new Error("boom"))
+      .mockResolvedValueOnce({
+        combinedText: "",
+        description: "",
+        ocrText: "",
+      });
+
+    const text = await describeRenderedPagesAsText(
+      [
+        "data:image/png;base64,one",
+        "data:image/png;base64,two",
+        "data:image/png;base64,three",
+      ],
+      { describe, onProgress },
+    );
+
+    expect(text).toContain("[Page 1]\nFirst page OCR");
+    expect(text).toContain("[Page 2]\n[Unable to describe page]");
+    expect(text).toContain("[Page 3]\n[Unable to describe page]");
+    expect(onProgress).toHaveBeenNthCalledWith(
+      1,
+      "Describing scanned PDF page 1/3...",
+    );
+    expect(onProgress).toHaveBeenNthCalledWith(
+      2,
+      "Describing scanned PDF page 2/3...",
+    );
+    expect(onProgress).toHaveBeenNthCalledWith(
+      3,
+      "Describing scanned PDF page 3/3...",
+    );
+  });
+});
+
+describe("describeImageAttachmentForPrompt", () => {
+  it("returns image text and summary on success", async () => {
+    const describe = vi.fn<typeof describeImageAttachmentForPrompt extends never ? never : any>().mockResolvedValue({
+      combinedText: "A cat on a chair",
+      description: "A cat on a chair",
+      ocrText: "",
+    });
+
+    const result = await describeImageAttachmentForPrompt(
+      "data:image/png;base64,abc",
+      { describe },
+    );
+
+    expect(result).toEqual({
+      imageDescription: "A cat on a chair",
+      extractionSummary: "Described by local vision",
+    });
+  });
+
+  it("returns a visible warning payload on failure", async () => {
+    const describe = vi.fn().mockRejectedValue(new Error("boom"));
+
+    const result = await describeImageAttachmentForPrompt(
+      "data:image/png;base64,abc",
+      { describe },
+    );
+
+    expect(result.imageDescription).toBeUndefined();
+    expect(result.extractionSummary).toBe(
+      "Image description failed — retry or send placeholder text",
+    );
+    expect(result.error).toContain("Image description failed: boom");
+  });
+});
+
+describe("attachmentForMessage", () => {
+  it("drops rendered page images once extracted text exists", () => {
+    const attachment = attachmentForMessage({
+      id: "att-pdf",
+      kind: "file",
+      dataUrl: "data:application/pdf;base64,abc",
+      mimeType: "application/pdf",
+      fileName: "scan.pdf",
+      status: "pending",
+      extractedText: "Recovered text",
+      renderedPageImages: ["data:image/png;base64,one"],
+      extractionSummary: "1 page described",
+    });
+
+    expect(attachment.extractedText).toBe("Recovered text");
+    expect(attachment.renderedPageImages).toBeUndefined();
   });
 });

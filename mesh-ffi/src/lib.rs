@@ -12,6 +12,8 @@ uniffi::setup_scaffolding!("mesh_ffi");
 pub enum FfiError {
     #[error("invalid invite token")]
     InvalidInviteToken,
+    #[error("invalid owner keypair")]
+    InvalidOwnerKeypair,
     #[error("join failed")]
     JoinFailed,
     #[error("discovery failed")]
@@ -109,17 +111,29 @@ pub fn create_client(
     owner_keypair_bytes_hex: String,
     invite_token: String,
 ) -> Result<Arc<MeshClientHandle>, FfiError> {
-    let _ = owner_keypair_bytes_hex;
     let token = invite_token
         .parse::<InviteToken>()
         .map_err(|_| FfiError::InvalidInviteToken)?;
-    let kp = OwnerKeypair::generate();
+    let kp = parse_owner_keypair(&owner_keypair_bytes_hex)?;
     let client = ClientBuilder::new(kp, token)
         .build()
-        .map_err(|_| FfiError::JoinFailed)?;
+        .map_err(|_| FfiError::HostUnavailable)?;
     Ok(Arc::new(MeshClientHandle {
         inner: Mutex::new(client),
     }))
+}
+
+fn parse_owner_keypair(owner_keypair_bytes_hex: &str) -> Result<OwnerKeypair, FfiError> {
+    if owner_keypair_bytes_hex.trim().is_empty() {
+        return Ok(OwnerKeypair::generate());
+    }
+
+    let raw = hex::decode(owner_keypair_bytes_hex).map_err(|_| FfiError::InvalidOwnerKeypair)?;
+    if raw.len() != 64 {
+        return Err(FfiError::InvalidOwnerKeypair);
+    }
+
+    OwnerKeypair::from_bytes(&raw[..32], &raw[32..]).map_err(|_| FfiError::InvalidOwnerKeypair)
 }
 
 #[uniffi::export]

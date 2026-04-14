@@ -5,6 +5,107 @@ use crate::protocol::NODE_PROTOCOL_GENERATION;
 use iroh::{EndpointAddr, EndpointId};
 use std::collections::HashMap;
 
+fn split_optional_csv(values: Option<&str>) -> Vec<Option<String>> {
+    values
+        .map(|values| {
+            values
+                .split(',')
+                .map(|value| {
+                    let value = value.trim();
+                    (!value.is_empty()).then(|| value.to_string())
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn join_optional_csv(values: &[Option<String>]) -> Option<String> {
+    if values.is_empty() {
+        return None;
+    }
+
+    let has_present_value = values.iter().any(|value| {
+        value
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+    });
+
+    if !has_present_value {
+        return None;
+    }
+
+    Some(
+        values
+            .iter()
+            .map(|value| value.clone().unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join(","),
+    )
+}
+
+fn local_owner_attestation_to_proto(
+    attestation: &crate::crypto::SignedNodeOwnership,
+) -> Option<crate::proto::node::SignedNodeOwnership> {
+    let owner_sign_public_key = match hex::decode(&attestation.claim.owner_sign_public_key) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::warn!(
+                "dropping local owner attestation from gossip: invalid owner_sign_public_key hex: {err}"
+            );
+            return None;
+        }
+    };
+    let node_endpoint_id = match hex::decode(&attestation.claim.node_endpoint_id) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::warn!(
+                "dropping local owner attestation from gossip: invalid node_endpoint_id hex: {err}"
+            );
+            return None;
+        }
+    };
+    let signature = match hex::decode(&attestation.signature) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::warn!(
+                "dropping local owner attestation from gossip: invalid signature hex: {err}"
+            );
+            return None;
+        }
+    };
+    Some(crate::proto::node::SignedNodeOwnership {
+        version: attestation.claim.version,
+        cert_id: attestation.claim.cert_id.clone(),
+        owner_id: attestation.claim.owner_id.clone(),
+        owner_sign_public_key,
+        node_endpoint_id,
+        issued_at_unix_ms: attestation.claim.issued_at_unix_ms,
+        expires_at_unix_ms: attestation.claim.expires_at_unix_ms,
+        node_label: attestation.claim.node_label.clone(),
+        hostname_hint: attestation.claim.hostname_hint.clone(),
+        signature,
+    })
+}
+
+fn proto_owner_attestation_to_local(
+    attestation: &crate::proto::node::SignedNodeOwnership,
+) -> crate::crypto::SignedNodeOwnership {
+    crate::crypto::SignedNodeOwnership {
+        claim: crate::crypto::NodeOwnershipClaim {
+            version: attestation.version,
+            cert_id: attestation.cert_id.clone(),
+            owner_id: attestation.owner_id.clone(),
+            owner_sign_public_key: hex::encode(&attestation.owner_sign_public_key),
+            node_endpoint_id: hex::encode(&attestation.node_endpoint_id),
+            issued_at_unix_ms: attestation.issued_at_unix_ms,
+            expires_at_unix_ms: attestation.expires_at_unix_ms,
+            node_label: attestation.node_label.clone(),
+            hostname_hint: attestation.hostname_hint.clone(),
+        },
+        signature: hex::encode(&attestation.signature),
+    }
+}
+
 fn local_source_kind_to_proto(kind: crate::mesh::ModelSourceKind) -> i32 {
     match kind {
         crate::mesh::ModelSourceKind::Catalog => {
@@ -60,44 +161,6 @@ fn proto_capability_level_to_local(level: i32) -> crate::models::CapabilityLevel
         crate::proto::node::CapabilityLevel::Supported => crate::models::CapabilityLevel::Supported,
         crate::proto::node::CapabilityLevel::None
         | crate::proto::node::CapabilityLevel::Unspecified => crate::models::CapabilityLevel::None,
-    }
-}
-
-pub(crate) fn local_apply_mode_to_proto(
-    mode: crate::runtime::config_state::ConfigApplyMode,
-) -> i32 {
-    match mode {
-        crate::runtime::config_state::ConfigApplyMode::Staged => {
-            crate::proto::node::ConfigApplyMode::Staged as i32
-        }
-        crate::runtime::config_state::ConfigApplyMode::Live => {
-            crate::proto::node::ConfigApplyMode::Live as i32
-        }
-        crate::runtime::config_state::ConfigApplyMode::Noop => {
-            crate::proto::node::ConfigApplyMode::Noop as i32
-        }
-    }
-}
-
-#[allow(dead_code)]
-pub(crate) fn proto_apply_mode_to_local(
-    mode: i32,
-) -> crate::runtime::config_state::ConfigApplyMode {
-    match crate::proto::node::ConfigApplyMode::try_from(mode)
-        .unwrap_or(crate::proto::node::ConfigApplyMode::Unspecified)
-    {
-        crate::proto::node::ConfigApplyMode::Staged => {
-            crate::runtime::config_state::ConfigApplyMode::Staged
-        }
-        crate::proto::node::ConfigApplyMode::Live => {
-            crate::runtime::config_state::ConfigApplyMode::Live
-        }
-        crate::proto::node::ConfigApplyMode::Noop => {
-            crate::runtime::config_state::ConfigApplyMode::Noop
-        }
-        crate::proto::node::ConfigApplyMode::Unspecified => {
-            crate::runtime::config_state::ConfigApplyMode::Staged
-        }
     }
 }
 
@@ -163,6 +226,117 @@ fn proto_runtime_descriptor_to_local(
         context_length: descriptor.context_length,
         ready: descriptor.ready,
     }
+}
+
+fn local_gpu_info_to_proto(ann: &PeerAnnouncement) -> Vec<crate::proto::node::GpuInfo> {
+    let legacy_field_count = [
+        split_optional_csv(ann.gpu_vram.as_deref()).len(),
+        split_optional_csv(ann.gpu_reserved_bytes.as_deref()).len(),
+        split_optional_csv(ann.gpu_mem_bandwidth_gbps.as_deref()).len(),
+        split_optional_csv(ann.gpu_compute_tflops_fp32.as_deref()).len(),
+        split_optional_csv(ann.gpu_compute_tflops_fp16.as_deref()).len(),
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or(0);
+    let names =
+        crate::system::hardware::expand_gpu_names(ann.gpu_name.as_deref(), legacy_field_count);
+    let vram = split_optional_csv(ann.gpu_vram.as_deref());
+    let reserved = split_optional_csv(ann.gpu_reserved_bytes.as_deref());
+    let mem_bandwidth = split_optional_csv(ann.gpu_mem_bandwidth_gbps.as_deref());
+    let fp32 = split_optional_csv(ann.gpu_compute_tflops_fp32.as_deref());
+    let fp16 = split_optional_csv(ann.gpu_compute_tflops_fp16.as_deref());
+    let count = [
+        legacy_field_count,
+        names.len(),
+        vram.len(),
+        reserved.len(),
+        mem_bandwidth.len(),
+        fp32.len(),
+        fp16.len(),
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or(0);
+
+    (0..count)
+        .map(|index| crate::proto::node::GpuInfo {
+            name: names.get(index).cloned(),
+            vram_bytes: vram.get(index).cloned().flatten(),
+            reserved_bytes: reserved.get(index).cloned().flatten(),
+            mem_bandwidth_gbps: mem_bandwidth.get(index).cloned().flatten(),
+            compute_tflops_fp32: fp32.get(index).cloned().flatten(),
+            compute_tflops_fp16: fp16.get(index).cloned().flatten(),
+        })
+        .collect()
+}
+
+fn local_hardware_info_to_proto(
+    ann: &PeerAnnouncement,
+) -> Option<crate::proto::node::HardwareInfo> {
+    let gpus = local_gpu_info_to_proto(ann);
+    if ann.hostname.is_none() && ann.is_soc.is_none() && gpus.is_empty() {
+        None
+    } else {
+        Some(crate::proto::node::HardwareInfo {
+            is_soc: ann.is_soc,
+            hostname: ann.hostname.clone(),
+            gpus,
+        })
+    }
+}
+
+fn proto_gpu_info_to_legacy_fields(
+    gpus: &[crate::proto::node::GpuInfo],
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+) {
+    let names: Vec<String> = gpus.iter().filter_map(|gpu| gpu.name.clone()).collect();
+    let gpu_name = crate::system::hardware::summarize_gpu_name(&names);
+    let gpu_vram = join_optional_csv(
+        &gpus
+            .iter()
+            .map(|gpu| gpu.vram_bytes.clone())
+            .collect::<Vec<_>>(),
+    );
+    let gpu_reserved_bytes = join_optional_csv(
+        &gpus
+            .iter()
+            .map(|gpu| gpu.reserved_bytes.clone())
+            .collect::<Vec<_>>(),
+    );
+    let gpu_mem_bandwidth_gbps = join_optional_csv(
+        &gpus
+            .iter()
+            .map(|gpu| gpu.mem_bandwidth_gbps.clone())
+            .collect::<Vec<_>>(),
+    );
+    let gpu_compute_tflops_fp32 = join_optional_csv(
+        &gpus
+            .iter()
+            .map(|gpu| gpu.compute_tflops_fp32.clone())
+            .collect::<Vec<_>>(),
+    );
+    let gpu_compute_tflops_fp16 = join_optional_csv(
+        &gpus
+            .iter()
+            .map(|gpu| gpu.compute_tflops_fp16.clone())
+            .collect::<Vec<_>>(),
+    );
+
+    (
+        gpu_name,
+        gpu_vram,
+        gpu_reserved_bytes,
+        gpu_mem_bandwidth_gbps,
+        gpu_compute_tflops_fp32,
+        gpu_compute_tflops_fp16,
+    )
 }
 
 /// Returns `true` when a proto descriptor carries a non-empty model name.
@@ -268,6 +442,7 @@ pub(crate) fn local_ann_to_proto_ann(
         .iter()
         .map(runtime_descriptor_to_proto)
         .collect();
+    let hardware = local_hardware_info_to_proto(&ann);
     crate::proto::node::PeerAnnouncement {
         endpoint_id: ann.addr.id.as_bytes().to_vec(),
         role: role_int,
@@ -296,7 +471,18 @@ pub(crate) fn local_ann_to_proto_ann(
         served_model_identities,
         served_model_descriptors,
         served_model_runtime,
-        owner_id: ann.owner_id.clone(),
+        owner_attestation: ann
+            .owner_attestation
+            .as_ref()
+            .and_then(local_owner_attestation_to_proto),
+        // Legacy GPU metric fields (29-32) are populated alongside `hardware` so that
+        // pre-v0.60.0 peers that do not decode the new `hardware` block can still read
+        // bandwidth/tflops/reserved data from the flat fields they already know.
+        gpu_mem_bandwidth_gbps: ann.gpu_mem_bandwidth_gbps.clone(),
+        gpu_compute_tflops_fp32: ann.gpu_compute_tflops_fp32.clone(),
+        gpu_compute_tflops_fp16: ann.gpu_compute_tflops_fp16.clone(),
+        gpu_reserved_bytes: ann.gpu_reserved_bytes.clone(),
+        hardware,
     }
 }
 
@@ -348,6 +534,19 @@ pub(crate) fn proto_ann_to_local(
         .hosted_models_known
         .unwrap_or(!pa.hosted_models.is_empty())
         .then(|| pa.hosted_models.clone());
+    let hardware = pa.hardware.as_ref();
+    let (
+        gpu_name_from_gpus,
+        gpu_vram_from_gpus,
+        gpu_reserved_from_gpus,
+        gpu_mem_bandwidth_from_gpus,
+        gpu_fp32_from_gpus,
+        gpu_fp16_from_gpus,
+    ) = proto_gpu_info_to_legacy_fields(
+        hardware
+            .map(|hardware| hardware.gpus.as_slice())
+            .unwrap_or(&[]),
+    );
     let mut ann = PeerAnnouncement {
         addr: addr.clone(),
         role,
@@ -361,11 +560,17 @@ pub(crate) fn proto_ann_to_local(
         version: pa.version.clone(),
         model_demand,
         mesh_id: pa.mesh_id.clone(),
-        gpu_name: pa.gpu_name.clone(),
-        hostname: pa.hostname.clone(),
-        is_soc: pa.is_soc,
-        gpu_vram: pa.gpu_vram.clone(),
-        gpu_bandwidth_gbps: None,
+        gpu_name: gpu_name_from_gpus.or_else(|| pa.gpu_name.clone()),
+        hostname: hardware
+            .and_then(|hardware| hardware.hostname.clone())
+            .or_else(|| pa.hostname.clone()),
+        is_soc: hardware.and_then(|hardware| hardware.is_soc).or(pa.is_soc),
+        gpu_vram: gpu_vram_from_gpus.or_else(|| pa.gpu_vram.clone()),
+        gpu_reserved_bytes: gpu_reserved_from_gpus.or_else(|| pa.gpu_reserved_bytes.clone()),
+        gpu_mem_bandwidth_gbps: gpu_mem_bandwidth_from_gpus
+            .or_else(|| pa.gpu_mem_bandwidth_gbps.clone()),
+        gpu_compute_tflops_fp32: gpu_fp32_from_gpus.or_else(|| pa.gpu_compute_tflops_fp32.clone()),
+        gpu_compute_tflops_fp16: gpu_fp16_from_gpus.or_else(|| pa.gpu_compute_tflops_fp16.clone()),
         available_model_metadata: Vec::new(),
         experts_summary: pa.experts_summary.clone(),
         available_model_sizes: HashMap::new(),
@@ -374,7 +579,6 @@ pub(crate) fn proto_ann_to_local(
             .iter()
             .map(proto_runtime_descriptor_to_local)
             .collect(),
-        owner_id: pa.owner_id.clone(),
         served_model_descriptors: if !pa.served_model_descriptors.is_empty() {
             let descriptors: Vec<_> = pa
                 .served_model_descriptors
@@ -434,6 +638,10 @@ pub(crate) fn proto_ann_to_local(
                 .map(legacy_descriptor_from_identity)
                 .collect()
         },
+        owner_attestation: pa
+            .owner_attestation
+            .as_ref()
+            .map(proto_owner_attestation_to_local),
     };
     crate::mesh::backfill_legacy_descriptors(&mut ann);
     Some((addr, ann))
@@ -459,6 +667,14 @@ pub(crate) fn mesh_config_to_proto(
     config: &crate::plugin::MeshConfig,
 ) -> crate::proto::node::NodeConfigSnapshot {
     use crate::plugin::GpuAssignment;
+    fn configured_model_ref(declared_ref: &str) -> crate::proto::node::ConfiguredModelRef {
+        crate::proto::node::ConfiguredModelRef {
+            declared_ref: declared_ref.to_string(),
+            source_kind: None,
+            revision: None,
+        }
+    }
+
     let assignment = match config.gpu.assignment {
         GpuAssignment::Auto => crate::proto::node::GpuAssignment::Auto as i32,
         GpuAssignment::Pinned => crate::proto::node::GpuAssignment::Pinned as i32,
@@ -470,6 +686,9 @@ pub(crate) fn mesh_config_to_proto(
             model: m.model.clone(),
             mmproj: m.mmproj.clone(),
             ctx_size: m.ctx_size,
+            gpu_id: m.gpu_id.clone(),
+            model_ref: Some(configured_model_ref(&m.model)),
+            mmproj_ref: m.mmproj.as_deref().map(configured_model_ref),
         })
         .collect();
     let plugins = config
@@ -496,6 +715,19 @@ pub(crate) fn proto_config_to_mesh(
     use crate::plugin::{
         GpuAssignment, GpuConfig, MeshConfig, ModelConfigEntry, PluginConfigEntry,
     };
+    fn declared_ref_or_none(
+        configured: Option<&crate::proto::node::ConfiguredModelRef>,
+    ) -> Option<String> {
+        configured.and_then(|configured| {
+            let declared_ref = configured.declared_ref.trim();
+            if declared_ref.is_empty() {
+                None
+            } else {
+                Some(declared_ref.to_string())
+            }
+        })
+    }
+
     let assignment = match snapshot.gpu.as_ref().map(|g| g.assignment) {
         Some(v) if v == crate::proto::node::GpuAssignment::Pinned as i32 => GpuAssignment::Pinned,
         _ => GpuAssignment::Auto,
@@ -504,9 +736,10 @@ pub(crate) fn proto_config_to_mesh(
         .models
         .iter()
         .map(|m| ModelConfigEntry {
-            model: m.model.clone(),
-            mmproj: m.mmproj.clone(),
+            model: declared_ref_or_none(m.model_ref.as_ref()).unwrap_or_else(|| m.model.clone()),
+            mmproj: declared_ref_or_none(m.mmproj_ref.as_ref()).or_else(|| m.mmproj.clone()),
             ctx_size: m.ctx_size,
+            gpu_id: m.gpu_id.clone(),
         })
         .collect();
     let plugins = snapshot

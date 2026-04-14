@@ -16,6 +16,7 @@ mesh-host-core = { path = "../mesh-host-core", optional = true }
 uniffi = "=0.31.0"
 thiserror = "2"
 pollster = "0.3"
+hex = "0.4"
 
 [build-dependencies]
 uniffi = { version = "=0.31.0", features = ["build"] }

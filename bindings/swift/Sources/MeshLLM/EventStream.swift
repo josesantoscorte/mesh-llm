@@ -37,6 +37,8 @@ public final class EventStreamBridge: @unchecked Sendable {
     private let continuation: AsyncThrowingStream<MeshEvent, Error>.Continuation
     private let requestId: RequestId
     private weak var client: MeshClient?
+    private let stateLock = NSLock()
+    private var finished = false
 
     public init(
         continuation: AsyncThrowingStream<MeshEvent, Error>.Continuation,
@@ -54,16 +56,31 @@ public final class EventStreamBridge: @unchecked Sendable {
     }
 
     public func emit(_ event: MeshEvent) {
+        stateLock.lock()
+        if finished {
+            stateLock.unlock()
+            return
+        }
         switch event {
         case .completed, .failed, .disconnected:
+            finished = true
+            stateLock.unlock()
             continuation.yield(event)
             continuation.finish()
         default:
+            stateLock.unlock()
             continuation.yield(event)
         }
     }
 
     public func finish(throwing error: Error? = nil) {
+        stateLock.lock()
+        if finished {
+            stateLock.unlock()
+            return
+        }
+        finished = true
+        stateLock.unlock()
         if let error = error {
             continuation.finish(throwing: error)
         } else {

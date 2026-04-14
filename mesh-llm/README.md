@@ -48,7 +48,7 @@ The current control plane prefers protocol `mesh-llm/1` with protobuf framing, w
 
 The management API exposes the state the UI uses directly:
 
-- `GET /api/status` for node, peer, and routing state
+- `GET /api/status` for node, peer, and routing state, including enriched `gpus[]` hardware entries with per-device VRAM, optional reserved bytes when the backend reports a true reserved/unavailable metric, memory bandwidth, and compute-throughput hints
 - `GET /api/events` for live updates
 - `GET /api/models` for mesh model inventory and `GET /api/runtime*` for loaded model/process state
 - `GET /api/discover` for mesh discovery results
@@ -80,15 +80,17 @@ Unified local config example:
 version = 1
 
 [gpu]
-assignment = "auto"
+assignment = "pinned"
 
 [[models]]
 model = "Qwen3-8B-Q4_K_M"
+gpu_id = "pci:0000:65:00.0"
 
 [[models]]
 model = "bartowski/Qwen2.5-VL-7B-Instruct-GGUF/qwen2.5-vl-7b-instruct-q4_k_m.gguf"
 mmproj = "bartowski/Qwen2.5-VL-7B-Instruct-GGUF/mmproj-f16.gguf"
 ctx_size = 8192
+gpu_id = "uuid:GPU-12345678"
 
 [[plugin]]
 name = "blackboard"
@@ -104,6 +106,8 @@ args = ["--stdio"]
 Explicit `--model` or `--gguf` ignores configured `[[models]]`, and explicit `--ctx-size`
 overrides configured `ctx_size` for the selected startup models.
 Bare `mesh-llm serve` warns, shows help, and exits if `[[models]]` is empty.
+
+When `[gpu].assignment = "pinned"`, every configured `[[models]]` entry must include a `gpu_id` taken from the pinnable stable IDs shown by `mesh-llm gpus` / `mesh-llm gpus --json`. Some fallback `stable_id` values may still be printed for inventory (`index:*`, backend-device names, and similar fallbacks), but those are not valid config identities. Pinned configs fail closed when an ID is missing, ambiguous, unsupported by the selected backend, or no longer resolves on the current host.
 
 ## Discovery and mesh modes
 

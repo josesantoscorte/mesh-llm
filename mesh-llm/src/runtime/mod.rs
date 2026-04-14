@@ -1,5 +1,6 @@
 pub(crate) mod config_state;
 mod discovery;
+pub mod instance;
 mod local;
 mod proxy;
 
@@ -13,6 +14,10 @@ use self::local::{
 use self::proxy::{api_proxy, bootstrap_proxy};
 use crate::api;
 use crate::cli::{Cli, Command, RuntimeSurface};
+use crate::crypto::{
+    default_keystore_path, default_trust_store_path, keystore_exists, keystore_metadata,
+    load_keystore, load_owner_keypair_from_keychain, load_trust_store, OwnerKeychainLoadError,
+};
 use crate::inference::{election, launch, moe};
 use crate::mesh;
 use crate::mesh::NodeRole;
@@ -24,13 +29,25 @@ use crate::system::{autoupdate, benchmark, hardware};
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser};
 use std::collections::HashMap;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+use zeroize::Zeroizing;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct StartupModelSpec {
     model_ref: PathBuf,
     mmproj_ref: Option<PathBuf>,
     ctx_size: Option<u32>,
+    gpu_id: Option<String>,
+    config_owned: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StartupPinnedGpuTarget {
+    pub(crate) index: usize,
+    pub(crate) stable_id: String,
+    pub(crate) backend_device: String,
+    pub(crate) vram_bytes: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -39,6 +56,125 @@ struct StartupModelPlan {
     resolved_path: PathBuf,
     mmproj_path: Option<PathBuf>,
     ctx_size: Option<u32>,
+    gpu_id: Option<String>,
+    pinned_gpu: Option<StartupPinnedGpuTarget>,
+}
+
+fn resolve_runtime_owner_key_path(cli: &Cli) -> Result<Option<PathBuf>> {
+    if let Some(path) = cli.owner_key.clone() {
+        return Ok(Some(path));
+    }
+
+    let default_path = default_keystore_path()?;
+    if keystore_exists(&default_path) {
+        Ok(Some(default_path))
+    } else {
+        Ok(None)
+    }
+}
+
+fn resolve_owner_passphrase(path: &Path) -> Result<Option<Zeroizing<String>>> {
+    let info = keystore_metadata(path)?;
+    if !info.encrypted {
+        return Ok(None);
+    }
+
+    if let Ok(passphrase) = std::env::var("MESH_LLM_OWNER_PASSPHRASE") {
+        return Ok(Some(Zeroizing::new(passphrase)));
+    }
+
+    if std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
+        let prompt = format!("Enter owner keystore passphrase for {}: ", path.display());
+        let passphrase = rpassword::prompt_password_stderr(&prompt)?;
+        return Ok(Some(Zeroizing::new(passphrase)));
+    }
+
+    Err(crate::crypto::CryptoError::MissingPassphrase.into())
+}
+
+fn load_owner_keypair_for_runtime(path: &Path) -> Result<crate::crypto::OwnerKeypair> {
+    let info = keystore_metadata(path)?;
+    if info.encrypted && std::env::var("MESH_LLM_OWNER_PASSPHRASE").is_err() {
+        match load_owner_keypair_from_keychain(path) {
+            Ok(keypair) => return Ok(keypair),
+            Err(OwnerKeychainLoadError::NoEntry)
+            | Err(OwnerKeychainLoadError::Crypto(crate::crypto::CryptoError::DecryptionFailed))
+            | Err(OwnerKeychainLoadError::Crypto(
+                crate::crypto::CryptoError::KeychainUnavailable { .. },
+            ))
+            | Err(OwnerKeychainLoadError::Crypto(
+                crate::crypto::CryptoError::KeychainAccessDenied { .. },
+            )) => {}
+            Err(OwnerKeychainLoadError::Crypto(err)) => {
+                return Err(err)
+                    .with_context(|| format!("Failed to load owner keystore {}", path.display()));
+            }
+        }
+    }
+
+    let passphrase = resolve_owner_passphrase(path)?;
+    load_keystore(path, passphrase.as_deref().map(|value| value.as_str()))
+        .with_context(|| format!("Failed to load owner keystore {}", path.display()))
+}
+
+fn owner_runtime_config(cli: &Cli) -> Result<mesh::OwnerRuntimeConfig> {
+    let trust_store_path = default_trust_store_path()?;
+    let trust_store = load_trust_store(&trust_store_path)
+        .with_context(|| format!("Failed to load trust store {}", trust_store_path.display()))?
+        .merged_with_trusted_owners(&cli.trust_owner);
+    let trust_policy = cli.trust_policy.unwrap_or(trust_store.policy);
+
+    let keypair = match resolve_runtime_owner_key_path(cli)? {
+        Some(path) => match load_owner_keypair_for_runtime(&path) {
+            Ok(keypair) => Some(keypair),
+            Err(err) if !cli.owner_required => {
+                eprintln!(
+                    "⚠️ Owner identity unavailable at {}: {err}\n  Starting without owner attestation.",
+                    path.display()
+                );
+                None
+            }
+            Err(err) => return Err(err),
+        },
+        None if cli.owner_required => {
+            anyhow::bail!(
+                "Owner identity is required but no keystore was found. Use --owner-key or run `mesh-llm auth init`."
+            );
+        }
+        None => None,
+    };
+
+    Ok(mesh::OwnerRuntimeConfig {
+        keypair,
+        node_label: cli.node_label.clone(),
+        trust_store,
+        trust_policy,
+    })
+}
+
+/// Wait for either SIGINT (ctrl-c) or SIGTERM. Without this, an unhandled
+/// SIGTERM aborts the process before destructors run, so PidfileGuard never
+/// removes its file and child llama-server / rpc-server are left orphaned.
+async fn wait_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 pub(crate) async fn run() -> Result<()> {
@@ -97,7 +233,7 @@ pub(crate) async fn run() -> Result<()> {
     let checked_updates = autoupdate::maybe_auto_update(&cli).await?;
 
     // Finish the release check before startup continues.
-    if !checked_updates && !matches!(cli.command, Some(Command::Update)) {
+    if !checked_updates && !matches!(cli.command, Some(Command::Update { .. })) {
         autoupdate::check_for_update().await;
     }
 
@@ -110,12 +246,67 @@ pub(crate) async fn run() -> Result<()> {
     let has_config_models = !config.models.is_empty();
     let has_startup_models = cli_has_explicit_models || has_config_models;
 
-    // Clean up orphan processes from previous runs (skip for client — never runs llama-server).
+    // Acquire the per-instance runtime directory and flock (skip for --client — no local servers).
+    // Wrap in Arc so it can be cheaply shared with election/spawn tasks that
+    // need to write pidfiles for child processes (rpc-server, llama-server).
+    let runtime: Option<std::sync::Arc<crate::runtime::instance::InstanceRuntime>> = if !cli.client
+    {
+        match crate::runtime::instance::InstanceRuntime::acquire(std::process::id()) {
+            Ok(rt) => Some(std::sync::Arc::new(rt)),
+            Err(e) => {
+                tracing::warn!("failed to acquire instance runtime: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Write owner.json into the runtime dir so sibling-instance discovery can find us.
+    if let Some(ref rt) = runtime {
+        let started_at =
+            crate::runtime::instance::validate::current_process_start_time_unix().unwrap_or(0);
+        let owner_meta = serde_json::json!({
+            "pid": std::process::id(),
+            "api_port": cli.console,
+            "version": crate::VERSION,
+            "started_at_unix": started_at,
+            "mesh_llm_binary": std::env::current_exe()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default(),
+        });
+        let owner_path = rt.dir().join("owner.json");
+        if let Ok(json) = serde_json::to_string_pretty(&owner_meta) {
+            let _ = crate::runtime::instance::write_text_file_atomic(&owner_path, &json);
+        }
+    }
+
+    // Reap orphans from dead sibling instances (skip for client — never runs llama-server).
     // This intentionally happens after subcommand dispatch so control commands
     // targeting a live instance don't kill it before sending the request.
+    // Uses scoped reap that only touches runtime dirs whose owner has died (flock-released).
     if !cli.client {
-        launch::kill_llama_server().await;
-        launch::kill_orphan_rpc_servers().await;
+        if let Some(ref rt) = runtime {
+            match crate::runtime::instance::runtime_root() {
+                Ok(root) => {
+                    let my_dir = rt.dir().to_path_buf();
+                    match crate::runtime::instance::reap::reap_cross_runtime_orphans(&root, &my_dir)
+                        .await
+                    {
+                        Ok(summary) => {
+                            if summary.children_killed > 0 || summary.dirs_gc_d > 0 {
+                                eprintln!(
+                                    "🧹 Reaped {} orphan children from {} dead instance(s)",
+                                    summary.children_killed, summary.dirs_gc_d
+                                );
+                            }
+                        }
+                        Err(e) => tracing::warn!("cross-runtime reap failed: {e}"),
+                    }
+                }
+                Err(e) => tracing::warn!("runtime_root resolution failed during reap: {e}"),
+            }
+        }
     }
 
     // Auto-enable publishing when mesh is named
@@ -134,6 +325,8 @@ pub(crate) async fn run() -> Result<()> {
         eprintln!("🔑 Previous run was public — rotating identity for private mesh");
         mesh::clear_public_identity();
     }
+
+    let mut auto_join_candidates: Vec<(String, Option<String>)> = Vec::new();
 
     // --- Auto-discover ---
     if cli.auto && cli.join.is_empty() {
@@ -178,8 +371,8 @@ pub(crate) async fn run() -> Result<()> {
             nostr::AutoDecision::Join { candidates } => {
                 if cli.client {
                     // Clients skip health probe — joining itself is the test.
-                    // Use the best candidate.
-                    let (token, mesh) = &candidates[0];
+                    // Queue all candidates so we can fall back if the top one is unreachable.
+                    let (_, mesh) = &candidates[0];
                     if cli.mesh_name.is_none() {
                         if let Some(ref name) = mesh.listing.name {
                             cli.mesh_name = Some(name.clone());
@@ -196,12 +389,15 @@ pub(crate) async fn run() -> Result<()> {
                             .map(|r| format!(", region: {r}"))
                             .unwrap_or_default()
                     );
-                    cli.join.push(token.clone());
+                    for (token, _) in &candidates {
+                        cli.join.push(token.clone());
+                    }
                 } else {
                     // GPU nodes: try to join each candidate directly.
                     // No ephemeral probe — it fails when the target has a firewall
                     // even though the real join (via relay) would succeed.
-                    if let Some((i, (token, mesh))) = candidates.iter().enumerate().next() {
+                    let mut joined = false;
+                    for (i, (token, mesh)) in candidates.iter().enumerate() {
                         eprintln!(
                             "  Trying mesh {}{}...",
                             mesh.listing.name.as_deref().unwrap_or("unnamed"),
@@ -211,24 +407,10 @@ pub(crate) async fn run() -> Result<()> {
                                 String::new()
                             }
                         );
-                        if cli.mesh_name.is_none() {
-                            if let Some(ref name) = mesh.listing.name {
-                                cli.mesh_name = Some(name.clone());
-                            }
-                        }
-                        eprintln!(
-                            "✅ Joining: {} ({} nodes, {} models{})",
-                            mesh.listing.name.as_deref().unwrap_or("unnamed"),
-                            mesh.listing.node_count,
-                            mesh.listing.serving.len(),
-                            mesh.listing
-                                .region
-                                .as_ref()
-                                .map(|r| format!(", region: {r}"))
-                                .unwrap_or_default()
-                        );
-                        cli.join.push(token.clone());
-                    } else {
+                        auto_join_candidates.push((token.clone(), mesh.listing.name.clone()));
+                        joined = true;
+                    }
+                    if !joined {
                         eprintln!("⚠️  No meshes found — starting new");
                         let models = nostr::default_models_for_vram(my_vram_gb);
                         start_new_mesh(&mut cli, &models, my_vram_gb, has_startup_models);
@@ -250,7 +432,7 @@ pub(crate) async fn run() -> Result<()> {
                                 target_name,
                                 last_mesh_id.as_deref(),
                             ) {
-                                let (token, mesh) = &candidates[0];
+                                let (_, mesh) = &candidates[0];
                                 if cli.mesh_name.is_none() {
                                     if let Some(ref name) = mesh.listing.name {
                                         cli.mesh_name = Some(name.clone());
@@ -262,7 +444,9 @@ pub(crate) async fn run() -> Result<()> {
                                     mesh.listing.node_count,
                                     mesh.listing.serving.len()
                                 );
-                                cli.join.push(token.clone());
+                                for (token, _) in &candidates {
+                                    cli.join.push(token.clone());
+                                }
                                 found = true;
                                 break;
                             }
@@ -310,7 +494,8 @@ pub(crate) async fn run() -> Result<()> {
         eprintln!();
         return Ok(());
     }
-    let startup_models = resolve_startup_models(&startup_specs).await?;
+    let mut startup_models = resolve_startup_models(&startup_specs).await?;
+    preflight_config_owned_startup_models(&config, &startup_specs, &mut startup_models)?;
     let resolved_models: Vec<PathBuf> = startup_models
         .iter()
         .map(|model| model.resolved_path.clone())
@@ -333,7 +518,16 @@ pub(crate) async fn run() -> Result<()> {
         None => detect_bin_dir()?,
     };
 
-    run_auto(cli, config, startup_models, requested_model_names, bin_dir).await
+    run_auto(
+        cli,
+        config,
+        startup_models,
+        requested_model_names,
+        bin_dir,
+        runtime,
+        auto_join_candidates,
+    )
+    .await
 }
 
 /// Resolve a model path: local file, catalog name, or HuggingFace URL.
@@ -363,6 +557,8 @@ fn build_startup_model_specs(
                 model_ref: path.clone(),
                 mmproj_ref: None,
                 ctx_size: cli.ctx_size,
+                gpu_id: None,
+                config_owned: false,
             });
         }
         for model in &cli.model {
@@ -370,6 +566,8 @@ fn build_startup_model_specs(
                 model_ref: model.clone(),
                 mmproj_ref: None,
                 ctx_size: cli.ctx_size,
+                gpu_id: None,
+                config_owned: false,
             });
         }
         if let Some(mmproj) = &cli.mmproj {
@@ -385,6 +583,8 @@ fn build_startup_model_specs(
             model_ref: PathBuf::from(model.model.clone()),
             mmproj_ref: model.mmproj.as_ref().map(PathBuf::from),
             ctx_size: cli.ctx_size.or(model.ctx_size),
+            gpu_id: model.gpu_id.clone(),
+            config_owned: true,
         });
     }
     Ok(specs)
@@ -403,9 +603,98 @@ async fn resolve_startup_models(specs: &[StartupModelSpec]) -> Result<Vec<Startu
             resolved_path,
             mmproj_path,
             ctx_size: spec.ctx_size,
+            gpu_id: spec.gpu_id.clone(),
+            pinned_gpu: None,
         });
     }
     Ok(plans)
+}
+
+fn preflight_config_owned_startup_models(
+    config: &plugin::MeshConfig,
+    specs: &[StartupModelSpec],
+    plans: &mut [StartupModelPlan],
+) -> Result<()> {
+    if config.gpu.assignment != plugin::GpuAssignment::Pinned {
+        return Ok(());
+    }
+
+    let survey = hardware::query(pinned_startup_preflight_metrics());
+    preflight_config_owned_startup_models_with_gpus(config, specs, plans, &survey.gpus)
+}
+
+fn pinned_startup_preflight_metrics() -> &'static [hardware::Metric] {
+    &[
+        hardware::Metric::GpuName,
+        hardware::Metric::GpuFacts,
+        hardware::Metric::VramBytes,
+    ]
+}
+
+fn preflight_config_owned_startup_models_with_gpus(
+    config: &plugin::MeshConfig,
+    specs: &[StartupModelSpec],
+    plans: &mut [StartupModelPlan],
+    gpus: &[hardware::GpuFacts],
+) -> Result<()> {
+    if config.gpu.assignment != plugin::GpuAssignment::Pinned {
+        return Ok(());
+    }
+
+    anyhow::ensure!(
+        specs.len() == plans.len(),
+        "startup model preflight received mismatched specs/plans"
+    );
+
+    for (spec, plan) in specs.iter().zip(plans.iter_mut()) {
+        if !spec.config_owned {
+            continue;
+        }
+
+        let resolved_gpu = hardware::resolve_pinned_gpu(plan.gpu_id.as_deref(), gpus)
+            .map_err(anyhow::Error::new)
+            .with_context(|| {
+                format!(
+                    "startup model '{}' failed pinned GPU preflight",
+                    plan.declared_ref
+                )
+            })?;
+
+        let stable_id = resolved_gpu.stable_id.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "startup model '{}' resolved pinned GPU at index {} without a stable_id",
+                plan.declared_ref,
+                resolved_gpu.index
+            )
+        })?;
+
+        let backend_device = resolved_gpu
+            .backend_device
+            .clone()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "startup model '{}' resolved pinned GPU '{}' at index {} without a backend_device",
+                    plan.declared_ref,
+                    stable_id,
+                    resolved_gpu.index
+                )
+            })
+            .with_context(|| {
+                format!(
+                    "startup model '{}' failed pinned GPU preflight",
+                    plan.declared_ref
+                )
+            })?;
+
+        plan.pinned_gpu = Some(StartupPinnedGpuTarget {
+            index: resolved_gpu.index,
+            stable_id,
+            backend_device,
+            vram_bytes: resolved_gpu.vram_bytes,
+        });
+    }
+
+    Ok(())
 }
 
 fn should_show_serve_config_help(
@@ -419,6 +708,25 @@ fn should_show_serve_config_help(
         && !cli.auto
         && cli.join.is_empty()
         && cli.discover.is_none()
+}
+
+fn startup_rpc_backend_device<'a>(
+    cli_device: Option<&'a str>,
+    primary_startup_model: Option<&'a StartupModelPlan>,
+) -> Result<Option<&'a str>> {
+    let pinned_device = primary_startup_model
+        .and_then(|model| model.pinned_gpu.as_ref())
+        .map(|gpu| gpu.backend_device.as_str());
+
+    if let (Some(cli_device), Some(pinned_device)) = (cli_device, pinned_device) {
+        anyhow::ensure!(
+            cli_device == pinned_device,
+            "explicit --device '{cli_device}' conflicts with pinned startup GPU backend device '{pinned_device}'"
+        );
+        return Ok(Some(cli_device));
+    }
+
+    Ok(cli_device.or(pinned_device))
 }
 
 /// Look up the model filename in the catalog and check if its draft model exists on disk.
@@ -817,19 +1125,33 @@ async fn join_mesh_for_mcp(cli: &Cli, node: &mesh::Node) -> Result<()> {
         let last_mesh_id_here = crate::mesh::load_last_mesh_id();
         match nostr::smart_auto(&meshes, 0.0, target_name, last_mesh_id_here.as_deref()) {
             nostr::AutoDecision::Join { candidates } => {
-                let (token, mesh) = &candidates[0];
-                eprintln!(
-                    "✅ Joining: {} ({} nodes, {} models{})",
-                    mesh.listing.name.as_deref().unwrap_or("unnamed"),
-                    mesh.listing.node_count,
-                    mesh.listing.serving.len(),
-                    mesh.listing
-                        .region
-                        .as_ref()
-                        .map(|r| format!(", region: {r}"))
-                        .unwrap_or_default()
-                );
-                node.join(token).await?;
+                let mut last_err: Option<anyhow::Error> = None;
+                for (token, mesh) in &candidates {
+                    eprintln!(
+                        "✅ Joining: {} ({} nodes, {} models{})",
+                        mesh.listing.name.as_deref().unwrap_or("unnamed"),
+                        mesh.listing.node_count,
+                        mesh.listing.serving.len(),
+                        mesh.listing
+                            .region
+                            .as_ref()
+                            .map(|r| format!(", region: {r}"))
+                            .unwrap_or_default()
+                    );
+                    match node.join(token).await {
+                        Ok(()) => {
+                            last_err = None;
+                            break;
+                        }
+                        Err(err) => {
+                            tracing::warn!("Failed to join mesh candidate: {err}");
+                            last_err = Some(err);
+                        }
+                    }
+                }
+                if let Some(err) = last_err {
+                    return Err(err);
+                }
             }
             nostr::AutoDecision::StartNew { .. } => {
                 anyhow::bail!("No mesh found for MCP mode. Pass --join or start a mesh first.");
@@ -842,17 +1164,21 @@ async fn join_mesh_for_mcp(cli: &Cli, node: &mesh::Node) -> Result<()> {
 
 pub(crate) async fn run_plugin_mcp(cli: &Cli) -> Result<()> {
     let resolved_plugins = load_resolved_plugins(cli)?;
+    let owner_config = owner_runtime_config(cli)?;
     let (node, _channels) = mesh::Node::start(
         NodeRole::Client,
         &cli.relay,
         cli.bind_port,
         Some(0.0),
         cli.enumerate_host,
+        Some(owner_config),
+        cli.config.as_deref(),
     )
     .await?;
     node.start_accepting();
     node.set_display_name(node_display_name(cli, &node)).await;
     node.start_heartbeat();
+    node.start_relay_health_monitor();
     join_mesh_for_mcp(cli, &node).await?;
 
     let (plugin_mesh_tx, plugin_mesh_rx) = tokio::sync::mpsc::channel(256);
@@ -871,6 +1197,17 @@ pub(crate) async fn run_plugin_mcp(cli: &Cli) -> Result<()> {
 
 pub(crate) use self::discovery::{check_mesh, nostr_relays};
 
+async fn store_benchmark_metrics(
+    mem_arc: std::sync::Arc<tokio::sync::Mutex<Option<Vec<f64>>>>,
+    fp32_arc: std::sync::Arc<tokio::sync::Mutex<Option<Vec<f64>>>>,
+    fp16_arc: std::sync::Arc<tokio::sync::Mutex<Option<Vec<f64>>>>,
+    result: Option<&benchmark::BenchmarkResult>,
+) {
+    *mem_arc.lock().await = result.map(|r| r.mem_bandwidth_gbps.clone());
+    *fp32_arc.lock().await = result.and_then(|r| r.compute_tflops_fp32.clone());
+    *fp16_arc.lock().await = result.and_then(|r| r.compute_tflops_fp16.clone());
+}
+
 /// Auto-election mode: start rpc-server, join mesh, auto-elect host.
 async fn run_auto(
     mut cli: Cli,
@@ -878,6 +1215,8 @@ async fn run_auto(
     startup_models: Vec<StartupModelPlan>,
     requested_model_names: Vec<String>,
     bin_dir: PathBuf,
+    runtime: Option<std::sync::Arc<crate::runtime::instance::InstanceRuntime>>,
+    auto_join_candidates: Vec<(String, Option<String>)>,
 ) -> Result<()> {
     let resolved_plugins = resolve_plugins_from_config(&config, &cli)?;
     let api_port = cli.port;
@@ -902,6 +1241,7 @@ async fn run_auto(
     } else {
         NodeRole::Worker
     };
+    let owner_config = owner_runtime_config(&cli)?;
     // Clients report 0 VRAM so they're never assigned a model to serve
     let max_vram = if is_client { Some(0.0) } else { cli.max_vram };
     let (node, channels) = mesh::Node::start(
@@ -910,6 +1250,8 @@ async fn run_auto(
         cli.bind_port,
         max_vram,
         cli.enumerate_host,
+        Some(owner_config),
+        cli.config.as_deref(),
     )
     .await?;
     node.start_accepting();
@@ -929,11 +1271,14 @@ async fn run_auto(
 
     // Start periodic health check to detect dead peers
     node.start_heartbeat();
+    node.start_relay_health_monitor();
 
     // Launch memory bandwidth benchmark in background (non-blocking)
     // Skip for client nodes — they have no GPU to benchmark
     if !is_client {
-        let bw_arc = node.gpu_bandwidth_gbps.clone();
+        let mem_arc = node.gpu_mem_bandwidth_gbps.clone();
+        let compute_fp32_arc = node.gpu_compute_tflops_fp32.clone();
+        let compute_fp16_arc = node.gpu_compute_tflops_fp16.clone();
         let bin_dir_clone = bin_dir.clone();
         tokio::spawn(async move {
             let result = tokio::time::timeout(
@@ -944,7 +1289,7 @@ async fn run_auto(
                         tracing::debug!("no GPUs detected — skipping memory bandwidth benchmark");
                         return None;
                     }
-                    benchmark::run_or_load(&hw, &bin_dir_clone, std::time::Duration::from_secs(25))
+                    benchmark::run_or_load(&hw, &bin_dir_clone, benchmark::BENCHMARK_TIMEOUT)
                 }),
             )
             .await
@@ -955,36 +1300,89 @@ async fn run_auto(
             .and_then(|r| r.ok())
             .flatten();
 
-            if let Some(ref per_gpu) = result {
-                let total: f64 = per_gpu.iter().sum();
+            if let Some(ref run) = result {
+                let total: f64 = run.mem_bandwidth_gbps.iter().sum();
                 tracing::info!(
                     "Memory bandwidth fingerprint: {} GPUs, {:.1} GB/s total",
-                    per_gpu.len(),
+                    run.mem_bandwidth_gbps.len(),
                     total
                 );
-                for (i, gbps) in per_gpu.iter().enumerate() {
+                for (i, gbps) in run.mem_bandwidth_gbps.iter().enumerate() {
                     tracing::debug!("  GPU {}: {:.1} GB/s", i, gbps);
                 }
+                if let Some(fp32s) = &run.compute_tflops_fp32 {
+                    let total_fp32: f64 = fp32s.iter().sum();
+                    tracing::info!(
+                        "Compute FP32 TFLOPS: {} GPUs, {:.1} TFLOPS total",
+                        fp32s.len(),
+                        total_fp32
+                    );
+                    for (i, tf) in fp32s.iter().enumerate() {
+                        tracing::debug!("  GPU {}: {:.1} TF32", i, tf);
+                    }
+                }
+                if let Some(fp16s) = &run.compute_tflops_fp16 {
+                    let total_fp16: f64 = fp16s.iter().sum();
+                    tracing::info!(
+                        "Compute FP16 TFLOPS: {} GPUs, {:.1} TFLOPS total",
+                        fp16s.len(),
+                        total_fp16
+                    );
+                    for (i, tf) in fp16s.iter().enumerate() {
+                        tracing::debug!("  GPU {}: {:.1} TF16", i, tf);
+                    }
+                }
             }
-            *bw_arc.lock().await = result;
+            store_benchmark_metrics(
+                mem_arc.clone(),
+                compute_fp32_arc.clone(),
+                compute_fp16_arc.clone(),
+                result.as_ref(),
+            )
+            .await;
         });
     } else {
         tracing::debug!("client node — skipping memory bandwidth benchmark");
     }
 
-    // Join mesh if --join was given
-    if !cli.join.is_empty() {
+    // Join mesh if --join was given or auto-discovery queued fallback candidates.
+    if !cli.join.is_empty() || !auto_join_candidates.is_empty() {
         let mut joined = false;
-        for t in &cli.join {
+        let join_attempts: Vec<(String, Option<String>)> = if !cli.join.is_empty() {
+            cli.join
+                .iter()
+                .cloned()
+                .map(|token| (token, None))
+                .collect()
+        } else {
+            auto_join_candidates.clone()
+        };
+        let mut successful_join: Option<(String, Option<String>)> = None;
+
+        for (t, mesh_name) in &join_attempts {
             match node.join(t).await {
                 Ok(()) => {
                     eprintln!("Joined mesh");
                     joined = true;
+                    successful_join = Some((t.clone(), mesh_name.clone()));
                     break;
                 }
                 Err(e) => tracing::warn!("Failed to join via token: {e}"),
             }
         }
+
+        if cli.join.is_empty() {
+            cli.join.clear();
+            if let Some((token, mesh_name)) = successful_join {
+                cli.join.push(token);
+                if cli.mesh_name.is_none() {
+                    if let Some(name) = mesh_name {
+                        cli.mesh_name = Some(name);
+                    }
+                }
+            }
+        }
+
         if !joined {
             eprintln!("Failed to join any peer — running standalone");
         }
@@ -1196,21 +1594,36 @@ async fn run_auto(
         }
     }
 
-    // Clean up stale processes from previous runs
-    launch::kill_orphan_rpc_servers().await;
+    // Drain stale pidfiles from our own runtime dir before spawning a new rpc-server
+    if let Some(ref rt) = runtime {
+        let _ = crate::runtime::instance::reap::reap_own_stale_pidfiles(rt.dir()).await;
+    }
 
-    // Start rpc-server
-    let rpc_port = launch::start_rpc_server(
+    // Serve mode (non-client) always has the InstanceRuntime acquired above.
+    // The fallback was only relevant during the T1-T11 staging when acquisition
+    // wasn't yet wired into run() — keep an explicit error here so any future
+    // refactor that drops the acquire surfaces immediately instead of panicking
+    // mid-spawn from a child task.
+    let runtime_arc = runtime
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("serve mode requires an instance runtime"))?
+        .clone();
+    let rpc_handle = launch::start_rpc_server(
+        &runtime_arc,
         &bin_dir,
         cli.llama_flavor,
-        cli.device.as_deref(),
+        startup_rpc_backend_device(cli.device.as_deref(), primary_startup_model.as_ref())?,
         Some(&model),
     )
     .await?;
-    tracing::info!("rpc-server on 127.0.0.1:{rpc_port} serving {model_name}");
+    tracing::info!(
+        "rpc-server on 127.0.0.1:{} (pid {}) serving {model_name}",
+        rpc_handle.port,
+        rpc_handle.pid
+    );
 
     let tunnel_mgr =
-        tunnel::Manager::start(node.clone(), rpc_port, channels.rpc, channels.http).await?;
+        tunnel::Manager::start(node.clone(), rpc_handle.port, channels.rpc, channels.http).await?;
 
     // Election publishes per-model targets
     let (target_tx, target_rx) = tokio::sync::watch::channel(election::ModelTargets::default());
@@ -1304,6 +1717,24 @@ async fn run_auto(
         None
     };
 
+    if !is_client {
+        if let Some(ref cs) = console_state {
+            if let Ok(root) = crate::runtime::instance::runtime_root() {
+                let li_handle = cs.local_instances_handle().await;
+                if let Ok(initial) =
+                    crate::runtime::instance::scan_local_instances(&root, std::process::id()).await
+                {
+                    *li_handle.lock().await = initial;
+                }
+                crate::runtime::instance::spawn_local_instance_scanner(
+                    root,
+                    std::process::id(),
+                    li_handle,
+                );
+            }
+        }
+    }
+
     // Election loop
     tracing::info!("Entering auto-election for model: {model_name}");
     let node2 = node.clone();
@@ -1331,13 +1762,33 @@ async fn run_auto(
     let primary_ctx_size = primary_startup_model
         .as_ref()
         .and_then(|model| model.ctx_size);
+    let primary_pinned_gpu = primary_startup_model
+        .as_ref()
+        .and_then(|model| model.pinned_gpu.clone());
     let (primary_stop_tx, primary_stop_rx) = tokio::sync::watch::channel(false);
+    let primary_runtime = runtime_arc.clone();
     let primary_task = tokio::spawn(async move {
         election::election_loop(
-            node2, tunnel_mgr2, api_port, rpc_port, bin_dir2, model2, model_name_for_election,
-            primary_mmproj,
-            draft2, draft_max, force_split, llama_flavor, primary_ctx_size, moe_runtime_options, primary_target_tx,
-            primary_stop_rx,
+            election::ElectionLoopParams {
+                runtime: primary_runtime,
+                node: node2,
+                tunnel_mgr: tunnel_mgr2,
+                ingress_http_port: api_port,
+                rpc_port: rpc_handle.port,
+                bin_dir: bin_dir2,
+                model: model2,
+                model_name: model_name_for_election,
+                explicit_mmproj: primary_mmproj,
+                draft: draft2,
+                draft_max,
+                force_split,
+                binary_flavor: llama_flavor,
+                ctx_size_override: primary_ctx_size,
+                pinned_gpu: primary_pinned_gpu,
+                moe_runtime_options,
+                target_tx: primary_target_tx,
+                stop_rx: primary_stop_rx,
+            },
             move |is_host, llama_ready| {
                 let advertise_node = node_for_cb.clone();
                 let advertise_model = primary_model_name_for_advertise.clone();
@@ -1455,6 +1906,7 @@ async fn run_auto(
             let extra_path = extra_model.resolved_path.clone();
             let extra_mmproj = extra_model.mmproj_path.clone();
             let extra_ctx_size = extra_model.ctx_size;
+            let extra_pinned_gpu = extra_model.pinned_gpu.clone();
             let extra_target_tx = target_tx.clone();
             let extra_model_name = extra_name.clone();
             let api_port_extra = api_port;
@@ -1470,12 +1922,29 @@ async fn run_auto(
             let managed_model_name = extra_name.clone();
             eprintln!("  + {extra_name}");
             let (extra_stop_tx, extra_stop_rx) = tokio::sync::watch::channel(false);
+            let extra_runtime = runtime_arc.clone();
             let extra_task = tokio::spawn(async move {
                 election::election_loop(
-                    extra_node, extra_tunnel, api_port_extra, 0, extra_bin, extra_path, extra_model_name.clone(),
-                    extra_mmproj,
-                    None, 8, false, extra_llama_flavor, extra_ctx_size, extra_moe_runtime_options, extra_target_tx,
-                    extra_stop_rx,
+                    election::ElectionLoopParams {
+                        runtime: extra_runtime,
+                        node: extra_node,
+                        tunnel_mgr: extra_tunnel,
+                        ingress_http_port: api_port_extra,
+                        rpc_port: 0,
+                        bin_dir: extra_bin,
+                        model: extra_path,
+                        model_name: extra_model_name.clone(),
+                        explicit_mmproj: extra_mmproj,
+                        draft: None,
+                        draft_max: 8,
+                        force_split: false,
+                        binary_flavor: extra_llama_flavor,
+                        ctx_size_override: extra_ctx_size,
+                        pinned_gpu: extra_pinned_gpu,
+                        moe_runtime_options: extra_moe_runtime_options,
+                        target_tx: extra_target_tx,
+                        stop_rx: extra_stop_rx,
+                    },
                     move |is_host, llama_ready| {
                         let advertise_node = extra_node_for_advertise.clone();
                         let model_name = extra_model_name_for_advertise.clone();
@@ -1571,11 +2040,11 @@ async fn run_auto(
         None
     };
 
-    // Wait for ctrl-c or runtime model control commands.
+    // Wait for SIGINT/SIGTERM or runtime model control commands.
     let primary_model_name = model_name.clone();
     loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
+            _ = wait_shutdown_signal() => {
                 eprintln!("\nShutting down...");
                 break;
             }
@@ -1597,6 +2066,7 @@ async fn run_auto(
                             add_serving_assignment(&node, &primary_model_name, &runtime_model_name)
                                 .await;
                             let (loaded_name, handle, death_rx) = start_runtime_local_model(
+                                &runtime_arc,
                                 &bin_dir,
                                 cli.llama_flavor,
                                 &node,
@@ -1733,15 +2203,40 @@ async fn run_auto(
         handle.process.shutdown().await;
     }
 
+    // Signal each election loop to stop, then give it a short window to drop
+    // its `llama_process` (which sends SIGTERM via the handle's Drop). Abort
+    // only as a fallback so the Drop chain still runs.
     for (_, controller) in managed_models.drain() {
         let _ = controller.stop_tx.send(true);
-        controller.task.abort();
+        let mut task = controller.task;
+        match tokio::time::timeout(std::time::Duration::from_secs(3), &mut task).await {
+            Ok(join_result) => {
+                let _ = join_result;
+            }
+            Err(_) => {
+                tracing::warn!("election task did not stop within 3s during shutdown");
+                task.abort();
+                let _ = task.await;
+            }
+        }
     }
 
     node.set_serving_models(Vec::new()).await;
     node.set_hosted_models(Vec::new()).await;
-    launch::kill_llama_server().await;
-    launch::kill_orphan_rpc_servers().await;
+    rpc_handle.shutdown().await;
+    if let Some(rt) = runtime {
+        let outstanding_refs = std::sync::Arc::strong_count(&rt);
+        if outstanding_refs == 1 {
+            let dir = rt.dir().to_path_buf();
+            drop(rt);
+            let _ = std::fs::remove_dir_all(&dir);
+        } else {
+            tracing::warn!(
+                outstanding_refs,
+                "skipping runtime directory removal during shutdown because runtime references remain"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1903,7 +2398,7 @@ async fn run_passive(
                 eprintln!("⬆️  Standby promoting to serve: {model_name}");
                 return Ok(Some(model_name));
             }
-            _ = tokio::signal::ctrl_c() => {
+            _ = wait_shutdown_signal() => {
                 eprintln!("\nShutting down...");
                 node.broadcast_leaving().await;
                 return Ok(None);
@@ -2044,6 +2539,7 @@ fn build_serving_list(resolved_models: &[PathBuf], model_name: &str) -> Vec<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::system::hardware::GpuFacts;
     use hf_hub::{Cache, Repo, RepoType};
     use serial_test::serial;
     use std::path::Path;
@@ -2055,6 +2551,30 @@ mod tests {
             std::env::set_var(key, value);
         } else {
             std::env::remove_var(key);
+        }
+    }
+
+    fn synthetic_gpu(
+        index: usize,
+        stable_id: Option<&str>,
+        backend_device: Option<&str>,
+    ) -> GpuFacts {
+        GpuFacts {
+            index,
+            display_name: format!("GPU {index}"),
+            backend_device: backend_device.map(str::to_string),
+            vram_bytes: 24_000_000_000,
+            reserved_bytes: None,
+            mem_bandwidth_gbps: None,
+            compute_tflops_fp32: None,
+            compute_tflops_fp16: None,
+            unified_memory: false,
+            stable_id: stable_id.map(str::to_string),
+            pci_bdf: None,
+            vendor_uuid: None,
+            metal_registry_id: None,
+            dxgi_luid: None,
+            pnp_instance_id: None,
         }
     }
 
@@ -2240,6 +2760,7 @@ mod tests {
                 model: "Ignored-Model".into(),
                 mmproj: Some("/tmp/ignored-mmproj.gguf".into()),
                 ctx_size: Some(8192),
+                gpu_id: None,
             }],
             ..plugin::MeshConfig::default()
         };
@@ -2249,6 +2770,8 @@ mod tests {
         assert_eq!(specs[0].model_ref, PathBuf::from("Qwen3-8B-Q4_K_M"));
         assert_eq!(specs[0].mmproj_ref, None);
         assert_eq!(specs[0].ctx_size, Some(4096));
+        assert_eq!(specs[0].gpu_id, None);
+        assert!(!specs[0].config_owned);
     }
 
     #[test]
@@ -2260,11 +2783,13 @@ mod tests {
                     model: "Qwen3-8B-Q4_K_M".into(),
                     mmproj: None,
                     ctx_size: Some(8192),
+                    gpu_id: None,
                 },
                 plugin::ModelConfigEntry {
                     model: "bartowski/Qwen2.5-VL/model.gguf".into(),
                     mmproj: Some("bartowski/Qwen2.5-VL/mmproj.gguf".into()),
                     ctx_size: Some(16384),
+                    gpu_id: None,
                 },
             ],
             ..plugin::MeshConfig::default()
@@ -2274,11 +2799,15 @@ mod tests {
         assert_eq!(specs.len(), 2);
         assert_eq!(specs[0].model_ref, PathBuf::from("Qwen3-8B-Q4_K_M"));
         assert_eq!(specs[0].ctx_size, Some(4096));
+        assert_eq!(specs[0].gpu_id, None);
+        assert!(specs[0].config_owned);
         assert_eq!(
             specs[1].mmproj_ref,
             Some(PathBuf::from("bartowski/Qwen2.5-VL/mmproj.gguf"))
         );
         assert_eq!(specs[1].ctx_size, Some(4096));
+        assert_eq!(specs[1].gpu_id, None);
+        assert!(specs[1].config_owned);
     }
 
     #[test]
@@ -2289,12 +2818,313 @@ mod tests {
                 model: "Qwen3-8B-Q4_K_M".into(),
                 mmproj: None,
                 ctx_size: Some(8192),
+                gpu_id: None,
             }],
             ..plugin::MeshConfig::default()
         };
 
         let specs = build_startup_model_specs(&cli, &config).unwrap();
         assert!(specs.is_empty());
+    }
+
+    #[test]
+    fn pinned_gpu_startup_preflight_uses_config_gpu_id() {
+        let cli = Cli::parse_from(["mesh-llm"]);
+        let config = plugin::MeshConfig {
+            gpu: plugin::GpuConfig {
+                assignment: plugin::GpuAssignment::Pinned,
+            },
+            models: vec![plugin::ModelConfigEntry {
+                model: "Qwen3-8B-Q4_K_M".into(),
+                mmproj: None,
+                ctx_size: Some(8192),
+                gpu_id: Some("pci:0000:65:00.0".into()),
+            }],
+            ..plugin::MeshConfig::default()
+        };
+        let specs = build_startup_model_specs(&cli, &config).unwrap();
+        let mut plans = vec![StartupModelPlan {
+            declared_ref: "Qwen3-8B-Q4_K_M".into(),
+            resolved_path: PathBuf::from("/tmp/Qwen3-8B-Q4_K_M.gguf"),
+            mmproj_path: None,
+            ctx_size: Some(8192),
+            gpu_id: specs[0].gpu_id.clone(),
+            pinned_gpu: None,
+        }];
+        let gpus = vec![
+            synthetic_gpu(0, Some("pci:0000:65:00.0"), Some("CUDA0")),
+            synthetic_gpu(1, Some("pci:0000:b3:00.0"), Some("CUDA1")),
+        ];
+
+        preflight_config_owned_startup_models_with_gpus(&config, &specs, &mut plans, &gpus)
+            .unwrap();
+
+        assert_eq!(plans[0].gpu_id.as_deref(), Some("pci:0000:65:00.0"));
+        assert_eq!(
+            plans[0].pinned_gpu,
+            Some(StartupPinnedGpuTarget {
+                index: 0,
+                stable_id: "pci:0000:65:00.0".into(),
+                backend_device: "CUDA0".into(),
+                vram_bytes: 24_000_000_000,
+            })
+        );
+    }
+
+    #[test]
+    fn pinned_gpu_startup_preflight_requests_per_gpu_vram_metrics() {
+        let metrics = pinned_startup_preflight_metrics();
+
+        assert_eq!(metrics.len(), 3);
+        assert!(metrics.contains(&hardware::Metric::GpuName));
+        assert!(metrics.contains(&hardware::Metric::GpuFacts));
+        assert!(metrics.contains(&hardware::Metric::VramBytes));
+    }
+
+    #[test]
+    fn pinned_gpu_startup_preflight_cli_models_bypass_config_gpu_id() {
+        let cli = Cli::parse_from(["mesh-llm", "--model", "Qwen3-8B-Q4_K_M"]);
+        let config = plugin::MeshConfig {
+            gpu: plugin::GpuConfig {
+                assignment: plugin::GpuAssignment::Pinned,
+            },
+            models: vec![plugin::ModelConfigEntry {
+                model: "Ignored-Model".into(),
+                mmproj: None,
+                ctx_size: Some(8192),
+                gpu_id: Some("pci:0000:65:00.0".into()),
+            }],
+            ..plugin::MeshConfig::default()
+        };
+        let specs = build_startup_model_specs(&cli, &config).unwrap();
+        let mut plans = vec![StartupModelPlan {
+            declared_ref: "Qwen3-8B-Q4_K_M".into(),
+            resolved_path: PathBuf::from("/tmp/Qwen3-8B-Q4_K_M.gguf"),
+            mmproj_path: None,
+            ctx_size: None,
+            gpu_id: specs[0].gpu_id.clone(),
+            pinned_gpu: None,
+        }];
+        let gpus = vec![synthetic_gpu(0, Some("pci:0000:65:00.0"), Some("CUDA0"))];
+
+        preflight_config_owned_startup_models_with_gpus(&config, &specs, &mut plans, &gpus)
+            .unwrap();
+
+        assert_eq!(specs[0].gpu_id, None);
+        assert!(!specs[0].config_owned);
+        assert_eq!(plans[0].gpu_id, None);
+        assert_eq!(plans[0].pinned_gpu, None);
+    }
+
+    #[test]
+    fn pinned_gpu_startup_preflight_missing_gpu_id_fails_closed() {
+        let config = plugin::MeshConfig {
+            gpu: plugin::GpuConfig {
+                assignment: plugin::GpuAssignment::Pinned,
+            },
+            ..plugin::MeshConfig::default()
+        };
+        let specs = vec![StartupModelSpec {
+            model_ref: PathBuf::from("Qwen3-8B-Q4_K_M"),
+            mmproj_ref: None,
+            ctx_size: None,
+            gpu_id: None,
+            config_owned: true,
+        }];
+        let mut plans = vec![StartupModelPlan {
+            declared_ref: "Qwen3-8B-Q4_K_M".into(),
+            resolved_path: PathBuf::from("/tmp/Qwen3-8B-Q4_K_M.gguf"),
+            mmproj_path: None,
+            ctx_size: None,
+            gpu_id: None,
+            pinned_gpu: None,
+        }];
+        let gpus = vec![synthetic_gpu(0, Some("pci:0000:65:00.0"), Some("CUDA0"))];
+
+        let err =
+            preflight_config_owned_startup_models_with_gpus(&config, &specs, &mut plans, &gpus)
+                .unwrap_err();
+        let message = format!("{err:#}");
+
+        assert!(message.contains("failed pinned GPU preflight"));
+        assert!(message.contains("missing configured gpu_id"));
+    }
+
+    #[test]
+    fn pinned_gpu_startup_preflight_stores_resolved_pinned_target_in_plan() {
+        let config = plugin::MeshConfig {
+            gpu: plugin::GpuConfig {
+                assignment: plugin::GpuAssignment::Pinned,
+            },
+            ..plugin::MeshConfig::default()
+        };
+        let specs = vec![StartupModelSpec {
+            model_ref: PathBuf::from("Qwen3-8B-Q4_K_M"),
+            mmproj_ref: None,
+            ctx_size: Some(4096),
+            gpu_id: Some("uuid:GPU-123".into()),
+            config_owned: true,
+        }];
+        let mut plans = vec![StartupModelPlan {
+            declared_ref: "Qwen3-8B-Q4_K_M".into(),
+            resolved_path: PathBuf::from("/tmp/Qwen3-8B-Q4_K_M.gguf"),
+            mmproj_path: None,
+            ctx_size: Some(4096),
+            gpu_id: Some("uuid:GPU-123".into()),
+            pinned_gpu: None,
+        }];
+        let gpus = vec![synthetic_gpu(3, Some("uuid:GPU-123"), Some("CUDA3"))];
+
+        preflight_config_owned_startup_models_with_gpus(&config, &specs, &mut plans, &gpus)
+            .unwrap();
+
+        let pinned_gpu = plans[0].pinned_gpu.as_ref().unwrap();
+        assert_eq!(pinned_gpu.index, 3);
+        assert_eq!(pinned_gpu.stable_id, "uuid:GPU-123");
+        assert_eq!(pinned_gpu.backend_device, "CUDA3");
+        assert_eq!(pinned_gpu.vram_bytes, 24_000_000_000);
+    }
+
+    #[test]
+    fn pinned_gpu_startup_preflight_rejects_resolved_gpu_without_backend_device() {
+        let config = plugin::MeshConfig {
+            gpu: plugin::GpuConfig {
+                assignment: plugin::GpuAssignment::Pinned,
+            },
+            ..plugin::MeshConfig::default()
+        };
+        let specs = vec![StartupModelSpec {
+            model_ref: PathBuf::from("Qwen3-8B-Q4_K_M"),
+            mmproj_ref: None,
+            ctx_size: Some(4096),
+            gpu_id: Some("uuid:GPU-123".into()),
+            config_owned: true,
+        }];
+        let mut plans = vec![StartupModelPlan {
+            declared_ref: "Qwen3-8B-Q4_K_M".into(),
+            resolved_path: PathBuf::from("/tmp/Qwen3-8B-Q4_K_M.gguf"),
+            mmproj_path: None,
+            ctx_size: Some(4096),
+            gpu_id: Some("uuid:GPU-123".into()),
+            pinned_gpu: None,
+        }];
+        let gpus = vec![synthetic_gpu(3, Some("uuid:GPU-123"), None)];
+
+        let err =
+            preflight_config_owned_startup_models_with_gpus(&config, &specs, &mut plans, &gpus)
+                .unwrap_err();
+        let message = format!("{err:#}");
+
+        assert!(message.contains("failed pinned GPU preflight"));
+        assert!(message.contains("without a backend_device"));
+    }
+
+    #[test]
+    fn pinned_gpu_startup_preflight_unresolvable_gpu_id_fails_closed() {
+        let config = plugin::MeshConfig {
+            gpu: plugin::GpuConfig {
+                assignment: plugin::GpuAssignment::Pinned,
+            },
+            ..plugin::MeshConfig::default()
+        };
+        let specs = vec![StartupModelSpec {
+            model_ref: PathBuf::from("Qwen3-8B-Q4_K_M"),
+            mmproj_ref: None,
+            ctx_size: None,
+            gpu_id: Some("pci:0000:b3:00.0".into()),
+            config_owned: true,
+        }];
+        let mut plans = vec![StartupModelPlan {
+            declared_ref: "Qwen3-8B-Q4_K_M".into(),
+            resolved_path: PathBuf::from("/tmp/Qwen3-8B-Q4_K_M.gguf"),
+            mmproj_path: None,
+            ctx_size: None,
+            gpu_id: Some("pci:0000:b3:00.0".into()),
+            pinned_gpu: None,
+        }];
+        let gpus = vec![synthetic_gpu(0, Some("pci:0000:65:00.0"), Some("CUDA0"))];
+
+        let err =
+            preflight_config_owned_startup_models_with_gpus(&config, &specs, &mut plans, &gpus)
+                .unwrap_err();
+        let message = format!("{err:#}");
+
+        assert!(message.contains("failed pinned GPU preflight"));
+        assert!(message.contains("did not match any available pinnable GPU"));
+    }
+
+    #[test]
+    fn pinned_gpu_startup_rpc_device_uses_explicit_cli_device_without_pinned_target() {
+        let device = startup_rpc_backend_device(Some("CUDA3"), None).unwrap();
+
+        assert_eq!(device, Some("CUDA3"));
+    }
+
+    #[test]
+    fn pinned_gpu_startup_rpc_device_allows_matching_explicit_and_pinned_device() {
+        let primary_startup_model = StartupModelPlan {
+            declared_ref: "Qwen3-8B-Q4_K_M".into(),
+            resolved_path: PathBuf::from("/tmp/Qwen3-8B-Q4_K_M.gguf"),
+            mmproj_path: None,
+            ctx_size: Some(8192),
+            gpu_id: Some("pci:0000:65:00.0".into()),
+            pinned_gpu: Some(StartupPinnedGpuTarget {
+                index: 0,
+                stable_id: "pci:0000:65:00.0".into(),
+                backend_device: "CUDA0".into(),
+                vram_bytes: 24_000_000_000,
+            }),
+        };
+
+        let device =
+            startup_rpc_backend_device(Some("CUDA0"), Some(&primary_startup_model)).unwrap();
+
+        assert_eq!(device, Some("CUDA0"));
+    }
+
+    #[test]
+    fn pinned_gpu_startup_rpc_device_falls_back_to_pinned_backend_device() {
+        let primary_startup_model = StartupModelPlan {
+            declared_ref: "Qwen3-8B-Q4_K_M".into(),
+            resolved_path: PathBuf::from("/tmp/Qwen3-8B-Q4_K_M.gguf"),
+            mmproj_path: None,
+            ctx_size: Some(8192),
+            gpu_id: Some("pci:0000:65:00.0".into()),
+            pinned_gpu: Some(StartupPinnedGpuTarget {
+                index: 0,
+                stable_id: "pci:0000:65:00.0".into(),
+                backend_device: "CUDA0".into(),
+                vram_bytes: 24_000_000_000,
+            }),
+        };
+
+        let device = startup_rpc_backend_device(None, Some(&primary_startup_model)).unwrap();
+
+        assert_eq!(device, Some("CUDA0"));
+    }
+
+    #[test]
+    fn pinned_gpu_startup_rpc_device_rejects_conflicting_explicit_and_pinned_device() {
+        let primary_startup_model = StartupModelPlan {
+            declared_ref: "Qwen3-8B-Q4_K_M".into(),
+            resolved_path: PathBuf::from("/tmp/Qwen3-8B-Q4_K_M.gguf"),
+            mmproj_path: None,
+            ctx_size: Some(8192),
+            gpu_id: Some("pci:0000:65:00.0".into()),
+            pinned_gpu: Some(StartupPinnedGpuTarget {
+                index: 0,
+                stable_id: "pci:0000:65:00.0".into(),
+                backend_device: "CUDA0".into(),
+                vram_bytes: 24_000_000_000,
+            }),
+        };
+
+        let err =
+            startup_rpc_backend_device(Some("CUDA3"), Some(&primary_startup_model)).unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("conflicts with pinned startup GPU backend device"));
     }
 
     #[test]
@@ -2316,6 +3146,8 @@ mod tests {
             model_ref: PathBuf::from("Qwen3-8B-Q4_K_M"),
             mmproj_ref: None,
             ctx_size: None,
+            gpu_id: None,
+            config_owned: false,
         }];
 
         assert!(!should_show_serve_config_help(
@@ -2452,5 +3284,29 @@ mod tests {
             draft = None;
         }
         assert!(draft.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_benchmark_result_bandwidth_still_works() {
+        let mem_arc = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+        let fp32_arc = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+        let fp16_arc = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+        let result = benchmark::BenchmarkResult {
+            mem_bandwidth_gbps: vec![10.5, 20.0],
+            compute_tflops_fp32: None,
+            compute_tflops_fp16: None,
+        };
+
+        store_benchmark_metrics(
+            mem_arc.clone(),
+            fp32_arc.clone(),
+            fp16_arc.clone(),
+            Some(&result),
+        )
+        .await;
+
+        assert_eq!(*mem_arc.lock().await, Some(vec![10.5, 20.0]));
+        assert!(fp32_arc.lock().await.is_none());
+        assert!(fp16_arc.lock().await.is_none());
     }
 }

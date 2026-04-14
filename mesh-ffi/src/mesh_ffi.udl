@@ -6,11 +6,13 @@ namespace mesh_ffi {
 [Error]
 enum FfiError {
     "InvalidInviteToken",
+    "InvalidOwnerKeypair",
     "JoinFailed",
     "DiscoveryFailed",
     "StreamFailed",
     "Cancelled",
     "ReconnectFailed",
+    "HostUnavailable",
 };
 
 interface MeshClientHandle {
