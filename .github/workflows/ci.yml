@@ -146,7 +146,15 @@ jobs:
 
       # ── llama.cpp (CPU-only for CI) ──
       - name: Clone llama.cpp fork
-        run: git clone -b upstream-latest --depth 1 https://github.com/michaelneale/llama.cpp.git llama.cpp
+        run: |
+          git clone -b master --depth 1 https://github.com/Mesh-LLM/llama.cpp.git llama.cpp
+          if [[ -f LLAMA_CPP_SHA ]]; then
+            SHA=$(tr -d '[:space:]' < LLAMA_CPP_SHA)
+            cd llama.cpp
+            git fetch --depth 1 origin "$SHA"
+            git checkout "$SHA"
+            cd ..
+          fi
 
       - name: Build llama.cpp (CPU + RPC)
         run: |
@@ -266,7 +274,15 @@ jobs:
       # ── llama.cpp (Metal + RPC) ──
       - name: Clone llama.cpp fork
         if: ${{ github.event_name == 'workflow_dispatch' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.ui == 'true' }}
-        run: git clone -b upstream-latest --depth 1 https://github.com/michaelneale/llama.cpp.git llama.cpp
+        run: |
+          git clone -b master --depth 1 https://github.com/Mesh-LLM/llama.cpp.git llama.cpp
+          if [[ -f LLAMA_CPP_SHA ]]; then
+            SHA=$(tr -d '[:space:]' < LLAMA_CPP_SHA)
+            cd llama.cpp
+            git fetch --depth 1 origin "$SHA"
+            git checkout "$SHA"
+            cd ..
+          fi
 
       - name: Build llama.cpp (CPU + RPC)
         if: ${{ github.event_name == 'workflow_dispatch' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.ui == 'true' }}
@@ -364,6 +380,11 @@ jobs:
             target/debug/mesh-llm \
             llama.cpp/build/bin \
             ~/.models/$MOE_MODEL_FILE
+
+      - name: Virtual LLM hook test
+        if: ${{ github.event_name == 'workflow_dispatch' || needs.changes.outputs.rust == 'true' }}
+        run: cargo test -p mesh-llm --test virtual_llm_injection -- --nocapture
+        timeout-minutes: 5
 
       - name: CLI smoke test
         if: ${{ github.event_name == 'workflow_dispatch' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.ui == 'true' }}
@@ -529,7 +550,7 @@ jobs:
       #   4. MESH_LLM_LLAMA_PIN_SHA — pin the llama.cpp checkout to the SHA
       #      embedded in the artifact cache key (above). NEVER set this in
       #      release.yml; release artifacts must build the current
-      #      upstream-latest tip.
+      #      master tip.
       #
       # Split into two mutually exclusive steps keyed off the artifact cache:
       #
@@ -668,6 +689,7 @@ jobs:
             . -> target
           prefix-key: ${{ env.CACHE_NAMESPACE }}-rust-${{ hashFiles('.github/cache-version.txt') }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
+
 
       - name: Restore llama.cpp ROCm cache
         if: ${{ github.event_name == 'workflow_dispatch' || needs.changes.outputs.rust == 'true' }}
