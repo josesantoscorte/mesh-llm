@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 mod api;
 mod cli;
 pub mod crypto;
@@ -21,7 +23,7 @@ pub(crate) use plugins::blackboard;
 
 use anyhow::Result;
 
-pub const VERSION: &str = "0.60.3";
+pub const VERSION: &str = "0.62.0";
 
 pub async fn run() -> Result<()> {
     runtime::run().await
