@@ -110,10 +110,6 @@ val buildNativeLibs by tasks.registering {
     )
 }
 
-tasks.named("assembleAar") {
-    dependsOn(buildNativeLibs)
-}
-
 // Assemble a distributable AAR artifact (ZIP format) containing:
 //   classes.jar              — compiled Kotlin classes
 //   jni/<abi>/libmesh_ffi.so — native shared libraries
@@ -123,6 +119,7 @@ val assembleAar by tasks.registering(Zip::class) {
     description = "Assemble AAR artifact with native libs and consumer ProGuard rules"
     group = "build"
 
+    dependsOn(buildNativeLibs)
     dependsOn("jar")
 
     archiveFileName.set("meshllm.aar")
