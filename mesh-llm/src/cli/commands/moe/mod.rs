@@ -163,8 +163,10 @@ async fn run_analyze_full(
         n_gpu_layers.to_string(),
     ];
     run_analyzer_command(&command, &log_path, "full-v1")?;
+    let analysis_path = moe_planner::write_analysis_json(&resolved, &output_path, "full-v1")?;
     println!("✅ Full MoE analysis complete");
     println!("  Ranking: {}", output_path.display());
+    println!("  Analysis: {}", analysis_path.display());
     println!("  Log: {}", log_path.display());
     print_submit_suggestion(&resolved.path);
     Ok(())
@@ -299,8 +301,10 @@ async fn run_analyze_micro(
         &ranking,
         ranking.iter().map(|(_, values)| values.0).sum::<f64>(),
     )?;
+    let analysis_path = moe_planner::write_analysis_json(&resolved, &cache_path, "micro-v1")?;
     println!("✅ Micro MoE analysis complete");
     println!("  Ranking: {}", cache_path.display());
+    println!("  Analysis: {}", analysis_path.display());
     if !wrote_cache {
         println!(
             "  Note: A stronger or equivalent shared ranking already exists, so this micro-v1 result was not promoted as the preferred shared artifact."
@@ -449,6 +453,10 @@ async fn run_share(model: &str, ranking_file: Option<&Path>, dataset_repo: &str)
         &format!("{}/metadata.json", bundle.dataset_prefix),
         bundle.metadata_content.as_bytes(),
     ));
+    operations.push(ndjson_file_op(
+        &format!("{}/analysis.json", bundle.dataset_prefix),
+        bundle.analysis_content.as_bytes(),
+    ));
     if let Some(log_path) = bundle.log_path.as_ref() {
         operations.push(ndjson_file_op(
             &format!("{}/run.log", bundle.dataset_prefix),
@@ -567,6 +575,7 @@ mod tests {
         let all = vec![
             "a/ranking.csv".to_string(),
             "a/metadata.json".to_string(),
+            "a/analysis.json".to_string(),
             "a/run.log".to_string(),
         ];
         assert_eq!(classify_share_prefix(&all, &[]), SharePrefixState::New);
