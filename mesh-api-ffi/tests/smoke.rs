@@ -1,5 +1,7 @@
 use mesh_ffi::{create_client, EventDto, EventListener, FfiError};
+use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 fn valid_owner_keypair_hex() -> String {
     mesh_api::OwnerKeypair::generate().to_hex()
@@ -21,6 +23,20 @@ impl EventListener for MockListener {
             EventDto::Disconnected { .. } => "Disconnected".to_string(),
         };
         self.events.lock().unwrap().push(name);
+    }
+}
+
+struct ReentrantListener {
+    handle: Arc<mesh_ffi::MeshClientHandle>,
+    sender: Mutex<Sender<mesh_ffi::StatusDto>>,
+}
+
+impl EventListener for ReentrantListener {
+    fn on_event(&self, event: EventDto) {
+        if let EventDto::Completed { .. } = event {
+            let status = self.handle.status();
+            let _ = self.sender.lock().unwrap().send(status);
+        }
     }
 }
 
@@ -123,6 +139,31 @@ fn handle_create_destroy_loop_25_times() {
         let status = handle.status();
         assert!(!status.connected, "iteration {}: expected disconnected", i);
     }
+}
+
+#[test]
+fn listener_can_reenter_handle_during_callback() {
+    let handle = create_client(valid_owner_keypair_hex(), "valid-token".to_string()).unwrap();
+    let (tx, rx) = mpsc::channel();
+    let request_id = handle.chat(
+        mesh_ffi::ChatRequestDto {
+            model: "test-model".to_string(),
+            messages: vec![mesh_ffi::ChatMessageDto {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+            }],
+        },
+        Box::new(ReentrantListener {
+            handle: handle.clone(),
+            sender: Mutex::new(tx),
+        }),
+    );
+
+    assert!(!request_id.is_empty(), "chat should return a request id");
+    let status = rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("callback should be able to reenter handle without deadlocking");
+    assert!(!status.connected);
 }
 
 #[test]

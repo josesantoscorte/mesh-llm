@@ -4,7 +4,8 @@ use mesh_api::{
     ChatMessage, ChatRequest, ClientBuilder, InviteToken, MeshClient, RequestId, ResponsesRequest,
 };
 use pollster::block_on;
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
 
 uniffi::setup_scaffolding!("mesh_ffi");
 
@@ -105,7 +106,38 @@ impl CoreEventListener for EventListenerBridge {
 
 #[derive(uniffi::Object)]
 pub struct MeshClientHandle {
-    inner: Mutex<MeshClient>,
+    command_tx: mpsc::Sender<ClientCommand>,
+    worker: Mutex<Option<thread::JoinHandle<()>>>,
+}
+
+enum ClientCommand {
+    Join {
+        response_tx: mpsc::SyncSender<Result<(), FfiError>>,
+    },
+    ListModels {
+        response_tx: mpsc::SyncSender<Result<Vec<ModelDto>, FfiError>>,
+    },
+    Chat {
+        request: ChatRequestDto,
+        listener: Box<dyn EventListener>,
+        response_tx: mpsc::SyncSender<String>,
+    },
+    Responses {
+        request: ResponsesRequestDto,
+        listener: Box<dyn EventListener>,
+        response_tx: mpsc::SyncSender<String>,
+    },
+    Cancel {
+        request_id: String,
+    },
+    Status {
+        response_tx: mpsc::SyncSender<StatusDto>,
+    },
+    Disconnect,
+    Reconnect {
+        response_tx: mpsc::SyncSender<Result<(), FfiError>>,
+    },
+    Shutdown,
 }
 
 /// Generate a fresh owner keypair, returning its hex-encoded form.
@@ -139,45 +171,42 @@ pub fn create_client(
     let client = ClientBuilder::new(kp, token)
         .build()
         .map_err(|_| FfiError::BuildFailed)?;
+    let (command_tx, command_rx) = mpsc::channel();
+    let worker = thread::Builder::new()
+        .name("mesh-ffi-client".to_string())
+        .spawn(move || run_client_worker(client, command_rx))
+        .map_err(|_| FfiError::BuildFailed)?;
     Ok(Arc::new(MeshClientHandle {
-        inner: Mutex::new(client),
+        command_tx,
+        worker: Mutex::new(Some(worker)),
     }))
 }
 
 #[uniffi::export]
 impl MeshClientHandle {
     pub fn join(&self) -> Result<(), FfiError> {
-        let mut client = self.inner.lock().unwrap();
-        block_on(client.join()).map_err(|_| FfiError::JoinFailed)
+        let (response_tx, response_rx) = mpsc::sync_channel(1);
+        self.send_command(ClientCommand::Join { response_tx })?;
+        response_rx.recv().map_err(|_| FfiError::JoinFailed)?
     }
 
     pub fn list_models(&self) -> Result<Vec<ModelDto>, FfiError> {
-        let client = self.inner.lock().unwrap();
-        let models = block_on(client.list_models()).map_err(|_| FfiError::DiscoveryFailed)?;
-        Ok(models
-            .into_iter()
-            .map(|m| ModelDto {
-                id: m.id,
-                name: m.name,
-            })
-            .collect())
+        let (response_tx, response_rx) = mpsc::sync_channel(1);
+        self.send_command(ClientCommand::ListModels { response_tx })?;
+        response_rx.recv().map_err(|_| FfiError::DiscoveryFailed)?
     }
 
     pub fn chat(&self, request: ChatRequestDto, listener: Box<dyn EventListener>) -> String {
-        let client = self.inner.lock().unwrap();
-        let bridge = Arc::new(EventListenerBridge { inner: listener });
-        let req = ChatRequest {
-            model: request.model,
-            messages: request
-                .messages
-                .into_iter()
-                .map(|m| ChatMessage {
-                    role: m.role,
-                    content: m.content,
-                })
-                .collect(),
-        };
-        client.chat(req, bridge).0
+        let (response_tx, response_rx) = mpsc::sync_channel(1);
+        self.send_command(ClientCommand::Chat {
+            request,
+            listener,
+            response_tx,
+        })
+        .expect("mesh ffi client worker should accept chat commands");
+        response_rx
+            .recv()
+            .expect("mesh ffi client worker should return chat request ids")
     }
 
     pub fn responses(
@@ -185,36 +214,137 @@ impl MeshClientHandle {
         request: ResponsesRequestDto,
         listener: Box<dyn EventListener>,
     ) -> String {
-        let client = self.inner.lock().unwrap();
-        let bridge = Arc::new(EventListenerBridge { inner: listener });
-        let req = ResponsesRequest {
-            model: request.model,
-            input: request.input,
-        };
-        client.responses(req, bridge).0
+        let (response_tx, response_rx) = mpsc::sync_channel(1);
+        self.send_command(ClientCommand::Responses {
+            request,
+            listener,
+            response_tx,
+        })
+        .expect("mesh ffi client worker should accept responses commands");
+        response_rx
+            .recv()
+            .expect("mesh ffi client worker should return responses request ids")
     }
 
     pub fn cancel(&self, request_id: String) {
-        let client = self.inner.lock().unwrap();
-        client.cancel(RequestId(request_id));
+        let _ = self.send_command(ClientCommand::Cancel { request_id });
     }
 
     pub fn status(&self) -> StatusDto {
-        let client = self.inner.lock().unwrap();
-        let s = block_on(client.status());
-        StatusDto {
-            connected: s.connected,
-            peer_count: s.peer_count as u64,
+        let (response_tx, response_rx) = mpsc::sync_channel(1);
+        if self
+            .send_command(ClientCommand::Status { response_tx })
+            .is_err()
+        {
+            return StatusDto {
+                connected: false,
+                peer_count: 0,
+            };
         }
+        response_rx.recv().unwrap_or(StatusDto {
+            connected: false,
+            peer_count: 0,
+        })
     }
 
     pub fn disconnect(&self) {
-        let mut client = self.inner.lock().unwrap();
-        block_on(client.disconnect());
+        let _ = self.send_command(ClientCommand::Disconnect);
     }
 
     pub fn reconnect(&self) -> Result<(), FfiError> {
-        let mut client = self.inner.lock().unwrap();
-        block_on(client.reconnect()).map_err(|_| FfiError::ReconnectFailed)
+        let (response_tx, response_rx) = mpsc::sync_channel(1);
+        self.send_command(ClientCommand::Reconnect { response_tx })?;
+        response_rx.recv().map_err(|_| FfiError::ReconnectFailed)?
+    }
+}
+
+impl MeshClientHandle {
+    fn send_command(&self, command: ClientCommand) -> Result<(), FfiError> {
+        self.command_tx
+            .send(command)
+            .map_err(|_| FfiError::HostUnavailable)
+    }
+}
+
+impl Drop for MeshClientHandle {
+    fn drop(&mut self) {
+        let _ = self.command_tx.send(ClientCommand::Shutdown);
+        if let Some(worker) = self.worker.lock().unwrap().take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn run_client_worker(mut client: MeshClient, command_rx: mpsc::Receiver<ClientCommand>) {
+    while let Ok(command) = command_rx.recv() {
+        match command {
+            ClientCommand::Join { response_tx } => {
+                let result = block_on(client.join()).map_err(|_| FfiError::JoinFailed);
+                let _ = response_tx.send(result);
+            }
+            ClientCommand::ListModels { response_tx } => {
+                let result = block_on(client.list_models())
+                    .map(|models| {
+                        models
+                            .into_iter()
+                            .map(|m| ModelDto {
+                                id: m.id,
+                                name: m.name,
+                            })
+                            .collect()
+                    })
+                    .map_err(|_| FfiError::DiscoveryFailed);
+                let _ = response_tx.send(result);
+            }
+            ClientCommand::Chat {
+                request,
+                listener,
+                response_tx,
+            } => {
+                let bridge = Arc::new(EventListenerBridge { inner: listener });
+                let req = ChatRequest {
+                    model: request.model,
+                    messages: request
+                        .messages
+                        .into_iter()
+                        .map(|m| ChatMessage {
+                            role: m.role,
+                            content: m.content,
+                        })
+                        .collect(),
+                };
+                let _ = response_tx.send(client.chat(req, bridge).0);
+            }
+            ClientCommand::Responses {
+                request,
+                listener,
+                response_tx,
+            } => {
+                let bridge = Arc::new(EventListenerBridge { inner: listener });
+                let req = ResponsesRequest {
+                    model: request.model,
+                    input: request.input,
+                };
+                let _ = response_tx.send(client.responses(req, bridge).0);
+            }
+            ClientCommand::Cancel { request_id } => {
+                client.cancel(RequestId(request_id));
+            }
+            ClientCommand::Status { response_tx } => {
+                let status = block_on(client.status());
+                let _ = response_tx.send(StatusDto {
+                    connected: status.connected,
+                    peer_count: status.peer_count as u64,
+                });
+            }
+            ClientCommand::Disconnect => {
+                block_on(client.disconnect());
+            }
+            ClientCommand::Reconnect { response_tx } => {
+                let result = block_on(client.reconnect()).map_err(|_| FfiError::ReconnectFailed);
+                let _ = response_tx.send(result);
+            }
+            ClientCommand::Shutdown => break,
+        }
     }
 }
