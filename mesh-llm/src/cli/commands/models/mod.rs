@@ -141,7 +141,7 @@ fn build_installed_rows() -> Vec<InstalledRow> {
             let display_name = crate::models::installed_model_display_name(&name);
             let catalog_model = find_catalog_model_exact(&name);
             let model_ref = if let Some(model) = catalog_model {
-                model.name.clone()
+                model.model_ref.clone()
             } else if let Some(identity) = crate::models::huggingface_identity_for_path(&path) {
                 crate::models::installed_model_huggingface_ref(&identity)
             } else {

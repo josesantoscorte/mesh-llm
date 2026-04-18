@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "source_repo": "unsloth/Qwen3.5-9B-GGUF",
+  "variants": {
+    "Qwen3.5-9B-Q4_K_M": {
+      "source": {
+        "repo": "unsloth/Qwen3.5-9B-GGUF",
+        "revision": "main",
+        "file": "Qwen3.5-9B-Q4_K_M.gguf"
+      },
+      "curated": {
+        "name": "Qwen3.5-9B-Vision-Q4_K_M",
+        "size": "5.8GB",
+        "description": "Vision + text, replaces Qwen3-8B with image understanding",
+        "draft": null,
+        "moe": null,
+        "extra_files": [],
+        "mmproj": {
+          "file": "mmproj-BF16.gguf",
+          "repo": "unsloth/Qwen3.5-9B-GGUF",
+          "revision": "main"
+        }
+      },
+      "packages": []
+    }
+  }
+}

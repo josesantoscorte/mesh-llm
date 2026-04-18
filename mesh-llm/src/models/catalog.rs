@@ -1,29 +1,77 @@
-//! Built-in model catalog plus managed acquisition helpers.
+//! Hugging Face-backed curated model catalog plus managed acquisition helpers.
 
 use super::track_managed_model_usage;
 use crate::cli::terminal_progress::{start_spinner, SpinnerHandle};
 use anyhow::{Context, Result};
 use hf_hub::{DownloadEvent, Progress, ProgressEvent, ProgressHandler, RepoDownloadFileParams};
 use serde::Deserialize;
+use std::collections::BTreeMap;
 #[cfg(test)]
 use std::collections::HashMap;
+use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 use tokio::io::AsyncWriteExt;
-#[derive(Clone, Debug, Deserialize)]
+
+const DEFAULT_CURATED_CATALOG_DATASET: &str = "meshllm/catalog";
+const DEFAULT_CURATED_CATALOG_ROOT: &str = "entries";
+
+#[derive(Clone, Debug, Deserialize, serde::Serialize, Eq, PartialEq)]
 pub struct CatalogAsset {
     pub file: String,
-    pub url: String,
+    pub repo: String,
+    pub revision: String,
+}
+
+#[derive(Clone, Debug, Deserialize, serde::Serialize, Eq, PartialEq)]
+pub struct CatalogSource {
+    pub repo: String,
+    pub revision: String,
+    pub file: String,
+}
+
+#[derive(Clone, Debug, Deserialize, serde::Serialize, Eq, PartialEq)]
+pub struct CatalogPackagePointer {
+    pub package_repo: String,
+    pub package_revision: String,
+    pub publisher: String,
+    pub trust: String,
+}
+
+#[derive(Clone, Debug, Deserialize, serde::Serialize, Eq, PartialEq)]
+pub struct CatalogCuratedVariant {
+    pub name: String,
+    pub size: String,
+    pub description: String,
+    pub draft: Option<String>,
+    pub moe: Option<CatalogMoeConfigJson>,
+    #[serde(default)]
+    pub extra_files: Vec<CatalogAsset>,
+    pub mmproj: Option<CatalogAsset>,
+}
+
+#[derive(Clone, Debug, Deserialize, serde::Serialize, Eq, PartialEq)]
+pub struct CatalogVariantEntry {
+    pub source: CatalogSource,
+    pub curated: Option<CatalogCuratedVariant>,
+    #[serde(default)]
+    pub packages: Vec<CatalogPackagePointer>,
+}
+
+#[derive(Clone, Debug, Deserialize, serde::Serialize, Eq, PartialEq)]
+pub struct CatalogRepoEntry {
+    pub schema_version: u32,
+    pub source_repo: String,
+    pub variants: BTreeMap<String, CatalogVariantEntry>,
 }
 
 #[derive(Clone, Debug)]
 pub struct CatalogModel {
     pub name: String,
+    pub model_ref: String,
     pub file: String,
-    /// Legacy transport field. Prefer `source_repo()`, `source_revision()`,
-    /// and `source_file()` for curated model identity.
-    pub url: String,
+    pub source: CatalogSource,
     pub size: String,
     pub description: String,
     /// If set, this model has a recommended draft model for speculative decoding.
@@ -42,15 +90,23 @@ pub struct CatalogModel {
 
 impl CatalogModel {
     pub fn source_repo(&self) -> Option<&str> {
-        parse_hf_resolve_url_parts(&self.url).map(|(repo, _, _)| repo)
+        Some(self.source.repo.as_str())
     }
 
     pub fn source_revision(&self) -> Option<&str> {
-        parse_hf_resolve_url_parts(&self.url).and_then(|(_, revision, _)| revision)
+        Some(self.source.revision.as_str())
     }
 
     pub fn source_file(&self) -> Option<&str> {
-        parse_hf_resolve_url_parts(&self.url).map(|(_, _, file)| file)
+        Some(self.source.file.as_str())
+    }
+
+    pub fn primary_asset(&self) -> CatalogAsset {
+        CatalogAsset {
+            file: self.source.file.clone(),
+            repo: self.source.repo.clone(),
+            revision: self.source.revision.clone(),
+        }
     }
 }
 
@@ -69,22 +125,8 @@ pub struct MoeConfig {
     pub ranking: Vec<u32>,
 }
 
-#[derive(Debug, Deserialize)]
-struct CatalogModelJson {
-    name: String,
-    file: String,
-    url: String,
-    size: String,
-    description: String,
-    draft: Option<String>,
-    moe: Option<MoeConfigJson>,
-    #[serde(default)]
-    extra_files: Vec<CatalogAsset>,
-    mmproj: Option<CatalogAsset>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct MoeConfigJson {
+#[derive(Clone, Debug, Deserialize, serde::Serialize, Eq, PartialEq)]
+pub struct CatalogMoeConfigJson {
     n_expert: u32,
     n_expert_used: u32,
     min_experts_per_node: u32,
@@ -93,29 +135,15 @@ struct MoeConfigJson {
 pub static MODEL_CATALOG: LazyLock<Vec<CatalogModel>> = LazyLock::new(load_catalog);
 
 fn load_catalog() -> Vec<CatalogModel> {
-    let raw: Vec<CatalogModelJson> =
-        serde_json::from_str(include_str!("catalog.json")).expect("parse bundled catalog.json");
-    raw.into_iter().map(CatalogModel::from_json).collect()
-}
-
-impl CatalogModel {
-    fn from_json(raw: CatalogModelJson) -> Self {
-        Self {
-            name: raw.name,
-            file: raw.file,
-            url: raw.url,
-            size: raw.size,
-            description: raw.description,
-            draft: raw.draft,
-            moe: raw.moe.map(MoeConfig::from_json),
-            extra_files: raw.extra_files,
-            mmproj: raw.mmproj,
-        }
-    }
+    load_curated_catalog_entries()
+        .expect("load Mesh catalog from Hugging Face or test fixture")
+        .into_iter()
+        .flat_map(|entry| flatten_curated_catalog_entry(&entry))
+        .collect()
 }
 
 impl MoeConfig {
-    fn from_json(raw: MoeConfigJson) -> Self {
+    fn from_json(raw: CatalogMoeConfigJson) -> Self {
         Self {
             n_expert: raw.n_expert,
             n_expert_used: raw.n_expert_used,
@@ -123,6 +151,158 @@ impl MoeConfig {
             ranking: Vec::new(),
         }
     }
+}
+
+fn curated_catalog_dataset_repo() -> String {
+    std::env::var("MESH_LLM_CATALOG_DATASET")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_CURATED_CATALOG_DATASET.to_string())
+}
+
+fn curated_catalog_root_path() -> String {
+    std::env::var("MESH_LLM_CATALOG_ROOT")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_CURATED_CATALOG_ROOT.to_string())
+}
+
+fn load_curated_catalog_entries() -> Result<Vec<CatalogRepoEntry>> {
+    if let Ok(path) = std::env::var("MESH_LLM_CATALOG_LOCAL_PATH") {
+        let path = path.trim();
+        if !path.is_empty() {
+            return load_catalog_entries_from_local_root(Path::new(path));
+        }
+    }
+
+    #[cfg(test)]
+    {
+        let fixture_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("catalog");
+        if fixture_root.exists() {
+            return load_catalog_entries_from_local_root(&fixture_root);
+        }
+    }
+
+    load_catalog_entries_from_hf()
+}
+
+fn load_catalog_entries_from_local_root(root: &Path) -> Result<Vec<CatalogRepoEntry>> {
+    let entries_root = root.join(curated_catalog_root_path());
+    let mut files = Vec::new();
+    collect_catalog_json_files(&entries_root, &mut files)?;
+    files.sort();
+    let mut entries = Vec::new();
+    for file in files {
+        let bytes = fs::read(&file).with_context(|| format!("Read {}", file.display()))?;
+        let entry: CatalogRepoEntry =
+            serde_json::from_slice(&bytes).with_context(|| format!("Parse {}", file.display()))?;
+        validate_catalog_repo_entry(&entry, &file.display().to_string())?;
+        entries.push(entry);
+    }
+    Ok(entries)
+}
+
+fn collect_catalog_json_files(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    if !root.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(root).with_context(|| format!("Read dir {}", root.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_catalog_json_files(&path, out)?;
+        } else if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn load_catalog_entries_from_hf() -> Result<Vec<CatalogRepoEntry>> {
+    let repo_id = curated_catalog_dataset_repo();
+    let catalog_root = format!("{}/", curated_catalog_root_path().trim_end_matches('/'));
+    let (owner, name) = repo_id
+        .split_once('/')
+        .with_context(|| format!("Invalid Mesh catalog repo id {}", repo_id))?;
+    let api = crate::models::build_hf_api(false)?;
+    let dataset = api.dataset(owner, name);
+    let info = dataset
+        .info(
+            &hf_hub::RepoInfoParams::builder()
+                .revision("main".to_string())
+                .build(),
+        )
+        .with_context(|| format!("Fetch Mesh catalog repo info for {}", repo_id))?;
+    let hf_hub::RepoInfo::Dataset(info) = info else {
+        anyhow::bail!("Expected dataset repo info for {}", repo_id);
+    };
+    let revision = info.sha.as_deref().unwrap_or("main");
+    let mut repo_paths = info
+        .siblings
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .filter(|entry| {
+            entry.rfilename.starts_with(&catalog_root) && entry.rfilename.ends_with(".json")
+        })
+        .map(|entry| entry.rfilename.clone())
+        .collect::<Vec<_>>();
+    repo_paths.sort();
+    let mut entries = Vec::new();
+    for repo_path in repo_paths {
+        let downloaded = dataset
+            .download_file(
+                &RepoDownloadFileParams::builder()
+                    .filename(repo_path.clone())
+                    .revision(revision.to_string())
+                    .build(),
+            )
+            .with_context(|| format!("Download Mesh catalog entry {}", repo_path))?;
+        let bytes = fs::read(&downloaded)
+            .with_context(|| format!("Read downloaded Mesh catalog {}", downloaded.display()))?;
+        let entry: CatalogRepoEntry = serde_json::from_slice(&bytes)
+            .with_context(|| format!("Parse downloaded Mesh catalog {}", downloaded.display()))?;
+        validate_catalog_repo_entry(&entry, &downloaded.display().to_string())?;
+        entries.push(entry);
+    }
+    Ok(entries)
+}
+
+fn validate_catalog_repo_entry(entry: &CatalogRepoEntry, label: &str) -> Result<()> {
+    anyhow::ensure!(
+        entry.schema_version == 1,
+        "Unsupported Mesh catalog schema version {} in {}",
+        entry.schema_version,
+        label
+    );
+    Ok(())
+}
+
+fn flatten_curated_catalog_entry(entry: &CatalogRepoEntry) -> Vec<CatalogModel> {
+    entry
+        .variants
+        .iter()
+        .filter_map(|(variant, variant_entry)| {
+            let curated = variant_entry.curated.as_ref()?;
+            Some(CatalogModel {
+                name: curated.name.clone(),
+                model_ref: format!("{}:{}", entry.source_repo, variant),
+                file: variant_entry.source.file.clone(),
+                source: variant_entry.source.clone(),
+                size: curated.size.clone(),
+                description: curated.description.clone(),
+                draft: curated.draft.clone(),
+                moe: curated.moe.clone().map(MoeConfig::from_json),
+                extra_files: curated.extra_files.clone(),
+                mmproj: curated.mmproj.clone(),
+            })
+        })
+        .collect()
 }
 
 /// Get the canonical managed model root (the Hugging Face hub cache).
@@ -147,12 +327,16 @@ pub fn find_model(query: &str) -> Option<&'static CatalogModel> {
     let q = query.to_lowercase();
     MODEL_CATALOG
         .iter()
-        .find(|m| m.name.to_lowercase() == q)
+        .find(|m| m.name.to_lowercase() == q || m.model_ref.to_lowercase() == q)
         .or_else(|| {
-            MODEL_CATALOG
-                .iter()
-                .find(|m| m.name.to_lowercase().contains(&q))
+            MODEL_CATALOG.iter().find(|m| {
+                m.name.to_lowercase().contains(&q) || m.model_ref.to_lowercase().contains(&q)
+            })
         })
+}
+
+pub fn huggingface_repo_url(repo: &str) -> String {
+    format!("https://huggingface.co/{repo}")
 }
 
 fn parse_hf_resolve_url_parts(url: &str) -> Option<(&str, Option<&str>, &str)> {
@@ -170,11 +354,6 @@ fn parse_hf_resolve_url_parts(url: &str) -> Option<(&str, Option<&str>, &str)> {
     Some((repo, Some(revision), file))
 }
 
-pub fn huggingface_repo_url(url: &str) -> Option<String> {
-    let (repo, _, _) = parse_hf_resolve_url_parts(url)?;
-    Some(format!("https://huggingface.co/{repo}"))
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct HfAsset {
     repo: String,
@@ -190,13 +369,12 @@ impl HfAsset {
     }
 }
 
-fn hf_asset_from_url(url: &str) -> Option<HfAsset> {
-    let (repo, revision, file) = parse_hf_resolve_url_parts(url)?;
-    Some(HfAsset {
-        repo: repo.to_string(),
-        revision: revision.unwrap_or("main").to_string(),
-        file: file.to_string(),
-    })
+fn hf_asset_from_catalog_asset(asset: &CatalogAsset) -> HfAsset {
+    HfAsset {
+        repo: asset.repo.clone(),
+        revision: asset.revision.clone(),
+        file: asset.file.clone(),
+    }
 }
 
 fn expand_split_asset(asset: &HfAsset) -> Result<Vec<HfAsset>> {
@@ -807,49 +985,25 @@ pub async fn download_model(model: &CatalogModel) -> Result<PathBuf> {
 }
 
 pub async fn download_model_with_progress(model: &CatalogModel, progress: bool) -> Result<PathBuf> {
-    let hf_assets: Option<Vec<HfAsset>> = std::iter::once(model.url.as_str())
-        .chain(model.extra_files.iter().map(|asset| asset.url.as_str()))
-        .chain(model.mmproj.iter().map(|asset| asset.url.as_str()))
-        .map(hf_asset_from_url)
+    let assets: Vec<HfAsset> = std::iter::once(model.primary_asset())
+        .chain(model.extra_files.iter().cloned())
+        .chain(model.mmproj.iter().cloned())
+        .map(|asset| hf_asset_from_catalog_asset(&asset))
         .collect();
-    if let Some(assets) = hf_assets {
-        let source = model.source_file().unwrap_or(model.file.as_str());
-        let mut paths = download_hf_assets(&model.name, assets, progress).await?;
-        paths.sort();
-        let managed_paths = paths.clone();
-        if let Some(path) = paths
-            .iter()
-            .find(|path| path_suffix_matches_ignore_case(path, source))
-            .cloned()
-        {
-            if let Err(err) = track_managed_model_usage(
-                &path,
-                &managed_paths,
-                &model.name,
-                Some(&model.name),
-                "catalog",
-            ) {
-                tracing::warn!(
-                    "failed to record managed model usage for {}: {err}",
-                    path.display()
-                );
-            }
-            return Ok(path);
-        }
-        let path = paths
-            .into_iter()
-            .find(|path| path_suffix_matches_ignore_case(path, &model.file))
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Downloaded model path not found in cache for {}",
-                    model.name
-                )
-            })?;
+    let source = model.source_file().unwrap_or(model.file.as_str());
+    let mut paths = download_hf_assets(&model.name, assets, progress).await?;
+    paths.sort();
+    let managed_paths = paths.clone();
+    if let Some(path) = paths
+        .iter()
+        .find(|path| path_suffix_matches_ignore_case(path, source))
+        .cloned()
+    {
         if let Err(err) = track_managed_model_usage(
             &path,
             &managed_paths,
             &model.name,
-            Some(&model.name),
+            Some(&model.model_ref),
             "catalog",
         ) {
             tracing::warn!(
@@ -859,121 +1013,28 @@ pub async fn download_model_with_progress(model: &CatalogModel, progress: bool) 
         }
         return Ok(path);
     }
-
-    let dir = models_dir();
-    tokio::fs::create_dir_all(&dir).await?;
-    let dest = dir.join(&model.file);
-
-    // Collect all files to download: primary + extra splits + mmproj
-    let mut files: Vec<(&str, &str)> = vec![(model.file.as_str(), model.url.as_str())];
-    for asset in &model.extra_files {
-        files.push((asset.file.as_str(), asset.url.as_str()));
-    }
-    if let Some(asset) = &model.mmproj {
-        files.push((asset.file.as_str(), asset.url.as_str()));
-    }
-    let all_paths: Vec<PathBuf> = files.iter().map(|(file, _)| dir.join(file)).collect();
-
-    let mut all_present = true;
-    let mut total_size: u64 = 0;
-    for (file, _) in &files {
-        let path = dir.join(file);
-        let size = tokio::fs::metadata(&path)
-            .await
-            .map(|m| m.len())
-            .unwrap_or(0);
-        if size < 1_000_000 {
-            all_present = false;
-            break;
-        }
-        total_size += size;
-    }
-
-    if all_present {
-        if progress {
-            eprintln!(
-                "✅ {} already exists ({:.1}GB, {} file{})",
-                model.name,
-                total_size as f64 / 1e9,
-                files.len(),
-                if files.len() > 1 { "s" } else { "" },
-            );
-        }
-        if let Err(err) =
-            track_managed_model_usage(&dest, &all_paths, &model.name, Some(&model.name), "catalog")
-        {
-            tracing::warn!(
-                "failed to record managed model usage for {}: {err}",
-                dest.display()
-            );
-        }
-        return Ok(dest);
-    }
-
-    if progress {
-        eprintln!("📥 Downloading {} ({})...", model.name, model.size);
-    }
-
-    // Collect files that still need downloading
-    let mut needed: Vec<(String, String)> = Vec::new();
-    for (file, url) in &files {
-        let path = dir.join(file);
-        if path.exists() {
-            let size = tokio::fs::metadata(&path)
-                .await
-                .map(|m| m.len())
-                .unwrap_or(0);
-            if size > 1_000_000 {
-                if progress {
-                    eprintln!("  ✅ {file} already exists ({:.1}GB)", size as f64 / 1e9);
-                }
-                continue;
-            }
-        }
-        needed.push((file.to_string(), url.to_string()));
-    }
-
-    if needed.len() > 1 {
-        // Parallel download of split files
-        if progress {
-            eprintln!("  ⚡ Downloading {} files in parallel...", needed.len());
-        }
-        let total = needed.len();
-        let completed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let mut handles = Vec::new();
-        for (file, url) in needed {
-            let path = dir.join(&file);
-            let completed = completed.clone();
-            handles.push(tokio::spawn(async move {
-                download_with_resume(&path, &url).await?;
-                let done = completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                if progress {
-                    eprintln!("  ✅ {file} [{done}/{total}]");
-                }
-                Ok::<(), anyhow::Error>(())
-            }));
-        }
-        for handle in handles {
-            handle.await??;
-        }
-    } else if let Some((file, url)) = needed.into_iter().next() {
-        // Single file — just download it
-        let path = dir.join(&file);
-        download_with_resume(&path, &url).await?;
-    }
-
-    if progress {
-        eprintln!("✅ Downloaded {} to {}", model.name, dir.display());
-    }
-    if let Err(err) =
-        track_managed_model_usage(&dest, &all_paths, &model.name, Some(&model.name), "catalog")
-    {
+    let path = paths
+        .into_iter()
+        .find(|path| path_suffix_matches_ignore_case(path, &model.file))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Downloaded model path not found in cache for {}",
+                model.name
+            )
+        })?;
+    if let Err(err) = track_managed_model_usage(
+        &path,
+        &managed_paths,
+        &model.name,
+        Some(&model.model_ref),
+        "catalog",
+    ) {
         tracing::warn!(
             "failed to record managed model usage for {}: {err}",
-            dest.display()
+            path.display()
         );
     }
-    Ok(dest)
+    Ok(path)
 }
 
 /// Download any URL to a destination path with resume support.
@@ -1014,8 +1075,8 @@ fn path_suffix_matches_ignore_case(path: &Path, expected: &str) -> bool {
 /// If the filename matches the split pattern, discovers and downloads all parts in parallel.
 /// Returns the path to the first part (or the single file).
 pub async fn download_hf_split_gguf(url: &str, filename: &str) -> Result<PathBuf> {
-    if let Some(asset) = hf_asset_from_url(url) {
-        return download_hf_repo_file(&asset.repo, Some(&asset.revision), &asset.file).await;
+    if let Some((repo, revision, file)) = parse_hf_resolve_url_parts(url) {
+        return download_hf_repo_file(&repo, revision, file).await;
     }
 
     let dir = models_dir();
@@ -1397,12 +1458,8 @@ mod tests {
     }
 
     #[test]
-    fn source_identity_is_absent_for_direct_url_entries() {
-        let model = find_model("Qwen3.5-27B-Q4_K_M").unwrap();
-        assert_eq!(model.source_repo(), None);
-        assert_eq!(model.source_revision(), None);
-        assert_eq!(model.source_file(), None);
-        assert!(model.source_repo().is_none());
+    fn dropped_raw_blob_entries_are_absent_from_catalog_fixture() {
+        assert!(find_model("Qwen3.5-27B-Q4_K_M").is_none());
     }
 
     #[test]
@@ -1721,8 +1778,14 @@ mod tests {
 
         let model = CatalogModel {
             name: "Qwen2.5-Coder-7B-Instruct-Q4_K_M".to_string(),
+            model_ref: "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF:Qwen2.5-Coder-7B-Instruct-Q4_K_M"
+                .to_string(),
             file: "Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf".to_string(),
-            url: "https://huggingface.co/Qwen/Qwen2.5-Coder-7B-Instruct-GGUF/resolve/main/qwen2.5-coder-7b-instruct-q4_k_m.gguf".to_string(),
+            source: CatalogSource {
+                repo: "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF".to_string(),
+                revision: "main".to_string(),
+                file: "qwen2.5-coder-7b-instruct-q4_k_m.gguf".to_string(),
+            },
             size: "4.4GB".to_string(),
             description: "".to_string(),
             draft: None,
@@ -1767,8 +1830,13 @@ mod tests {
 
         let model = CatalogModel {
             name: "Nested-Path-Model".to_string(),
+            model_ref: "org/repo:nested/model.gguf".to_string(),
             file: "model.gguf".to_string(),
-            url: "https://huggingface.co/org/repo/resolve/main/nested/MODEL.gguf".to_string(),
+            source: CatalogSource {
+                repo: "org/repo".to_string(),
+                revision: "main".to_string(),
+                file: "nested/MODEL.gguf".to_string(),
+            },
             size: "1GB".to_string(),
             description: "".to_string(),
             draft: None,

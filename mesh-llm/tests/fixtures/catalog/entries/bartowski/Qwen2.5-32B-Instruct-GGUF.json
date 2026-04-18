@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "source_repo": "bartowski/Qwen2.5-32B-Instruct-GGUF",
+  "variants": {
+    "Qwen2.5-32B-Instruct-Q4_K_M": {
+      "source": {
+        "repo": "bartowski/Qwen2.5-32B-Instruct-GGUF",
+        "revision": "main",
+        "file": "Qwen2.5-32B-Instruct-Q4_K_M.gguf"
+      },
+      "curated": {
+        "name": "Qwen2.5-32B-Instruct-Q4_K_M",
+        "size": "20GB",
+        "description": "Proven general chat",
+        "draft": "Qwen2.5-0.5B-Instruct-Q4_K_M",
+        "moe": null,
+        "extra_files": [],
+        "mmproj": null
+      },
+      "packages": []
+    }
+  }
+}

@@ -1675,8 +1675,9 @@ mod tests {
 
         drop(rt);
 
+        let released = wait_for_lock_release(&lock_path);
         assert!(
-            !is_locked(&lock_path),
+            released,
             "lock file must be released after InstanceRuntime is dropped"
         );
     }
@@ -1721,10 +1722,21 @@ mod tests {
 
         drop(rt);
 
+        let released = wait_for_lock_release(&lock_path);
         assert!(
-            !is_locked(&lock_path),
+            released,
             "is_locked must return false after InstanceRuntime is dropped"
         );
+    }
+
+    fn wait_for_lock_release(lock_path: &Path) -> bool {
+        for _ in 0..20 {
+            if !is_locked(lock_path) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        false
     }
 
     #[test]

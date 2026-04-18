@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "source_repo": "bartowski/google_gemma-3-1b-it-GGUF",
+  "variants": {
+    "google_gemma-3-1b-it-Q4_K_M": {
+      "source": {
+        "repo": "bartowski/google_gemma-3-1b-it-GGUF",
+        "revision": "main",
+        "file": "google_gemma-3-1b-it-Q4_K_M.gguf"
+      },
+      "curated": {
+        "name": "Gemma-3-1B-it-Q4_K_M",
+        "size": "780MB",
+        "description": "Draft for Gemma 3 models",
+        "draft": null,
+        "moe": null,
+        "extra_files": [],
+        "mmproj": null
+      },
+      "packages": []
+    }
+  }
+}

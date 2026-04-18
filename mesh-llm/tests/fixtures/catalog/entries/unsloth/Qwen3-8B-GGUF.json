@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "source_repo": "unsloth/Qwen3-8B-GGUF",
+  "variants": {
+    "Qwen3-8B-Q4_K_M": {
+      "source": {
+        "repo": "unsloth/Qwen3-8B-GGUF",
+        "revision": "main",
+        "file": "Qwen3-8B-Q4_K_M.gguf"
+      },
+      "curated": {
+        "name": "Qwen3-8B-Q4_K_M",
+        "size": "5.0GB",
+        "description": "Qwen3 mid-tier, strong for its size",
+        "draft": "Qwen3-0.6B-Q4_K_M",
+        "moe": null,
+        "extra_files": [],
+        "mmproj": null
+      },
+      "packages": []
+    }
+  }
+}

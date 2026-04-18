@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "source_repo": "bartowski/Hermes-2-Pro-Mistral-7B-GGUF",
+  "variants": {
+    "Hermes-2-Pro-Mistral-7B-Q4_K_M": {
+      "source": {
+        "repo": "bartowski/Hermes-2-Pro-Mistral-7B-GGUF",
+        "revision": "main",
+        "file": "Hermes-2-Pro-Mistral-7B-Q4_K_M.gguf"
+      },
+      "curated": {
+        "name": "Hermes-2-Pro-Mistral-7B-Q4_K_M",
+        "size": "4.4GB",
+        "description": "Goose default, strong tool calling for agents",
+        "draft": null,
+        "moe": null,
+        "extra_files": [],
+        "mmproj": null
+      },
+      "packages": []
+    }
+  }
+}

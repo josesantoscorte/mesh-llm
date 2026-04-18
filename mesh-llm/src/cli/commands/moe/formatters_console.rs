@@ -8,6 +8,7 @@ impl MoePlanFormatter for ConsoleFormatter {
             RankingSource::Override => "explicit override",
             RankingSource::LocalCache => "local cache",
             RankingSource::HuggingFaceDataset => "Hugging Face dataset",
+            RankingSource::HuggingFacePackage => "Hugging Face package",
         };
         println!("🧠 MoE plan");
         println!();

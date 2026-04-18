@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "source_repo": "unsloth/DeepSeek-R1-Distill-Qwen-32B-GGUF",
+  "variants": {
+    "DeepSeek-R1-Distill-Qwen-32B-Q4_K_M": {
+      "source": {
+        "repo": "unsloth/DeepSeek-R1-Distill-Qwen-32B-GGUF",
+        "revision": "main",
+        "file": "DeepSeek-R1-Distill-Qwen-32B-Q4_K_M.gguf"
+      },
+      "curated": {
+        "name": "DeepSeek-R1-Distill-Qwen-32B-Q4_K_M",
+        "size": "19.9GB",
+        "description": "DeepSeek R1 reasoning distilled into Qwen 32B",
+        "draft": "Qwen2.5-0.5B-Instruct-Q4_K_M",
+        "moe": null,
+        "extra_files": [],
+        "mmproj": null
+      },
+      "packages": []
+    }
+  }
+}

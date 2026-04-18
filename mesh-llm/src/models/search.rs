@@ -64,6 +64,7 @@ pub fn search_catalog_models(query: &str) -> Vec<&'static catalog::CatalogModel>
         .iter()
         .filter(|model| {
             model.name.to_lowercase().contains(&q)
+                || model.model_ref.to_lowercase().contains(&q)
                 || model.file.to_lowercase().contains(&q)
                 || model.description.to_lowercase().contains(&q)
         })

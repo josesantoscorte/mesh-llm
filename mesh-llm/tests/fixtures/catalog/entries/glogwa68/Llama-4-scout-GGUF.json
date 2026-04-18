@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "source_repo": "glogwa68/Llama-4-scout-GGUF",
+  "variants": {
+    "Llama-4-Scout-4bit-Q4_K_M": {
+      "source": {
+        "repo": "glogwa68/Llama-4-scout-GGUF",
+        "revision": "main",
+        "file": "Llama-4-Scout-4bit-Q4_K_M.gguf"
+      },
+      "curated": {
+        "name": "Llama-4-Scout-Q4_K_M",
+        "size": "22.5GB",
+        "description": "MoE 109B/17B active, 16 experts top-1, Meta latest, tool calling",
+        "draft": null,
+        "moe": {
+          "n_expert": 16,
+          "n_expert_used": 1,
+          "min_experts_per_node": 6
+        },
+        "extra_files": [],
+        "mmproj": null
+      },
+      "packages": []
+    }
+  }
+}

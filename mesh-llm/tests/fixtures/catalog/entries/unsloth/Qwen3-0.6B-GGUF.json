@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "source_repo": "unsloth/Qwen3-0.6B-GGUF",
+  "variants": {
+    "Qwen3-0.6B-Q4_K_M": {
+      "source": {
+        "repo": "unsloth/Qwen3-0.6B-GGUF",
+        "revision": "main",
+        "file": "Qwen3-0.6B-Q4_K_M.gguf"
+      },
+      "curated": {
+        "name": "Qwen3-0.6B-Q4_K_M",
+        "size": "397MB",
+        "description": "Draft for Qwen3 models",
+        "draft": null,
+        "moe": null,
+        "extra_files": [],
+        "mmproj": null
+      },
+      "packages": []
+    }
+  }
+}

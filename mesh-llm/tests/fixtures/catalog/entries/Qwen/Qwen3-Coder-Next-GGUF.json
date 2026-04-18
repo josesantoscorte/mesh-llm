@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "source_repo": "Qwen/Qwen3-Coder-Next-GGUF",
+  "variants": {
+    "Qwen3-Coder-Next-Q4_K_M/Qwen3-Coder-Next-Q4_K_M-00001-of-00004": {
+      "source": {
+        "repo": "Qwen/Qwen3-Coder-Next-GGUF",
+        "revision": "main",
+        "file": "Qwen3-Coder-Next-Q4_K_M/Qwen3-Coder-Next-Q4_K_M-00001-of-00004.gguf"
+      },
+      "curated": {
+        "name": "Qwen3-Coder-Next-Q4_K_M",
+        "size": "48GB",
+        "description": "Qwen3 Coder Next ~85B dense, frontier coding model",
+        "draft": null,
+        "moe": null,
+        "extra_files": [
+          {
+            "file": "Qwen3-Coder-Next-Q4_K_M/Qwen3-Coder-Next-Q4_K_M-00002-of-00004.gguf",
+            "repo": "Qwen/Qwen3-Coder-Next-GGUF",
+            "revision": "main"
+          },
+          {
+            "file": "Qwen3-Coder-Next-Q4_K_M/Qwen3-Coder-Next-Q4_K_M-00003-of-00004.gguf",
+            "repo": "Qwen/Qwen3-Coder-Next-GGUF",
+            "revision": "main"
+          },
+          {
+            "file": "Qwen3-Coder-Next-Q4_K_M/Qwen3-Coder-Next-Q4_K_M-00004-of-00004.gguf",
+            "repo": "Qwen/Qwen3-Coder-Next-GGUF",
+            "revision": "main"
+          }
+        ],
+        "mmproj": null
+      },
+      "packages": []
+    }
+  }
+}

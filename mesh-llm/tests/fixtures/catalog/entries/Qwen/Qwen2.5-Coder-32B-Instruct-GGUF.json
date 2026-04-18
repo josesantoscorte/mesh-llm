@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "source_repo": "Qwen/Qwen2.5-Coder-32B-Instruct-GGUF",
+  "variants": {
+    "qwen2.5-coder-32b-instruct-q4_k_m": {
+      "source": {
+        "repo": "Qwen/Qwen2.5-Coder-32B-Instruct-GGUF",
+        "revision": "main",
+        "file": "qwen2.5-coder-32b-instruct-q4_k_m.gguf"
+      },
+      "curated": {
+        "name": "Qwen2.5-Coder-32B-Instruct-Q4_K_M",
+        "size": "20GB",
+        "description": "Top-tier code gen, matches GPT-4o on code",
+        "draft": "Qwen2.5-0.5B-Instruct-Q4_K_M",
+        "moe": null,
+        "extra_files": [],
+        "mmproj": null
+      },
+      "packages": []
+    }
+  }
+}

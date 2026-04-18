@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "source_repo": "unsloth/Devstral-Small-2505-GGUF",
+  "variants": {
+    "Devstral-Small-2505-Q4_K_M": {
+      "source": {
+        "repo": "unsloth/Devstral-Small-2505-GGUF",
+        "revision": "main",
+        "file": "Devstral-Small-2505-Q4_K_M.gguf"
+      },
+      "curated": {
+        "name": "Devstral-Small-2505-Q4_K_M",
+        "size": "14.3GB",
+        "description": "Mistral agentic coding, tool use",
+        "draft": null,
+        "moe": null,
+        "extra_files": [],
+        "mmproj": null
+      },
+      "packages": []
+    }
+  }
+}

@@ -28,7 +28,7 @@ pub(crate) enum MoeCommand {
         #[command(subcommand)]
         command: MoeAnalyzeCommand,
     },
-    /// Share a local ranking artifact with other mesh-llm users via the canonical Hugging Face dataset.
+    /// Share a local MoE package with other mesh-llm users via Hugging Face package repos and the Mesh catalog.
     Share {
         /// Model spec: local path, catalog name, HF exact ref, HF repo selector like `org/repo:BF16@main`, or HF URL.
         model: String,
@@ -36,12 +36,13 @@ pub(crate) enum MoeCommand {
         /// This should point to a ranking CSV, such as a file produced by `mesh-llm moe analyze`.
         #[arg(long)]
         ranking_file: Option<PathBuf>,
-        /// Published dataset repo used for duplicate checks and PR target reporting.
-        #[arg(long, default_value = "meshllm/moe-rankings")]
-        dataset_repo: String,
-        /// Also publish topology-independent MoE expert components under the ranking prefix.
+        /// Mesh catalog dataset repo used for package resolution entries.
+        #[arg(long, default_value = "meshllm/catalog")]
+        catalog_repo: String,
+        /// Optional namespace for the package repo. Defaults to `meshllm` and
+        /// falls back to your user namespace when you cannot publish there.
         #[arg(long)]
-        with_experts: bool,
+        namespace: Option<String>,
     },
 }
 
@@ -86,9 +87,9 @@ pub(crate) struct HfJobArgs {
     /// Submit this MoE analyze run to Hugging Face Jobs instead of running locally.
     #[arg(long)]
     pub(crate) hf_job: bool,
-    /// Dataset repo to contribute to when the remote analysis succeeds.
-    #[arg(long, default_value = "meshllm/moe-rankings")]
-    pub(crate) dataset_repo: String,
+    /// Mesh catalog dataset repo to contribute to when the remote analysis succeeds.
+    #[arg(long, default_value = "meshllm/catalog")]
+    pub(crate) catalog_repo: String,
     /// HF Jobs hardware flavor, e.g. cpu-xl, cpu-performance, l40sx1.
     #[arg(long, default_value = "cpu-xl")]
     pub(crate) hf_job_flavor: String,

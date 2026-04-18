@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "source_repo": "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF",
+  "variants": {
+    "qwen2.5-coder-7b-instruct-q4_k_m": {
+      "source": {
+        "repo": "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF",
+        "revision": "main",
+        "file": "qwen2.5-coder-7b-instruct-q4_k_m.gguf"
+      },
+      "curated": {
+        "name": "Qwen2.5-Coder-7B-Instruct-Q4_K_M",
+        "size": "4.4GB",
+        "description": "Code generation & completion",
+        "draft": "Qwen2.5-0.5B-Instruct-Q4_K_M",
+        "moe": null,
+        "extra_files": [],
+        "mmproj": null
+      },
+      "packages": []
+    }
+  }
+}

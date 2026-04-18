@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "source_repo": "unsloth/GLM-4-32B-0414-GGUF",
+  "variants": {
+    "GLM-4-32B-0414-Q4_K_M": {
+      "source": {
+        "repo": "unsloth/GLM-4-32B-0414-GGUF",
+        "revision": "main",
+        "file": "GLM-4-32B-0414-Q4_K_M.gguf"
+      },
+      "curated": {
+        "name": "GLM-4-32B-0414-Q4_K_M",
+        "size": "19.7GB",
+        "description": "Strong 32B, good tool calling",
+        "draft": null,
+        "moe": null,
+        "extra_files": [],
+        "mmproj": null
+      },
+      "packages": []
+    }
+  }
+}

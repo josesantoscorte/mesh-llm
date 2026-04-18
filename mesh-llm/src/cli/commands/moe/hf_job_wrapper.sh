@@ -6,7 +6,7 @@ trap 'rm -rf "$workdir"' EXIT
 
 echo "☁️ Starting mesh-llm MoE HF job"
 echo "📦 Model: $MODEL_REF"
-echo "🗂️ Dataset repo: $DATASET_REPO"
+echo "🗂️ Catalog repo: $CATALOG_REPO"
 echo "📥 Release URL: $MESH_LLM_RELEASE_URL"
 echo "📁 Source repo: ${SOURCE_REPO:-unknown}"
 echo "🧷 Source revision: ${SOURCE_REVISION:-unknown}"
@@ -101,6 +101,6 @@ echo "🧠 Running analyze step"
 stdbuf -oL -eL bash -lc '__ANALYZE_COMMAND__'
 echo "✅ Analyze step complete"
 
-echo "📤 Opening dataset PR"
+echo "📤 Opening catalog and package PRs"
 stdbuf -oL -eL bash -lc '__SHARE_COMMAND__'
-echo "✅ Dataset PR step complete"
+echo "✅ Share step complete"

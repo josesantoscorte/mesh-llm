@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "source_repo": "unsloth/Qwen3-30B-A3B-GGUF",
+  "variants": {
+    "Qwen3-30B-A3B-Q4_K_M": {
+      "source": {
+        "repo": "unsloth/Qwen3-30B-A3B-GGUF",
+        "revision": "main",
+        "file": "Qwen3-30B-A3B-Q4_K_M.gguf"
+      },
+      "curated": {
+        "name": "Qwen3-30B-A3B-Q4_K_M",
+        "size": "17.3GB",
+        "description": "MoE general chat, 128 experts top-8, thinking/non-thinking",
+        "draft": "Qwen3-0.6B-Q4_K_M",
+        "moe": {
+          "n_expert": 128,
+          "n_expert_used": 8,
+          "min_experts_per_node": 46
+        },
+        "extra_files": [],
+        "mmproj": null
+      },
+      "packages": []
+    }
+  }
+}

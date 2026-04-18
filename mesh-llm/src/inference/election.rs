@@ -706,7 +706,7 @@ fn resolve_runtime_moe_config(
                     handle.block_on(tokio::task::spawn_blocking(move || {
                         crate::system::moe_planner::resolve_runtime_ranking(
                             &model_path_for_ranking,
-                            crate::system::moe_planner::DEFAULT_MOE_RANKINGS_DATASET,
+                            crate::system::moe_planner::DEFAULT_MOE_CATALOG_DATASET,
                         )
                     }))
                 }) {
@@ -726,7 +726,7 @@ fn resolve_runtime_moe_config(
                 },
                 Err(_) => crate::system::moe_planner::resolve_runtime_ranking(
                     model_path,
-                    crate::system::moe_planner::DEFAULT_MOE_RANKINGS_DATASET,
+                    crate::system::moe_planner::DEFAULT_MOE_CATALOG_DATASET,
                 ),
             };
             let resolved_ranking = match resolved_ranking_result {
@@ -898,7 +898,7 @@ fn print_runtime_submit_suggestion(model_name: &str, model_path: &Path, ranking_
     );
     eprintln!(
         "☁️  [{model_name}] Published source: {}",
-        crate::system::moe_planner::DEFAULT_MOE_RANKINGS_DATASET
+        crate::system::moe_planner::DEFAULT_MOE_CATALOG_DATASET
     );
     eprintln!("⚠️  [{model_name}] This run did not use a published ranking.");
     eprintln!(
@@ -922,19 +922,16 @@ async fn try_materialize_remote_expert_components(
     };
 
     let ranking_sha256 = crate::system::moe_planner::sha256_file(ranking_path)?;
-    let distribution_id =
-        crate::system::moe_planner::normalize_distribution_id(&identity.local_file_name);
-    let analyzer_id = moe_cfg.ranking_source.clone();
-    let repo_id = identity.repo_id.clone();
-    let revision = identity.revision.clone();
+    let model_ref = crate::system::moe_planner::canonical_model_ref_from_source(
+        &identity.repo_id,
+        &crate::system::moe_planner::normalize_distribution_id(&identity.local_file_name),
+        Some(identity.local_file_name.clone()),
+    );
     let expected_experts = assignment.experts.clone();
     let fetch_result = tokio::task::spawn_blocking(move || {
-        crate::system::moe_planner::fetch_remote_expert_components(
-            crate::system::moe_planner::DEFAULT_MOE_RANKINGS_DATASET,
-            &repo_id,
-            &revision,
-            &distribution_id,
-            &analyzer_id,
+        crate::system::moe_planner::fetch_remote_package_expert_components(
+            crate::system::moe_planner::DEFAULT_MOE_CATALOG_DATASET,
+            &model_ref,
             &ranking_sha256,
             &expected_experts,
             false,
@@ -964,7 +961,37 @@ async fn try_materialize_remote_expert_components(
         std::fs::copy(&temp_output, output_path)?;
         std::fs::remove_file(&temp_output)
     })?;
+    moe::write_assembled_shard_metadata(output_path)?;
     Ok(Some(remote.prefix))
+}
+
+fn try_materialize_local_expert_components(
+    bin_dir: &Path,
+    model_path: &Path,
+    moe_cfg: &ResolvedMoeConfig,
+    assignment: &moe::NodeAssignment,
+    expert_count: u32,
+    output_path: &Path,
+) -> anyhow::Result<PathBuf> {
+    let package_dir = sync_local_package_cache(bin_dir, model_path, moe_cfg)?;
+    moe::purge_legacy_split_artifacts(model_path, output_path);
+    let (trunk_path, expert_paths) =
+        moe::ensure_local_component_cache(bin_dir, model_path, &assignment.experts, expert_count)?;
+
+    let temp_output = assembling_shard_path(output_path);
+    if temp_output.exists() {
+        let _ = std::fs::remove_file(&temp_output);
+    }
+    moe::run_assemble_from_components(bin_dir, &trunk_path, &expert_paths, &temp_output)?;
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::rename(&temp_output, output_path).or_else(|_| {
+        std::fs::copy(&temp_output, output_path)?;
+        std::fs::remove_file(&temp_output)
+    })?;
+    moe::write_assembled_shard_metadata(output_path)?;
+    Ok(package_dir)
 }
 
 fn assembling_shard_path(output_path: &Path) -> PathBuf {
@@ -973,6 +1000,113 @@ fn assembling_shard_path(output_path: &Path) -> PathBuf {
         .and_then(|value| value.to_str())
         .unwrap_or("shard.gguf");
     output_path.with_file_name(format!("{file_name}.assembling"))
+}
+
+fn sync_local_package_cache(
+    bin_dir: &Path,
+    model_path: &Path,
+    moe_cfg: &ResolvedMoeConfig,
+) -> anyhow::Result<PathBuf> {
+    let model = crate::system::moe_planner::resolve_model_context_for_path(model_path)?;
+    let ranking_source_path = moe_cfg
+        .ranking_path
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("No ranking path available for local package cache"))?;
+
+    let ranking_path = moe::package_cache_ranking_path(model_path);
+    if let Some(parent) = ranking_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if ranking_source_path != &ranking_path {
+        std::fs::copy(ranking_source_path, &ranking_path)?;
+    }
+
+    let ranking = crate::system::moe_planner::ResolvedRanking {
+        path: ranking_path.clone(),
+        metadata_path: None,
+        analysis_path: Some(moe::package_cache_analysis_path(model_path)),
+        analyzer_id: moe_cfg.ranking_source.clone(),
+        source: crate::system::moe_planner::RankingSource::LocalCache,
+        reason: "local package cache".to_string(),
+    };
+    crate::system::moe_planner::write_package_analysis_json(
+        &model,
+        &ranking,
+        &moe::package_cache_analysis_path(model_path),
+    )?;
+
+    let run_log_path = moe::package_cache_run_log_path(model_path);
+    if let Some(source_log) =
+        crate::system::moe_planner::analysis_log_path(&model, &ranking.analyzer_id)
+            .filter(|path| path.exists())
+    {
+        if let Some(parent) = run_log_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(source_log, &run_log_path)?;
+    }
+
+    let all_experts = (0..model.expert_count).collect::<Vec<_>>();
+    let (trunk_path, expert_paths) =
+        moe::ensure_local_component_cache(bin_dir, model_path, &all_experts, model.expert_count)?;
+
+    let expert_files = all_experts
+        .iter()
+        .zip(expert_paths.iter())
+        .map(|(expert_id, path)| {
+            Ok(moe::ExpertComponentFile {
+                path: format!(
+                    "experts/{}",
+                    moe::expert_component_filename(*expert_id, model.expert_count)
+                ),
+                sha256: crate::system::moe_planner::sha256_file(path)?,
+                expert_id: Some(*expert_id),
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let manifest = crate::system::moe_planner::MoePackageManifest {
+        schema_version: 1,
+        format: "meshllm-moe-components".to_string(),
+        ranking_sha256: crate::system::moe_planner::sha256_file(&ranking_path)?,
+        n_expert: model.expert_count,
+        n_expert_used: model.used_expert_count,
+        min_experts_per_node: model.min_experts_per_node,
+        trunk: moe::ExpertComponentFile {
+            path: "trunk.gguf".to_string(),
+            sha256: crate::system::moe_planner::sha256_file(&trunk_path)?,
+            expert_id: None,
+        },
+        experts: expert_files,
+    };
+    let manifest_path = moe::package_cache_manifest_path(model_path);
+    if let Some(parent) = manifest_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&manifest)? + "\n",
+    )?;
+
+    let meshllm_path = moe::package_cache_meshllm_path(model_path);
+    let existing_meshllm = std::fs::read_to_string(&meshllm_path).ok();
+    let manifest_rel = format!(
+        "variants/{}/manifest.json",
+        crate::system::moe_planner::variant_key_for_model(&model)
+    );
+    let meshllm_json = crate::system::moe_planner::build_meshllm_descriptor(
+        existing_meshllm.as_deref(),
+        &model,
+        &manifest_rel,
+    )?;
+    if let Some(parent) = meshllm_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(
+        &meshllm_path,
+        serde_json::to_string_pretty(&meshllm_json)? + "\n",
+    )?;
+
+    Ok(moe::package_cache_variant_dir(model_path))
 }
 
 fn resolve_analyze_binary(bin_dir: &Path) -> anyhow::Result<std::path::PathBuf> {
@@ -2549,7 +2683,8 @@ async fn moe_election_loop(
             node.regossip().await;
 
             let shard_path = moe::split_path(&model, plan.active_ids.len(), my_shard_index);
-            if shard_path.exists() {
+            moe::purge_legacy_split_artifacts(&model, &shard_path);
+            if moe::assembled_shard_cache_is_current(&shard_path) {
                 let size = std::fs::metadata(&shard_path).map(|m| m.len()).unwrap_or(0);
                 eprintln!(
                     "  Using cached shard: {} ({:.1} GB)",
@@ -2586,14 +2721,27 @@ async fn moe_election_loop(
                 }
 
                 if !reused_published {
-                    eprintln!("  Splitting GGUF → {} ...", shard_path.display());
-                    match moe::run_split(&bin_dir, &model, my_assignment, &shard_path) {
+                    eprintln!(
+                        "  Materializing shard from local trunk + experts → {} ...",
+                        shard_path.display()
+                    );
+                    match try_materialize_local_expert_components(
+                        &bin_dir,
+                        &model,
+                        &moe_cfg,
+                        my_assignment,
+                        moe_cfg.config.n_expert,
+                        &shard_path,
+                    ) {
                         Ok(_) => {
                             let size = std::fs::metadata(&shard_path).map(|m| m.len()).unwrap_or(0);
-                            eprintln!("  Split complete: {:.1} GB", size as f64 / 1e9);
+                            eprintln!(
+                                "  Local component materialization complete: {:.1} GB",
+                                size as f64 / 1e9
+                            );
                         }
                         Err(e) => {
-                            eprintln!("  ❌ moe-split failed: {e}");
+                            eprintln!("  ❌ local component materialization failed: {e}");
                             node.set_model_runtime_context_length(&model_name, None)
                                 .await;
                             node.regossip().await;

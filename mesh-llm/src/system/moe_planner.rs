@@ -1,8 +1,9 @@
 use anyhow::{bail, Context, Result};
 use hf_hub::{RepoDownloadFileParams, RepoInfoParams};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -16,6 +17,7 @@ use crate::models::{
 
 const DEFAULT_DATASET_REVISION: &str = "main";
 pub(crate) const DEFAULT_MOE_RANKINGS_DATASET: &str = "meshllm/moe-rankings";
+pub(crate) const DEFAULT_MOE_CATALOG_DATASET: &str = "meshllm/catalog";
 const ANALYSIS_JSON_FILENAME: &str = "analysis.json";
 const DEFAULT_MASS_CHECKPOINTS: [usize; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
 const MODEL_LOAD_HEADROOM_NUMERATOR: u64 = 11;
@@ -72,14 +74,49 @@ pub(crate) struct ResolvedRanking {
 
 #[derive(Clone, Debug)]
 pub(crate) struct MoeSubmitBundle {
-    pub dataset_prefix: String,
-    pub dataset_paths: Vec<String>,
+    pub model_ref: String,
+    pub variant: String,
+    pub variant_root: String,
+    pub ranking_repo_path: String,
+    pub analysis_repo_path: String,
+    pub manifest_repo_path: String,
+    pub log_repo_path: Option<String>,
     pub ranking_path: PathBuf,
-    pub metadata_content: String,
     pub analysis_content: String,
     pub log_path: Option<PathBuf>,
     pub commit_message: String,
     pub commit_description: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct MeshllmPackageJson {
+    pub schema_version: u32,
+    pub source: MeshllmPackageSource,
+    pub variants: BTreeMap<String, MeshllmPackageVariant>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct MeshllmPackageSource {
+    pub repo: String,
+    pub revision: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct MeshllmPackageVariant {
+    pub distribution_id: String,
+    pub manifest: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct MoePackageManifest {
+    pub schema_version: u32,
+    pub format: String,
+    pub ranking_sha256: String,
+    pub n_expert: u32,
+    pub n_expert_used: u32,
+    pub min_experts_per_node: u32,
+    pub trunk: moe::ExpertComponentFile,
+    pub experts: Vec<moe::ExpertComponentFile>,
 }
 
 #[derive(Clone, Debug)]
@@ -158,6 +195,7 @@ pub(crate) enum RankingSource {
     Override,
     LocalCache,
     HuggingFaceDataset,
+    HuggingFacePackage,
 }
 
 impl RankingSource {
@@ -166,6 +204,7 @@ impl RankingSource {
             Self::Override => "override",
             Self::LocalCache => "local cache",
             Self::HuggingFaceDataset => "Hugging Face dataset",
+            Self::HuggingFacePackage => "Hugging Face package",
         }
     }
 }
@@ -378,6 +417,14 @@ pub(crate) async fn resolve_model_context_with_progress(
     } else {
         resolve_model_spec_with_progress(Path::new(model_spec), false).await?
     };
+    build_model_context(model_spec, path)
+}
+
+pub(crate) fn resolve_model_context_for_path(path: &Path) -> Result<MoeModelContext> {
+    build_model_context(&path.to_string_lossy(), path.to_path_buf())
+}
+
+fn build_model_context(model_spec: &str, path: PathBuf) -> Result<MoeModelContext> {
     let info = moe::detect_moe(&path).with_context(|| {
         format!(
             "Model is not auto-detected as MoE from the GGUF header: {}",
@@ -553,7 +600,7 @@ fn sibling_analysis_path(path: &Path) -> Option<PathBuf> {
 
 pub(crate) fn resolve_runtime_ranking(
     model_path: &Path,
-    dataset_repo_name: &str,
+    catalog_repo_name: &str,
 ) -> Result<Option<ResolvedRanking>> {
     let local_legacy = resolve_local_runtime_ranking(model_path);
 
@@ -570,13 +617,12 @@ pub(crate) fn resolve_runtime_ranking(
         return Ok(local_legacy);
     }
 
-    let remote = match fetch_remote_ranking(
-        dataset_repo_name,
+    let model_ref = canonical_model_ref_from_source(
         &identity.repo_id,
-        &identity.revision,
         &normalize_distribution_id(&identity.local_file_name),
-        false,
-    ) {
+        Some(identity.local_file_name.clone()),
+    );
+    let remote = match fetch_remote_package_ranking(catalog_repo_name, &model_ref, false) {
         Ok(remote) => remote,
         Err(error) => return local_legacy.ok_or(error).map(Some),
     };
@@ -846,125 +892,283 @@ fn canonical_dataset_prefix(
     format!("data/{namespace}/{repo}/{source_revision}/gguf/{distribution_id}")
 }
 
-fn canonical_expert_components_prefix(
-    source_repo: &str,
-    source_revision: &str,
-    distribution_id: &str,
-    analyzer_id: &str,
-) -> String {
-    format!(
-        "{}/{}/experts",
-        canonical_dataset_prefix(source_repo, source_revision, distribution_id),
+pub(crate) fn catalog_entry_path_for_source_repo(source_repo: &str) -> Result<String> {
+    let (source_owner, source_name) = source_repo
+        .split_once('/')
+        .ok_or_else(|| anyhow::anyhow!("Invalid source repo {}", source_repo))?;
+    anyhow::ensure!(
+        !source_owner.is_empty()
+            && !source_name.is_empty()
+            && source_owner != "."
+            && source_owner != ".."
+            && source_name != "."
+            && source_name != ".."
+            && !source_name.contains('/'),
+        "Invalid source repo {}",
+        source_repo
+    );
+    Ok(format!("entries/{source_owner}/{source_name}.json",))
+}
+
+fn package_variant_for_model_ref(model_ref: &str) -> Result<&str> {
+    model_ref
+        .rsplit_once(':')
+        .map(|(_, variant)| variant)
+        .ok_or_else(|| anyhow::anyhow!("Invalid Mesh model ref {model_ref}"))
+}
+
+fn join_repo_relative(parent_file: &str, relative_path: &str) -> String {
+    let relative = relative_path.trim_start_matches('/');
+    let Some(parent) = Path::new(parent_file).parent() else {
+        return relative.to_string();
+    };
+    let joined = parent.join(relative);
+    joined.to_string_lossy().replace('\\', "/")
+}
+
+fn analyzer_id_from_analysis(analysis_path: &Path) -> Result<String> {
+    let analysis_content = fs::read_to_string(analysis_path)
+        .with_context(|| format!("Read {}", analysis_path.display()))?;
+    let parsed: Value = serde_json::from_str(&analysis_content)
+        .with_context(|| format!("Parse {}", analysis_path.display()))?;
+    Ok(parsed
+        .get("analyzer_id")
+        .and_then(Value::as_str)
+        .unwrap_or("full-v1")
+        .to_string())
+}
+
+fn resolve_catalog_package_pointer(
+    api: &hf_hub::HFClientSync,
+    catalog_repo_name: &str,
+    model_ref: &str,
+) -> Result<Option<crate::models::catalog::CatalogPackagePointer>> {
+    let (owner, name) = catalog_repo_name
+        .split_once('/')
+        .unwrap_or(("", catalog_repo_name));
+    let catalog_repo = api.dataset(owner, name);
+    let info = catalog_repo.info(
+        &RepoInfoParams::builder()
+            .revision(DEFAULT_DATASET_REVISION.to_string())
+            .build(),
+    )?;
+    let hf_hub::RepoInfo::Dataset(info) = info else {
+        bail!("Expected dataset repo info for {}", catalog_repo_name);
+    };
+
+    let dataset_revision = info.sha.as_deref().unwrap_or(DEFAULT_DATASET_REVISION);
+    let (source_repo, variant) = model_ref
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow::anyhow!("Invalid Mesh model ref {model_ref}"))?;
+    let entry_path = catalog_entry_path_for_source_repo(source_repo)?;
+    if !info
+        .siblings
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .any(|entry| entry.rfilename == entry_path)
+    {
+        return Ok(None);
+    }
+
+    let downloaded = catalog_repo
+        .download_file(
+            &RepoDownloadFileParams::builder()
+                .filename(entry_path.clone())
+                .revision(dataset_revision.to_string())
+                .build(),
+        )
+        .with_context(|| format!("Download {}", entry_path))?;
+    let content = fs::read_to_string(&downloaded)
+        .with_context(|| format!("Read {}", downloaded.display()))?;
+    let entry: crate::models::catalog::CatalogRepoEntry = serde_json::from_str(&content)
+        .with_context(|| format!("Parse {}", downloaded.display()))?;
+    let mut packages = entry
+        .variants
+        .get(variant)
+        .map(|variant_entry| variant_entry.packages.clone())
+        .unwrap_or_default();
+
+    packages.sort_by(|left, right| {
+        let trust_rank = |trust: &str| match trust {
+            "canonical" => 2,
+            "community" => 1,
+            _ => 0,
+        };
+        trust_rank(&right.trust)
+            .cmp(&trust_rank(&left.trust))
+            .then_with(|| left.package_repo.cmp(&right.package_repo))
+            .then_with(|| left.package_revision.cmp(&right.package_revision))
+    });
+    Ok(packages.into_iter().next())
+}
+
+fn resolve_package_variant(
+    api: &hf_hub::HFClientSync,
+    package_repo: &str,
+    package_revision: &str,
+    model_ref: &str,
+) -> Result<Option<(Vec<hf_hub::RepoSibling>, String, String)>> {
+    let (owner, name) = package_repo.split_once('/').unwrap_or(("", package_repo));
+    let repo = api.model(owner, name);
+    let info = repo.info(
+        &RepoInfoParams::builder()
+            .revision(package_revision.to_string())
+            .build(),
+    )?;
+    let hf_hub::RepoInfo::Model(info) = info else {
+        bail!("Expected model repo info for {}", package_repo);
+    };
+    let resolved_revision = info.sha.unwrap_or_else(|| package_revision.to_string());
+    let siblings = info.siblings.unwrap_or_default();
+    if !siblings
+        .iter()
+        .any(|entry| entry.rfilename == "meshllm.json")
+    {
+        return Ok(None);
+    }
+
+    let meshllm_path = repo
+        .download_file(
+            &RepoDownloadFileParams::builder()
+                .filename("meshllm.json".to_string())
+                .revision(resolved_revision.clone())
+                .build(),
+        )
+        .with_context(|| format!("Download meshllm.json from {}", package_repo))?;
+    let meshllm_content = fs::read_to_string(&meshllm_path)
+        .with_context(|| format!("Read {}", meshllm_path.display()))?;
+    let meshllm: MeshllmPackageJson = serde_json::from_str(&meshllm_content)
+        .with_context(|| format!("Parse {}", meshllm_path.display()))?;
+    let variant = package_variant_for_model_ref(model_ref)?;
+    let Some(variant_entry) = meshllm.variants.get(variant) else {
+        return Ok(None);
+    };
+    Ok(Some((
+        siblings,
+        resolved_revision,
+        variant_entry.manifest.clone(),
+    )))
+}
+
+fn fetch_remote_package_ranking(
+    catalog_repo_name: &str,
+    model_ref: &str,
+    progress: bool,
+) -> Result<Option<ResolvedRanking>> {
+    let api = build_hf_api(progress).context("Build Hugging Face client for MoE package lookup")?;
+    let Some(entry) = resolve_catalog_package_pointer(&api, catalog_repo_name, model_ref)? else {
+        return Ok(None);
+    };
+    let Some((siblings, package_revision, manifest_path)) = resolve_package_variant(
+        &api,
+        &entry.package_repo,
+        &entry.package_revision,
+        model_ref,
+    )?
+    else {
+        return Ok(None);
+    };
+
+    let ranking_rel = join_repo_relative(&manifest_path, "ranking.csv");
+    let analysis_rel = join_repo_relative(&manifest_path, ANALYSIS_JSON_FILENAME);
+    if !(siblings.iter().any(|entry| entry.rfilename == ranking_rel)
+        && siblings.iter().any(|entry| entry.rfilename == analysis_rel))
+    {
+        return Ok(None);
+    }
+
+    let (owner, name) = entry
+        .package_repo
+        .split_once('/')
+        .unwrap_or(("", entry.package_repo.as_str()));
+    let repo = api.model(owner, name);
+    let ranking_path = repo
+        .download_file(
+            &RepoDownloadFileParams::builder()
+                .filename(ranking_rel.clone())
+                .revision(package_revision.clone())
+                .build(),
+        )
+        .with_context(|| format!("Download {}", ranking_rel))?;
+    let analysis_path = repo
+        .download_file(
+            &RepoDownloadFileParams::builder()
+                .filename(analysis_rel.clone())
+                .revision(package_revision.clone())
+                .build(),
+        )
+        .with_context(|| format!("Download {}", analysis_rel))?;
+    let analyzer_id = analyzer_id_from_analysis(&analysis_path)?;
+    Ok(Some(ResolvedRanking {
+        path: ranking_path,
+        metadata_path: None,
+        analysis_path: Some(analysis_path),
         analyzer_id,
-    )
+        source: RankingSource::HuggingFacePackage,
+        reason: format!("published package ranking in {}", entry.package_repo),
+    }))
 }
 
-pub(crate) fn canonical_dataset_prefix_for_model(model: &MoeModelContext) -> Result<String> {
-    let Some(source_repo) = model.source_repo.as_ref() else {
-        bail!("A Hugging Face-backed model is required to derive the canonical dataset path.");
-    };
-    let Some(source_revision) = model.source_revision.as_ref() else {
-        bail!("A resolved source revision is required to derive the canonical dataset path.");
-    };
-    Ok(canonical_dataset_prefix(
-        source_repo,
-        source_revision,
-        &model.distribution_id,
-    ))
-}
-
-pub(crate) fn canonical_expert_components_prefix_for_model(
-    model: &MoeModelContext,
-    analyzer_id: &str,
-) -> Result<String> {
-    let Some(source_repo) = model.source_repo.as_ref() else {
-        bail!(
-            "A Hugging Face-backed model is required to derive the expert component dataset path."
-        );
-    };
-    let Some(source_revision) = model.source_revision.as_ref() else {
-        bail!(
-            "A resolved source revision is required to derive the expert component dataset path."
-        );
-    };
-    Ok(canonical_expert_components_prefix(
-        source_repo,
-        source_revision,
-        &model.distribution_id,
-        analyzer_id,
-    ))
-}
-
-pub(crate) fn fetch_remote_expert_components(
-    dataset_repo_name: &str,
-    source_repo: &str,
-    source_revision: &str,
-    distribution_id: &str,
-    analyzer_id: &str,
+pub(crate) fn fetch_remote_package_expert_components(
+    catalog_repo_name: &str,
+    model_ref: &str,
     ranking_sha256: &str,
     expected_experts: &[u32],
     progress: bool,
 ) -> Result<Option<ResolvedExpertComponents>> {
     let api = build_hf_api(progress)
         .context("Build Hugging Face client for MoE expert component lookup")?;
-    let (owner, name) = dataset_repo_name
-        .split_once('/')
-        .unwrap_or(("", dataset_repo_name));
-    let dataset_repo = api.dataset(owner, name);
-    let info = dataset_repo.info(
-        &RepoInfoParams::builder()
-            .revision(DEFAULT_DATASET_REVISION.to_string())
-            .build(),
-    )?;
-    let hf_hub::RepoInfo::Dataset(info) = info else {
-        bail!("Expected dataset repo info for {}", dataset_repo_name);
+    let Some(entry) = resolve_catalog_package_pointer(&api, catalog_repo_name, model_ref)? else {
+        return Ok(None);
     };
-
-    let dataset_revision = info.sha.as_deref().unwrap_or(DEFAULT_DATASET_REVISION);
-    let prefix = canonical_expert_components_prefix(
-        source_repo,
-        source_revision,
-        distribution_id,
-        analyzer_id,
-    );
-    let manifest_rel = format!("{prefix}/manifest.json");
-    let siblings = info.siblings.as_deref().unwrap_or(&[]);
-    if !siblings.iter().any(|entry| entry.rfilename == manifest_rel) {
+    let Some((siblings, package_revision, manifest_rel)) = resolve_package_variant(
+        &api,
+        &entry.package_repo,
+        &entry.package_revision,
+        model_ref,
+    )?
+    else {
+        return Ok(None);
+    };
+    if !siblings
+        .iter()
+        .any(|sibling| sibling.rfilename == manifest_rel)
+    {
         return Ok(None);
     }
 
-    let manifest_path = dataset_repo
+    let (owner, name) = entry
+        .package_repo
+        .split_once('/')
+        .unwrap_or(("", entry.package_repo.as_str()));
+    let repo = api.model(owner, name);
+    let manifest_path = repo
         .download_file(
             &RepoDownloadFileParams::builder()
                 .filename(manifest_rel.clone())
-                .revision(dataset_revision.to_string())
+                .revision(package_revision.clone())
                 .build(),
         )
         .with_context(|| format!("Download {}", manifest_rel))?;
     let manifest_content = fs::read_to_string(&manifest_path)
         .with_context(|| format!("Read {}", manifest_path.display()))?;
-    let manifest: moe::ExpertComponentsManifest = serde_json::from_str(&manifest_content)
+    let manifest: MoePackageManifest = serde_json::from_str(&manifest_content)
         .with_context(|| format!("Parse {}", manifest_path.display()))?;
 
-    if manifest.analyzer_id != analyzer_id
-        || manifest.ranking_sha256 != ranking_sha256
-        || manifest.distribution_id != distribution_id
-        || manifest.source_repo.as_deref() != Some(source_repo)
-        || manifest.source_revision.as_deref() != Some(source_revision)
-        || manifest.format != "gguf-moe-components"
-    {
+    if manifest.ranking_sha256 != ranking_sha256 || manifest.format != "meshllm-moe-components" {
         return Ok(None);
     }
 
-    let trunk_rel = repo_component_path(&prefix, &manifest.trunk.path);
+    let trunk_rel = join_repo_relative(&manifest_rel, &manifest.trunk.path);
     if !siblings.iter().any(|entry| entry.rfilename == trunk_rel) {
         return Ok(None);
     }
-    let trunk_path = dataset_repo
+    let trunk_path = repo
         .download_file(
             &RepoDownloadFileParams::builder()
                 .filename(trunk_rel.clone())
-                .revision(dataset_revision.to_string())
+                .revision(package_revision.clone())
                 .build(),
         )
         .with_context(|| format!("Download {}", trunk_rel))?;
@@ -974,29 +1178,26 @@ pub(crate) fn fetch_remote_expert_components(
 
     let mut expert_paths = Vec::with_capacity(expected_experts.len());
     for expert_id in expected_experts {
-        let Some(entry) = manifest
+        let Some(expert) = manifest
             .experts
             .iter()
             .find(|entry| entry.expert_id == Some(*expert_id))
         else {
             return Ok(None);
         };
-        let expert_rel = repo_component_path(&prefix, &entry.path);
-        if !siblings
-            .iter()
-            .any(|sibling| sibling.rfilename == expert_rel)
-        {
+        let expert_rel = join_repo_relative(&manifest_rel, &expert.path);
+        if !siblings.iter().any(|entry| entry.rfilename == expert_rel) {
             return Ok(None);
         }
-        let expert_path = dataset_repo
+        let expert_path = repo
             .download_file(
                 &RepoDownloadFileParams::builder()
                     .filename(expert_rel.clone())
-                    .revision(dataset_revision.to_string())
+                    .revision(package_revision.clone())
                     .build(),
             )
             .with_context(|| format!("Download {}", expert_rel))?;
-        if sha256_file(&expert_path)? != entry.sha256 {
+        if sha256_file(&expert_path)? != expert.sha256 {
             bail!(
                 "Downloaded expert component hash mismatch for {}",
                 expert_rel
@@ -1006,22 +1207,13 @@ pub(crate) fn fetch_remote_expert_components(
     }
 
     Ok(Some(ResolvedExpertComponents {
-        prefix,
+        prefix: format!(
+            "{}@{}:{}",
+            entry.package_repo, package_revision, manifest_rel
+        ),
         trunk_path,
         expert_paths,
     }))
-}
-
-fn repo_component_path(prefix: &str, relative_path: &str) -> String {
-    if relative_path.starts_with(prefix) {
-        relative_path.to_string()
-    } else {
-        format!(
-            "{}/{}",
-            prefix.trim_end_matches('/'),
-            relative_path.trim_start_matches('/')
-        )
-    }
 }
 
 pub(crate) fn build_submit_bundle(
@@ -1029,125 +1221,135 @@ pub(crate) fn build_submit_bundle(
     ranking: &ResolvedRanking,
     log_path: Option<&Path>,
 ) -> Result<MoeSubmitBundle> {
-    let dataset_prefix = format!(
-        "{}/{}",
-        canonical_dataset_prefix_for_model(model)?,
-        ranking.analyzer_id
-    );
-    let ranking_rel = format!("{dataset_prefix}/ranking.csv");
-    let metadata_rel = format!("{dataset_prefix}/metadata.json");
-    let analysis_rel = format!("{dataset_prefix}/{ANALYSIS_JSON_FILENAME}");
-    let log_rel = format!("{dataset_prefix}/run.log");
+    let variant = variant_key_for_model(model);
+    let variant_root = format!("variants/{variant}");
+    let ranking_rel = format!("{variant_root}/ranking.csv");
+    let analysis_rel = format!("{variant_root}/{ANALYSIS_JSON_FILENAME}");
+    let manifest_rel = format!("{variant_root}/manifest.json");
+    let log_rel = format!("{variant_root}/run.log");
 
     let model_files = discover_distribution_files(model)?;
-    let metadata_content = if let Some(existing) = ranking.metadata_path.as_ref() {
-        fs::read_to_string(existing)
-            .with_context(|| format!("Read existing metadata {}", existing.display()))?
-    } else {
-        serde_json::to_string_pretty(&build_metadata_json(model, ranking, &model_files)?)? + "\n"
-    };
-    let analysis_content = if let Some(existing) = ranking.analysis_path.as_ref() {
-        fs::read_to_string(existing)
-            .with_context(|| format!("Read existing analysis {}", existing.display()))?
-    } else {
-        serde_json::to_string_pretty(&build_analysis_json(model, ranking, &model_files)?)? + "\n"
-    };
+    let analysis_content =
+        serde_json::to_string_pretty(&build_package_analysis_json(model, ranking, &model_files)?)?
+            + "\n";
 
-    let mut dataset_paths = vec![ranking_rel, metadata_rel, analysis_rel];
     let log_path = log_path.filter(|path| path.exists()).map(Path::to_path_buf);
-    if log_path.is_some() {
-        dataset_paths.push(log_rel);
-    }
-
-    let source_repo = model.source_repo.clone().unwrap_or_default();
-    let source_revision = model.source_revision.clone().unwrap_or_default();
+    let model_ref = canonical_model_ref_for_model(model)?;
     Ok(MoeSubmitBundle {
-        dataset_prefix,
-        dataset_paths,
+        model_ref,
+        variant,
+        variant_root,
+        ranking_repo_path: ranking_rel,
+        analysis_repo_path: analysis_rel,
+        manifest_repo_path: manifest_rel,
+        log_repo_path: log_path.as_ref().map(|_| log_rel),
         ranking_path: ranking.path.clone(),
-        metadata_content,
         analysis_content,
         log_path,
         commit_message: format!(
-            "Add {} {} for {}@{}",
-            model.distribution_id,
-            ranking.analyzer_id,
-            source_repo,
-            short_revision(&source_revision)
+            "Publish {} {} package",
+            model.distribution_id, ranking.analyzer_id,
         ),
         commit_description: format!(
-            "Publish {} ranking artifacts for {} ({})",
+            "Publish {} Mesh package artifacts for {} ({})",
             ranking.analyzer_id, model.display_name, model.input
         ),
     })
 }
 
-fn short_revision(revision: &str) -> &str {
-    if revision.len() <= 12 {
-        revision
+pub(crate) fn build_meshllm_descriptor(
+    existing: Option<&str>,
+    model: &MoeModelContext,
+    manifest_path: &str,
+) -> Result<MeshllmPackageJson> {
+    let source_repo = model.source_repo.clone().ok_or_else(|| {
+        anyhow::anyhow!("Package publishing requires a Hugging Face-backed model")
+    })?;
+    let source_revision = model.source_revision.clone().ok_or_else(|| {
+        anyhow::anyhow!("Package publishing requires a resolved Hugging Face source revision")
+    })?;
+    let variant = variant_key_for_model(model);
+    let mut meshllm = if let Some(existing) = existing {
+        let parsed: MeshllmPackageJson =
+            serde_json::from_str(existing).context("Parse existing meshllm.json")?;
+        if parsed.source.repo != source_repo {
+            bail!(
+                "Existing meshllm.json source repo {} does not match {}",
+                parsed.source.repo,
+                source_repo
+            );
+        }
+        parsed
     } else {
-        &revision[..12]
-    }
+        MeshllmPackageJson {
+            schema_version: 1,
+            source: MeshllmPackageSource {
+                repo: source_repo.clone(),
+                revision: source_revision.clone(),
+            },
+            variants: BTreeMap::new(),
+        }
+    };
+    meshllm.source.revision = source_revision;
+    meshllm.variants.insert(
+        variant,
+        MeshllmPackageVariant {
+            distribution_id: model.distribution_id.clone(),
+            manifest: manifest_path.to_string(),
+        },
+    );
+    Ok(meshllm)
 }
 
-fn build_metadata_json(
+fn build_package_analysis_json(
     model: &MoeModelContext,
     ranking: &ResolvedRanking,
     model_files: &[(String, PathBuf)],
 ) -> Result<Value> {
-    let Some(source_repo) = model.source_repo.as_ref() else {
-        bail!("A Hugging Face-backed model is required to generate metadata.");
-    };
-    let Some(source_revision) = model.source_revision.as_ref() else {
-        bail!("A resolved source revision is required to generate metadata.");
-    };
-    let primary_file = model_files
-        .first()
-        .map(|(repo_path, _)| repo_path.clone())
-        .unwrap_or_else(|| model.distribution_id.clone());
-    let all_files = model_files
-        .iter()
-        .map(|(repo_path, _)| repo_path.clone())
-        .collect::<Vec<_>>();
-    let total_files = model_files.len();
-    if total_files > 0 {
-        eprintln!(
-            "📦 Computing SHA-256 hashes for {} GGUF file(s) while building metadata...",
-            total_files
-        );
-    }
-    let mut file_hashes = serde_json::Map::with_capacity(total_files);
-    for (index, (repo_path, path)) in model_files.iter().enumerate() {
-        eprintln!("   [{}/{}] Hashing {}", index + 1, total_files, repo_path);
-        file_hashes.insert(repo_path.clone(), Value::String(sha256_file(path)?));
-    }
-
     let (prompt_set, prompt_count, token_count, context_size, all_layers) =
         infer_analysis_details(ranking, model)?;
+    let mass_profile = load_analyze_mass_profile(&ranking.path)?;
+    let tensor_profile = aggregate_tensor_byte_profile(model_files)?;
 
     Ok(json!({
         "schema_version": 1,
-        "source_repo": source_repo,
-        "source_revision": source_revision,
-        "format": "gguf",
-        "distribution_id": model.distribution_id,
         "analyzer_id": ranking.analyzer_id,
-        "analysis_tool": "llama-moe-analyze",
-        "ranking_path": "ranking.csv",
-        "primary_file": primary_file,
-        "all_files": all_files,
-        "file_hashes": file_hashes,
-        "prompt_set": prompt_set,
-        "prompt_count": prompt_count,
-        "token_count": token_count,
-        "all_layers": all_layers,
-        "command": {
-            "context_size": context_size,
-            "token_count": token_count,
-            "analyzer_id": ranking.analyzer_id,
-        },
         "created_at": iso8601_now(),
-        "status": "complete",
+        "tool": {
+            "name": "llama-moe-analyze",
+            "version": "mesh-llm-fork"
+        },
+        "parameters": {
+            "prompt_set": prompt_set,
+            "prompt_count": prompt_count,
+            "token_count": token_count,
+            "context_size": context_size,
+            "all_layers": all_layers
+        },
+        "ranking": {
+            "sha256": sha256_file(&ranking.path)?,
+            "rows": mass_profile.ranking.len(),
+            "mass_checkpoints": build_mass_checkpoints(&mass_profile),
+        },
+        "summary": {
+            "n_expert": model.expert_count,
+            "n_expert_used": model.used_expert_count,
+            "min_experts_per_node": model.min_experts_per_node
+        },
+        "memory": {
+            "full_model_bytes": tensor_profile.full_model_bytes,
+            "base_resident_bytes": tensor_profile.base_resident_bytes,
+            "shard_file_overhead_bytes": tensor_profile.file_overhead_bytes,
+            "expert_tensor_bytes_total": tensor_profile.expert_tensor_bytes,
+            "expert_bytes": expert_bytes_json(tensor_profile.expert_tensor_bytes, model.expert_count)?,
+        },
+        "planner": {
+            "recommended_overlap": 1,
+        },
+        "artifacts": {
+            "ranking": "ranking.csv",
+            "manifest": "manifest.json"
+        }
     }))
 }
 
@@ -1177,6 +1379,124 @@ fn build_analysis_json(
             "expert_bytes": expert_bytes_json(tensor_profile.expert_tensor_bytes, model.expert_count)?,
         }
     }))
+}
+
+pub(crate) fn default_package_repo_name_for_model(model: &MoeModelContext) -> Result<String> {
+    let Some(source_repo) = model.source_repo.as_ref() else {
+        bail!("A Hugging Face-backed model is required to derive the package repo name.");
+    };
+    let repo_name = source_repo
+        .split_once('/')
+        .map(|(_, repo)| repo)
+        .unwrap_or(source_repo);
+    Ok(format!("{}-moe", sanitize_repo_name_component(repo_name)))
+}
+
+pub(crate) fn canonical_model_ref_for_model(model: &MoeModelContext) -> Result<String> {
+    let Some(source_repo) = model.source_repo.as_ref() else {
+        bail!("A Hugging Face-backed model is required to derive the canonical model ref.");
+    };
+    Ok(canonical_model_ref_from_source(
+        source_repo,
+        &model.distribution_id,
+        Some(
+            crate::models::huggingface_identity_for_path(&model.path)
+                .map(|identity| identity.file)
+                .or_else(|| {
+                    model
+                        .path
+                        .file_name()
+                        .and_then(|value| value.to_str())
+                        .map(ToOwned::to_owned)
+                })
+                .unwrap_or_else(|| model.display_name.clone()),
+        ),
+    ))
+}
+
+pub(crate) fn canonical_model_ref_from_source(
+    source_repo: &str,
+    distribution_id: &str,
+    file_hint: Option<String>,
+) -> String {
+    let variant = file_hint
+        .as_deref()
+        .and_then(infer_variant_key_from_gguf_file)
+        .unwrap_or_else(|| normalize_variant_selector(distribution_id));
+    format!("{source_repo}:{variant}")
+}
+
+pub(crate) fn variant_key_for_model(model: &MoeModelContext) -> String {
+    let candidate = crate::models::huggingface_identity_for_path(&model.path)
+        .map(|identity| identity.file)
+        .or_else(|| {
+            model
+                .path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(|| model.display_name.clone());
+    infer_variant_key_from_gguf_file(&candidate).unwrap_or_else(|| model.distribution_id.clone())
+}
+
+pub(crate) fn sanitize_repo_name_component(input: &str) -> String {
+    let sanitized = input
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let trimmed = sanitized.trim_matches('-');
+    if trimmed.is_empty() {
+        "mesh-llm-moe".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+pub(crate) fn infer_variant_key_from_gguf_file(file: &str) -> Option<String> {
+    if !file.ends_with(".gguf") {
+        return None;
+    }
+    if let Some((prefix, _)) = file.split_once('/') {
+        if is_quant_like_selector(prefix) {
+            return Some(normalize_variant_selector(prefix));
+        }
+    }
+    let basename = Path::new(file).file_name()?.to_str()?;
+    let mut stem = basename.strip_suffix(".gguf")?;
+    if let Some((base, shard)) = stem.rsplit_once("-00001-of-") {
+        if shard.len() == 5 && shard.chars().all(|ch| ch.is_ascii_digit()) {
+            stem = base;
+        }
+    }
+    for marker in [
+        "-UD-", ".UD-", "-IQ", ".IQ", "-Q", ".Q", "-BF16", ".BF16", "-F16", ".F16", "-F32", ".F32",
+    ] {
+        if let Some(pos) = stem.rfind(marker) {
+            return Some(normalize_variant_selector(&stem[pos + 1..]));
+        }
+    }
+    None
+}
+
+pub(crate) fn normalize_variant_selector(selector: &str) -> String {
+    selector.strip_prefix("UD-").unwrap_or(selector).to_string()
+}
+
+fn is_quant_like_selector(value: &str) -> bool {
+    let upper = value.to_ascii_uppercase();
+    upper.starts_with("UD-")
+        || upper.starts_with("Q")
+        || upper.starts_with("IQ")
+        || upper == "BF16"
+        || upper == "F16"
+        || upper == "F32"
 }
 
 pub(crate) fn read_analysis_json(path: &Path) -> Result<MoeAnalysisJson> {
@@ -1461,6 +1781,21 @@ pub(crate) fn write_analysis_json(
     Ok(analysis_path)
 }
 
+pub(crate) fn write_package_analysis_json(
+    model: &MoeModelContext,
+    ranking: &ResolvedRanking,
+    output_path: &Path,
+) -> Result<()> {
+    let model_files = discover_distribution_files(model)?;
+    let content =
+        serde_json::to_string_pretty(&build_package_analysis_json(model, ranking, &model_files)?)?
+            + "\n";
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("Create {}", parent.display()))?;
+    }
+    fs::write(output_path, content).with_context(|| format!("Write {}", output_path.display()))
+}
+
 fn infer_analysis_details(
     ranking: &ResolvedRanking,
     model: &MoeModelContext,
@@ -1517,7 +1852,7 @@ fn extract_first_arg_value<'a>(text: Option<&'a str>, flag: &str) -> Option<&'a 
         .find_map(|window| (window[0] == flag).then_some(window[1]))
 }
 
-fn analysis_log_path(model: &MoeModelContext, analyzer_id: &str) -> Option<PathBuf> {
+pub(crate) fn analysis_log_path(model: &MoeModelContext, analyzer_id: &str) -> Option<PathBuf> {
     let stem = model
         .path
         .file_stem()
@@ -1697,6 +2032,7 @@ fn mass_pct_for_experts(profile: &AnalyzeMassProfile, experts: &[u32]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     fn temp_case_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -1799,6 +2135,55 @@ mod tests {
             content.push_str(&format!("{expert_id},{mass},0.0,1\n"));
         }
         fs::write(path, content).unwrap();
+    }
+
+    fn align_offset(offset: u64, alignment: u32) -> u64 {
+        let alignment = u64::from(alignment.max(1));
+        ((offset + alignment - 1) / alignment) * alignment
+    }
+
+    fn push_gguf_string(bytes: &mut Vec<u8>, value: &str) {
+        bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(value.as_bytes());
+    }
+
+    fn push_tensor_info(bytes: &mut Vec<u8>, name: &str, offset: u64) {
+        push_gguf_string(bytes, name);
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&16u64.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&offset.to_le_bytes());
+    }
+
+    fn write_test_gguf(path: &Path, expert_count: u32, expert_used_count: u32) {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.extend_from_slice(&2i64.to_le_bytes());
+        bytes.extend_from_slice(&3i64.to_le_bytes());
+
+        push_gguf_string(&mut bytes, "general.alignment");
+        bytes.extend_from_slice(&4u32.to_le_bytes());
+        bytes.extend_from_slice(&32u32.to_le_bytes());
+
+        push_gguf_string(&mut bytes, "llama.expert_count");
+        bytes.extend_from_slice(&4u32.to_le_bytes());
+        bytes.extend_from_slice(&expert_count.to_le_bytes());
+
+        push_gguf_string(&mut bytes, "llama.expert_used_count");
+        bytes.extend_from_slice(&4u32.to_le_bytes());
+        bytes.extend_from_slice(&expert_used_count.to_le_bytes());
+
+        push_tensor_info(&mut bytes, "blk.0.ffn_up_exps.weight", 0);
+        push_tensor_info(&mut bytes, "blk.0.attn_q.weight", 64);
+
+        let data_start = align_offset(bytes.len() as u64, 32) as usize;
+        bytes.resize(data_start, 0);
+        bytes.resize(data_start + 96, 0);
+
+        let mut file = fs::File::create(path).unwrap();
+        file.write_all(&bytes).unwrap();
+        file.flush().unwrap();
     }
 
     fn test_analysis(full_model_bytes: u64, base_resident_bytes: u64) -> MoeAnalysisJson {
@@ -1926,12 +2311,12 @@ mod tests {
         let analysis_path = analyzer_dir.join("analysis.json");
         let log_path = analyzer_dir.join("run.log");
         fs::create_dir_all(&analyzer_dir).unwrap();
-        fs::write(&ranking_path, "0\n1\n").unwrap();
+        write_test_ranking(&ranking_path, &[(0, 4.0), (1, 3.0), (2, 2.0), (3, 1.0)]);
         fs::write(&analysis_path, "{}\n").unwrap();
         fs::write(&log_path, "ok\n").unwrap();
 
         let model_file = dir.join("gemma-4-26B-A4B-it-UD-Q4_K_S.gguf");
-        fs::write(&model_file, b"fake").unwrap();
+        write_test_gguf(&model_file, 64, 4);
         let model = MoeModelContext {
             input: "unsloth/gemma".to_string(),
             path: model_file,
@@ -1954,60 +2339,48 @@ mod tests {
         };
 
         let bundle = build_submit_bundle(&model, &ranking, Some(&log_path)).unwrap();
+        assert_eq!(bundle.model_ref, "unsloth/gemma-4-26B-A4B-it-GGUF:Q4_K_S");
+        assert_eq!(bundle.variant, "Q4_K_S");
+        assert_eq!(bundle.variant_root, "variants/Q4_K_S");
+        assert_eq!(bundle.ranking_repo_path, "variants/Q4_K_S/ranking.csv");
+        assert_eq!(bundle.analysis_repo_path, "variants/Q4_K_S/analysis.json");
+        assert_eq!(bundle.manifest_repo_path, "variants/Q4_K_S/manifest.json");
         assert_eq!(
-            bundle.dataset_prefix,
-            "data/unsloth/gemma-4-26B-A4B-it-GGUF/9c718328e1620e7280a93e1a809e805e0f3e4839/gguf/gemma-4-26B-A4B-it-UD-Q4_K_S/full-v1"
+            bundle.log_repo_path.as_deref(),
+            Some("variants/Q4_K_S/run.log")
         );
-        assert!(bundle
-            .dataset_paths
-            .contains(&format!("{}/ranking.csv", bundle.dataset_prefix)));
-        assert!(bundle
-            .dataset_paths
-            .contains(&format!("{}/metadata.json", bundle.dataset_prefix)));
-        assert!(bundle
-            .dataset_paths
-            .contains(&format!("{}/analysis.json", bundle.dataset_prefix)));
-        assert!(bundle
-            .dataset_paths
-            .contains(&format!("{}/run.log", bundle.dataset_prefix)));
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn canonical_expert_components_prefix_uses_shared_experts_dir() {
+    fn default_package_repo_name_uses_source_repo_name() {
         let model = MoeModelContext {
             input: "demo".to_string(),
             path: PathBuf::from("/tmp/model.gguf"),
             display_name: "demo".to_string(),
-            source_repo: Some("unsloth/demo-gguf".to_string()),
+            source_repo: Some("unsloth/Qwen3.6-35B-A3B-GGUF".to_string()),
             source_revision: Some("deadbeef".to_string()),
-            distribution_id: "demo-q4".to_string(),
+            distribution_id: "Qwen3.6-35B-A3B-UD-Q4_K_XL".to_string(),
             expert_count: 8,
             used_expert_count: 2,
             min_experts_per_node: 4,
             total_model_bytes: 1,
         };
-
-        let prefix = canonical_expert_components_prefix_for_model(&model, "full-v1").unwrap();
         assert_eq!(
-            prefix,
-            "data/unsloth/demo-gguf/deadbeef/gguf/demo-q4/full-v1/experts"
+            default_package_repo_name_for_model(&model).unwrap(),
+            "qwen3.6-35b-a3b-gguf-moe"
         );
     }
 
     #[test]
-    fn repo_component_path_joins_prefix_once() {
-        let prefix = "data/org/repo/rev/gguf/dist/full-v1/experts";
+    fn join_repo_relative_resolves_paths_from_manifest_parent() {
         assert_eq!(
-            repo_component_path(prefix, "trunk.gguf"),
-            "data/org/repo/rev/gguf/dist/full-v1/experts/trunk.gguf"
+            join_repo_relative("variants/Q4_K_XL/manifest.json", "trunk.gguf"),
+            "variants/Q4_K_XL/trunk.gguf"
         );
         assert_eq!(
-            repo_component_path(
-                prefix,
-                "data/org/repo/rev/gguf/dist/full-v1/experts/trunk.gguf"
-            ),
-            "data/org/repo/rev/gguf/dist/full-v1/experts/trunk.gguf"
+            join_repo_relative("variants/Q4_K_XL/manifest.json", "experts/expert-000.gguf"),
+            "variants/Q4_K_XL/experts/expert-000.gguf"
         );
     }
 }

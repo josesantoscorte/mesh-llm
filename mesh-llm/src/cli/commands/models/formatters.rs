@@ -293,7 +293,6 @@ pub(crate) fn catalog_model_is_mlx(model: &catalog::CatalogModel) -> bool {
             file.ends_with("model.safetensors") || file.ends_with("model.safetensors.index.json")
         })
         .unwrap_or(false)
-        || model.url.contains("model.safetensors")
 }
 
 pub(crate) fn catalog_model_kind(model: &catalog::CatalogModel) -> &'static str {

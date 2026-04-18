@@ -29,7 +29,7 @@ pub(crate) async fn submit_full_analyze_job(
             context_size,
             n_gpu_layers,
         },
-        dataset_repo: options.dataset_repo.clone(),
+        catalog_repo: options.catalog_repo.clone(),
         flavor: options.hf_job_flavor.clone(),
         timeout: options.hf_job_timeout.clone(),
         namespace: options.hf_job_namespace.clone(),
@@ -63,7 +63,7 @@ pub(crate) async fn submit_micro_analyze_job(
             context_size,
             n_gpu_layers,
         },
-        dataset_repo: options.dataset_repo.clone(),
+        catalog_repo: options.catalog_repo.clone(),
         flavor: options.hf_job_flavor.clone(),
         timeout: options.hf_job_timeout.clone(),
         namespace: options.hf_job_namespace.clone(),
@@ -84,7 +84,7 @@ pub(crate) async fn submit_micro_analyze_job(
 struct JobSubmissionSpec {
     model_ref: String,
     analyzer: RemoteAnalyzer,
-    dataset_repo: String,
+    catalog_repo: String,
     flavor: String,
     timeout: String,
     namespace: Option<String>,
@@ -240,7 +240,7 @@ async fn submit_job(spec: JobSubmissionSpec) -> Result<()> {
             "SOURCE_REPO": spec.source_repo,
             "SOURCE_REVISION": spec.source_revision,
             "SOURCE_FILE": spec.source_file,
-            "DATASET_REPO": spec.dataset_repo,
+            "CATALOG_REPO": spec.catalog_repo,
             "HF_JOB_FLAVOR": pricing.flavor.name,
             "HF_JOB_FLAVOR_PRETTY": pricing.flavor.pretty_name(),
             "HF_JOB_UNIT_COST_USD": format!("{:.6}", pricing.unit_cost_usd),
@@ -260,14 +260,14 @@ async fn submit_job(spec: JobSubmissionSpec) -> Result<()> {
             "source_repo": sanitize_label(&spec.source_repo),
             "source_revision": sanitize_label(&spec.source_revision),
             "distribution_id": sanitize_label(&spec.distribution_id),
-            "dataset_repo": sanitize_label(&spec.dataset_repo),
+            "catalog_repo": sanitize_label(&spec.catalog_repo),
         }
     });
 
     println!("☁️ Hugging Face Job submission");
     println!("📍 Analyzer: {}", spec.analyzer.analyzer_id());
     println!("📦 Model: {}", spec.model_ref);
-    println!("🗂️ Dataset: {}", spec.dataset_repo);
+    println!("🗂️ Catalog: {}", spec.catalog_repo);
     println!("🖥️ Flavor: {}", spec.flavor);
     println!("⏱️ Timeout: {}", spec.timeout);
     println!("📥 Release: {} {}", spec.release_repo, spec.release_tag);
@@ -394,7 +394,7 @@ fn hf_endpoint() -> String {
 fn remote_bash_script(spec: &JobSubmissionSpec) -> String {
     let analyze_command = spec.analyzer.analyze_command_with_env_ref();
     let share_command =
-        "./mesh-llm moe share \"$MODEL_REF\" --dataset-repo \"$DATASET_REPO\"".to_string();
+        "./mesh-llm moe share \"$MODEL_REF\" --catalog-repo \"$CATALOG_REPO\"".to_string();
     HF_JOB_WRAPPER_TEMPLATE
         .replace("__ANALYZE_COMMAND__", &shell_single_quote(&analyze_command))
         .replace("__SHARE_COMMAND__", &shell_single_quote(&share_command))
@@ -577,10 +577,7 @@ mod tests {
 
     #[test]
     fn sanitize_label_replaces_unsupported_characters() {
-        assert_eq!(
-            sanitize_label("meshllm/moe-rankings"),
-            "meshllm-moe-rankings"
-        );
+        assert_eq!(sanitize_label("meshllm/catalog"), "meshllm-catalog");
         assert_eq!(sanitize_label("Qwen/Qwen3@abc"), "Qwen-Qwen3-abc");
     }
 

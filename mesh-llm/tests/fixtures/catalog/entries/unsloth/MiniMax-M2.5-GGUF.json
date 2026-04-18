@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "source_repo": "unsloth/MiniMax-M2.5-GGUF",
+  "variants": {
+    "Q4_K_M/MiniMax-M2.5-Q4_K_M-00001-of-00004": {
+      "source": {
+        "repo": "unsloth/MiniMax-M2.5-GGUF",
+        "revision": "main",
+        "file": "Q4_K_M/MiniMax-M2.5-Q4_K_M-00001-of-00004.gguf"
+      },
+      "curated": {
+        "name": "MiniMax-M2.5-Q4_K_M",
+        "size": "138GB",
+        "description": "MiniMax-M2.5 MoE 456B/46B active, 256 experts top-8, Q4_K_M",
+        "draft": null,
+        "moe": {
+          "n_expert": 256,
+          "n_expert_used": 8,
+          "min_experts_per_node": 96
+        },
+        "extra_files": [
+          {
+            "file": "Q4_K_M/MiniMax-M2.5-Q4_K_M-00002-of-00004.gguf",
+            "repo": "unsloth/MiniMax-M2.5-GGUF",
+            "revision": "main"
+          },
+          {
+            "file": "Q4_K_M/MiniMax-M2.5-Q4_K_M-00003-of-00004.gguf",
+            "repo": "unsloth/MiniMax-M2.5-GGUF",
+            "revision": "main"
+          },
+          {
+            "file": "Q4_K_M/MiniMax-M2.5-Q4_K_M-00004-of-00004.gguf",
+            "repo": "unsloth/MiniMax-M2.5-GGUF",
+            "revision": "main"
+          }
+        ],
+        "mmproj": null
+      },
+      "packages": []
+    }
+  }
+}

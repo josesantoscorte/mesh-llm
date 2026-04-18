@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "source_repo": "Qwen/Qwen2.5-3B-Instruct-GGUF",
+  "variants": {
+    "qwen2.5-3b-instruct-q4_k_m": {
+      "source": {
+        "repo": "Qwen/Qwen2.5-3B-Instruct-GGUF",
+        "revision": "main",
+        "file": "qwen2.5-3b-instruct-q4_k_m.gguf"
+      },
+      "curated": {
+        "name": "Qwen2.5-3B-Instruct-Q4_K_M",
+        "size": "2.1GB",
+        "description": "Small & fast general chat",
+        "draft": "Qwen2.5-0.5B-Instruct-Q4_K_M",
+        "moe": null,
+        "extra_files": [],
+        "mmproj": null
+      },
+      "packages": []
+    }
+  }
+}

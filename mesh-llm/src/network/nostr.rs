@@ -959,7 +959,7 @@ fn model_tiers() -> Vec<(String, f64)> {
 /// Tiers:
 ///   <8GB:    Qwen3-4B (2.5G)
 ///   8-24GB:  Qwen3-8B (5G)
-///   24-50GB: Qwen3.5-27B (17G) — vision + text
+///   24-50GB: Qwen3.5-9B-Vision (5.8G) — vision + text
 ///   50-63GB: GLM-4.7-Flash (18G) — 30B MoE, fast, tool calling
 ///   63-179GB: Qwen3-Coder-Next (48G) — frontier coder ~85B
 ///   179GB+:  MiniMax-M2.5 (138G) — 456B MoE flagship
@@ -1001,7 +1001,7 @@ pub fn auto_model_pack(vram_gb: f64) -> Vec<String> {
         },
         Pack {
             min_vram: 24.0,
-            models: &["Qwen3.5-27B-Q4_K_M"],
+            models: &["Qwen3.5-9B-Vision-Q4_K_M"],
         },
         Pack {
             min_vram: 8.0,
@@ -1045,7 +1045,7 @@ pub fn auto_model_pack(vram_gb: f64) -> Vec<String> {
 pub fn demand_seed_models() -> Vec<String> {
     vec![
         "Qwen3-Coder-Next-Q4_K_M".into(),
-        "Qwen3.5-27B-Q4_K_M".into(),
+        "Qwen3.5-9B-Vision-Q4_K_M".into(),
         "GLM-4.7-Flash-Q4_K_M".into(),
         "Qwen3-8B-Q4_K_M".into(),
         "Qwen3-4B-Q4_K_M".into(),
@@ -1090,7 +1090,7 @@ mod auto_pack_tests {
     #[test]
     fn pack_24gb_vision() {
         let pack = auto_model_pack(24.0);
-        assert_eq!(pack, vec!["Qwen3.5-27B-Q4_K_M"]);
+        assert_eq!(pack, vec!["Qwen3.5-9B-Vision-Q4_K_M"]);
     }
 
     #[test]
@@ -1119,9 +1119,9 @@ mod auto_pack_tests {
 
     #[test]
     fn pack_between_tiers_falls_through() {
-        // 40GB: below 50GB tier, falls to 24GB tier (Qwen3.5-27B)
+        // 40GB: below 50GB tier, falls to 24GB tier (Qwen3.5-9B-Vision)
         let pack = auto_model_pack(40.0);
-        assert_eq!(pack, vec!["Qwen3.5-27B-Q4_K_M"]);
+        assert_eq!(pack, vec!["Qwen3.5-9B-Vision-Q4_K_M"]);
     }
 
     #[test]

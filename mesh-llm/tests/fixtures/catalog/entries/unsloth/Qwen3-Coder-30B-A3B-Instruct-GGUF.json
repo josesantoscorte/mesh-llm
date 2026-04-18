@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "source_repo": "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF",
+  "variants": {
+    "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M": {
+      "source": {
+        "repo": "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF",
+        "revision": "main",
+        "file": "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf"
+      },
+      "curated": {
+        "name": "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M",
+        "size": "18.6GB",
+        "description": "MoE agentic coding, tool use, 128 experts top-8",
+        "draft": "Qwen3-0.6B-Q4_K_M",
+        "moe": {
+          "n_expert": 128,
+          "n_expert_used": 8,
+          "min_experts_per_node": 46
+        },
+        "extra_files": [],
+        "mmproj": null
+      },
+      "packages": []
+    }
+  }
+}

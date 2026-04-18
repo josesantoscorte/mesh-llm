@@ -65,6 +65,7 @@ pub fn find_catalog_model_exact(query: &str) -> Option<&'static catalog::Catalog
     let q = query.to_lowercase();
     catalog::MODEL_CATALOG.iter().find(|model| {
         model.name.to_lowercase() == q
+            || model.model_ref.to_lowercase() == q
             || model.file.to_lowercase() == q
             || model.file.trim_end_matches(".gguf").to_lowercase() == q
     })
@@ -187,17 +188,14 @@ pub async fn show_exact_model(input: &str) -> Result<ModelDetails> {
     match parse_exact_model_ref(&input)? {
         ExactModelRef::Catalog(model) => Ok(ModelDetails {
             display_name: model.name.to_string(),
-            exact_ref: model.name.to_string(),
+            exact_ref: model.model_ref.clone(),
             source: "catalog",
             kind: catalog_model_kind(model),
-            download_url: match (
-                model.source_repo(),
+            download_url: huggingface_resolve_url(
+                model.source_repo().unwrap_or_default(),
                 model.source_revision(),
-                model.source_file(),
-            ) {
-                (Some(repo), revision, Some(file)) => huggingface_resolve_url(repo, revision, file),
-                _ => model.url.to_string(),
-            },
+                model.source_file().unwrap_or(model.file.as_str()),
+            ),
             size_label: Some(model.size.to_string()),
             description: Some(model.description.to_string()),
             draft: model.draft.clone(),
@@ -567,7 +565,6 @@ fn catalog_model_kind(model: &catalog::CatalogModel) -> &'static str {
             file.ends_with("model.safetensors") || file.ends_with("model.safetensors.index.json")
         })
         .unwrap_or(false)
-        || model.url.contains("model.safetensors")
     {
         "🍎 MLX"
     } else {
@@ -603,23 +600,27 @@ pub(super) fn catalog_hf_asset_ref(
         ));
     }
 
-    let source_url = if let Some(asset) = model
+    if let Some(asset) = model
         .extra_files
         .iter()
         .find(|asset| asset.file == file_name)
     {
-        asset.url.as_str()
-    } else if let Some(asset) = model.mmproj.as_ref() {
+        return Some((
+            asset.repo.clone(),
+            Some(asset.revision.clone()),
+            asset.file.clone(),
+        ));
+    }
+    if let Some(asset) = model.mmproj.as_ref() {
         if asset.file == file_name {
-            asset.url.as_str()
-        } else {
-            return None;
+            return Some((
+                asset.repo.clone(),
+                Some(asset.revision.clone()),
+                asset.file.clone(),
+            ));
         }
-    } else {
-        return None;
-    };
-
-    parse_hf_resolve_url(source_url)
+    }
+    None
 }
 
 pub(super) fn matching_catalog_model_for_huggingface(
@@ -665,10 +666,10 @@ pub(super) fn matching_catalog_model_for_huggingface(
 }
 
 fn matching_catalog_model_for_url(url: &str) -> Option<&'static catalog::CatalogModel> {
-    catalog::MODEL_CATALOG
-        .iter()
-        .find(|model| model.url.eq_ignore_ascii_case(url))
-        .or_else(|| matching_catalog_model_by_basename(url))
+    if let Some((repo, revision, file)) = parse_hf_resolve_url(url) {
+        return matching_catalog_model_for_huggingface(&repo, revision.as_deref(), &file);
+    }
+    matching_catalog_model_by_basename(url)
 }
 
 fn matching_catalog_primary_for_huggingface(
@@ -696,12 +697,8 @@ fn matching_catalog_primary_for_huggingface(
 }
 
 fn matching_catalog_primary_for_url(url: &str) -> Option<&'static catalog::CatalogModel> {
-    let model = matching_catalog_model_for_url(url)?;
-    if model.url.eq_ignore_ascii_case(url) {
-        Some(model)
-    } else {
-        None
-    }
+    let (repo, revision, file) = parse_hf_resolve_url(url)?;
+    matching_catalog_primary_for_huggingface(&repo, revision.as_deref(), &file)
 }
 
 fn matching_catalog_model_by_basename(repo_file: &str) -> Option<&'static catalog::CatalogModel> {

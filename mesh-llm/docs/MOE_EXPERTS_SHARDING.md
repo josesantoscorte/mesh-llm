@@ -1,382 +1,703 @@
-# MoE Expert Components Sharding
+# MoE Package Repository Spec
 
-Proposed design for publishing MoE split artifacts to Hugging Face without
-creating a separate full split set for every supported node count.
+Specification for publishing Mesh-LLM MoE artifacts as self-contained
+Hugging Face repositories, with a separate Mesh catalog for resolution.
 
-## Goal
+## Summary
 
-Today mesh-llm publishes and reuses MoE rankings, but each runtime MoE split is
-still built locally as a topology-specific shard.
+This is a deliberate break from the legacy design.
 
-That works, but it scales poorly if we try to publish prebuilt split files:
+We are no longer treating `meshllm/moe-analysis` as the canonical home for MoE
+artifacts, and we are not extending the deleted bundled `catalog.json` model
+list into the new system.
 
-- 2 nodes means 2 shard files
-- 3 nodes means 3 different shard files
-- 4 nodes means 4 different shard files
-- every new node count creates a new split set
+The new design has two layers:
 
-This leads to combinatorial expansion in stored artifacts as we support more
-topologies.
+- `meshllm/catalog`
+  a small resolver dataset keyed by canonical Mesh model refs such as
+  `unsloth/Qwen3.6-35B-A3B-GGUF:BF16`
+- one Mesh-owned Hugging Face repo per upstream source repo
+  containing active MoE artifacts for one or more variants from that source
 
-The better approach is to publish a topology-independent decomposition:
+This means:
 
-- one shared trunk artifact
-- one artifact per expert
-- one manifest describing how to reassemble a runnable shard
+- `meshllm/moe-analysis` is legacy and should be deprecated
+- raw blob URLs are legacy and should be dropped
+- the Hugging Face-backed `meshllm/catalog` dataset is now the catalog of
+  record
+- the new hot path for `mesh-llm serve` is:
+  - resolve model ref in `meshllm/catalog`
+  - load the package repo
+  - read `meshllm.json`
+  - load the selected variant's `manifest.json`
+  - download `trunk.gguf` plus only the required experts
 
-Then `mesh-llm serve` downloads only the expert components needed for the
-current node's assignment and materializes a local shard from those pieces.
+## Goals
 
-## Proposed Hugging Face Layout
+- avoid combinatorial growth from publishing full topology-specific split sets
+- publish one topology-independent MoE decomposition per model variant
+- let one package repo hold multiple variants from the same upstream source repo
+- keep package identity separate from runtime assembly metadata
+- make `serve` resolve from a canonical Mesh model ref instead of a transport URL
+- make the local fallback build the same package-shaped artifact layout that
+  `moe share` publishes
 
-These artifacts should live in the existing `meshllm/moe-rankings` dataset
-under the same canonical prefix as the ranking that produced them.
+## Non-Goals
 
-Example:
+- supporting raw blob URLs as first-class catalog entries
+- continuing to use `meshllm/moe-analysis` as the canonical artifact store
+- supporting a root-level single-variant shortcut layout
+- publishing one prebuilt split set per supported node count
+
+## Canonical Model Ref
+
+The canonical Mesh identifier remains:
 
 ```text
-data/
-  unsloth/
-    Qwen3.6-35B-A3B-GGUF/
-      9280dd353ab587157920d5bd391ada414d84e552/
-        gguf/
-          Qwen3.6-35B-A3B-UD-Q4_K_XL/
-            full-v1/
-              ranking.csv
-              metadata.json
-              analysis.json
-              experts/
-                manifest.json
-                trunk.gguf
-                experts/
-                  000-031/
-                    expert-000.gguf
-                    expert-001.gguf
-                    ...
-                  032-063/
-                    ...
-                  064-095/
-                    ...
-                  096-127/
-                    ...
+owner/repo:variant
 ```
 
-The exact bucketing of expert files is flexible. The important property is that
-each expert remains independently addressable so a node can download only the
-experts it needs.
+Examples:
 
-## Why This Is Better
+```text
+unsloth/Qwen3.6-35B-A3B-GGUF:BF16
+unsloth/Qwen3.6-35B-A3B-GGUF:Q4_K_XL
+```
 
-- Storage grows with expert count, not with every supported node count.
-- Published artifacts are reusable across 2-node, 3-node, 4-node, and future
-  topologies.
-- Node join and leave events become more natural: a node only needs to fetch
-  new experts when its assignment changes.
-- The artifact model is cleaner: one canonical MoE decomposition per exact
-  model revision.
+This format is the key used in `meshllm/catalog`.
 
-## Runtime Model
+## New Architecture
 
-`mesh-llm serve` should continue to resolve MoE rankings as it does today.
+### `meshllm/catalog`
 
-After ranking resolution, the runtime flow becomes:
+`meshllm/catalog` is the resolver index. It should stay small and only answer:
 
-1. Compute the node's expert assignment from the ranking and current mesh plan.
-2. Check whether matching expert component artifacts exist in the dataset.
-3. Download `experts/manifest.json`.
-4. Download `trunk.gguf` if it is not already cached locally.
-5. Download only the expert files needed by this node's assignment.
-6. Materialize a local runnable shard GGUF from `trunk + selected experts`.
-7. Start `llama-server` using the materialized local shard.
-8. If any component is missing or invalid, fall back to today's local
-   `llama-moe-split` path.
+- does Mesh have a package for this canonical model ref?
+- which repo contains it?
+- which repo revision should runtime read?
+- who published it?
+- what trust level should runtime assign to it?
 
-This keeps the current local split path as the safety net while letting us try
-published expert reuse incrementally.
+The catalog may contain multiple entries for the same `model_ref`.
 
-## Important Compatibility Rule
+For v1, the trust model is:
 
-Published expert components must only be used when they match the ranking that
-the runtime selected.
+- `canonical`
+  a Mesh-owned package repo, typically under `meshllm/...`
+- `community`
+  a user- or org-owned package repo that has been proposed into the catalog
 
-The components are not identified by model name alone. They are valid only for
-an exact combination of:
+Community publishers should be able to publish package repos in their own
+namespace and open a PR adding those repos to `meshllm/catalog`.
 
-- source repo
-- source revision
-- distribution id
-- analyzer id (`full-v1` / `micro-v1`)
-- ranking hash
-- expert count and expert-used count
-- any component schema version we introduce
-
-If runtime resolves a newer or stronger local ranking, the published expert
-components must be ignored and the node should assemble from components that
-match that ranking or fall back to local splitting.
-
-## Manifest
-
-The `experts/manifest.json` file should describe the published decomposition and
-let runtime validate it before downloading large files.
-
-Example shape:
+Example row:
 
 ```json
 {
   "schema_version": 1,
-  "source_repo": "unsloth/Qwen3.6-35B-A3B-GGUF",
-  "source_revision": "9280dd353ab587157920d5bd391ada414d84e552",
-  "distribution_id": "Qwen3.6-35B-A3B-UD-Q4_K_XL",
-  "analyzer_id": "full-v1",
-  "ranking_sha256": "sha256:...",
-  "format": "gguf-moe-components",
-  "expert_count": 128,
-  "expert_used_count": 8,
+  "model_ref": "unsloth/Qwen3.6-35B-A3B-GGUF:Q4_K_XL",
+  "package_repo": "meshllm/qwen3.6-35b-a3b-gguf-moe",
+  "package_revision": "ab13dc98b9f1c3d4e5f60718293a4b5c6d7e8f90",
+  "publisher": "meshllm",
+  "trust": "canonical"
+}
+```
+
+Example community row:
+
+```json
+{
+  "schema_version": 1,
+  "model_ref": "unsloth/Qwen3.6-35B-A3B-GGUF:Q4_K_XL",
+  "package_repo": "jdumay/qwen3.6-35b-a3b-gguf-moe",
+  "package_revision": "de45f6a7b8c9d0123456789abcdef0123456789",
+  "publisher": "jdumay",
+  "trust": "community"
+}
+```
+
+### Per-source package repo
+
+Each Mesh package repo is keyed by upstream source repo, not by one specific
+variant.
+
+Example repo:
+
+```text
+meshllm/qwen3.6-35b-a3b-gguf-moe
+```
+
+That repo may contain multiple variants from:
+
+```text
+unsloth/Qwen3.6-35B-A3B-GGUF
+```
+
+### Top-level package descriptor
+
+Each package repo contains a top-level `meshllm.json` file describing:
+
+- the upstream source repo
+- the pinned upstream revision
+- which variants are present
+- where each variant's runtime manifest lives
+
+Example:
+
+```json
+{
+  "schema_version": 1,
+  "source": {
+    "repo": "unsloth/Qwen3.6-35B-A3B-GGUF",
+    "revision": "9280dd353ab587157920d5bd391ada414d84e552"
+  },
+  "variants": {
+    "BF16": {
+      "distribution_id": "Qwen3.6-35B-A3B-BF16",
+      "manifest": "variants/BF16/manifest.json"
+    },
+    "Q4_K_XL": {
+      "distribution_id": "Qwen3.6-35B-A3B-UD-Q4_K_XL",
+      "manifest": "variants/Q4_K_XL/manifest.json"
+    }
+  }
+}
+```
+
+## Package Repo Layout
+
+All active variant artifacts live under `variants/<variant>/`.
+
+Even single-variant repos must use this layout. There is no root-level variant
+shortcut.
+
+```text
+README.md
+meshllm.json
+variants/
+  BF16/
+    analysis.json
+    ranking.csv
+    manifest.json
+    run.log
+    trunk.gguf
+    experts/
+      expert-000.gguf
+      expert-001.gguf
+      ...
+  Q4_K_XL/
+    analysis.json
+    ranking.csv
+    manifest.json
+    run.log
+    trunk.gguf
+    experts/
+      expert-000.gguf
+      expert-001.gguf
+      ...
+```
+
+There is no `history/` directory in v1.
+
+If we want retained publication history later, it can be added in a future
+revision. For now, each variant directory only contains the active publication.
+
+## Local Cache Layout
+
+When `serve` cannot resolve a published package in `meshllm/catalog`, it
+should build and cache the same package-shaped variant layout locally instead of
+creating topology-specific split directories.
+
+The local package cache should mirror the published package layout under:
+
+```text
+~/.cache/mesh-llm/moe/packages/<source-owner>/<source-repo>/<source-revision>/
+  meshllm.json
+  variants/
+    <variant>/
+      analysis.json
+      ranking.csv
+      manifest.json
+      run.log
+      trunk.gguf
+      experts/
+        expert-000.gguf
+        expert-001.gguf
+        ...
+```
+
+This local cache is the source of truth for:
+
+- local runtime assembly
+- later `moe share` uploads
+- topology changes after the initial local extraction
+
+Legacy topology-specific GGUF split caches should be deleted rather than
+retained or migrated forward.
+
+## File Responsibilities
+
+### `meshllm.json`
+
+Repo-level descriptor.
+
+Owns:
+
+- source repo identity
+- source revision
+- available variants
+- each variant's runtime manifest location
+
+Does not own:
+
+- analysis results
+- ranking contents
+- runtime expert inventory
+
+### `variants/<variant>/manifest.json`
+
+Runtime assembly manifest for one variant.
+
+Owns:
+
+- ranking hash used for validation
+- MoE constants needed at runtime
+- `trunk.gguf` path and hash
+- expert file paths and hashes
+
+Does not own:
+
+- source repo identity
+- source revision
+- package repo identity
+- descriptive metadata
+
+Example:
+
+```json
+{
+  "schema_version": 1,
+  "format": "meshllm-moe-components",
+  "ranking_sha256": "sha256:5f2b6f4d9b0e1a2c...",
+  "n_expert": 128,
+  "n_expert_used": 8,
+  "min_experts_per_node": 46,
   "trunk": {
     "path": "trunk.gguf",
-    "sha256": "sha256:..."
+    "sha256": "sha256:19f2d5d6f2d2..."
   },
   "experts": [
     {
       "expert_id": 0,
-      "path": "experts/000-031/expert-000.gguf",
-      "sha256": "sha256:..."
+      "path": "experts/expert-000.gguf",
+      "sha256": "sha256:8a0d6c..."
     },
     {
       "expert_id": 1,
-      "path": "experts/000-031/expert-001.gguf",
-      "sha256": "sha256:..."
+      "path": "experts/expert-001.gguf",
+      "sha256": "sha256:1ff9a1..."
     }
   ]
 }
 ```
 
-The runtime should use this manifest to validate:
+Paths in the manifest are variant-relative because the manifest lives inside the
+variant directory.
 
-- model identity
-- ranking identity
-- expert count
-- presence of each required expert artifact
-- hashes when a local cached copy already exists
+### `variants/<variant>/analysis.json`
 
-## CLI Workflow
+Combined analysis results plus analysis-run metadata.
 
-The preferred workflow is to extend the existing share command instead of
-creating a separate publishing command.
+This file replaces the split between `analysis.json` and `metadata.json`.
 
-Recommended behavior:
+Owns:
+
+- analyzer id
+- tool/version
+- analysis parameters
+- summary results
+- planner notes
+- pointers to the ranking and manifest files
+
+Does not own:
+
+- package identity
+- source identity already present in `meshllm.json`
+
+Example:
+
+```json
+{
+  "schema_version": 1,
+  "analyzer_id": "full-v1",
+  "created_at": "2026-04-18T06:12:44Z",
+  "tool": {
+    "name": "llama-moe-analyze",
+    "version": "mesh-llm-fork"
+  },
+  "parameters": {
+    "all_layers": true,
+    "context_size": 32768,
+    "n_gpu_layers": 999
+  },
+  "summary": {
+    "n_expert": 128,
+    "n_expert_used": 8,
+    "min_experts_per_node": 46
+  },
+  "planner": {
+    "recommended_overlap": 1,
+    "notes": [
+      "46 experts per node preserved output quality in local benchmarks"
+    ]
+  },
+  "artifacts": {
+    "ranking": "ranking.csv",
+    "manifest": "manifest.json"
+  }
+}
+```
+
+### `variants/<variant>/ranking.csv`
+
+Canonical ranking artifact.
+
+This remains a separate file.
+
+### `variants/<variant>/run.log`
+
+Latest analyze/share log for the active variant publication.
+
+This is for debugging the current publication only. v1 does not preserve older
+logs after a new publication replaces the active files.
+
+## Why This Layout
+
+- one source repo can naturally publish many variants
+- variant boundaries already namespace the artifacts, so an extra `moe/`
+  subdirectory is not needed
+- `meshllm.json` is the single identity anchor
+- runtime files do not need to duplicate package or source identity
+- package repos remain self-contained and understandable on the Hub
+
+## Legacy Breaks
+
+This spec intentionally breaks with the legacy model in several ways.
+
+### Deprecated: `meshllm/moe-analysis`
+
+`meshllm/moe-analysis` should no longer be the canonical location for:
+
+- rankings
+- analysis output
+- manifests
+- trunks
+- expert shards
+
+Existing content there is legacy.
+
+### Deprecated: bundled `catalog.json` as the MoE registry
+
+The old bundled catalog at `mesh-llm/src/models/catalog.json` was a curated
+download list with mixed transports and friendly labels.
+
+That does not fit the new package-repo design because it:
+
+- is keyed by display names instead of canonical Mesh refs
+- points at direct transport URLs instead of Mesh package repos
+- still contains non-HF blob-style entries
+
+It has been replaced by the Hugging Face-backed `meshllm/catalog` dataset and
+is not the source of
+truth for MoE package resolution.
+
+### Dropped: raw blob URLs
+
+Raw blob URLs are not supported in the new catalog.
+
+All catalog entries must resolve from canonical Mesh refs of the form:
+
+```text
+owner/repo:variant
+```
+
+Entries that only exist as raw transport blobs should be dropped rather than
+ported into the new catalog.
+
+## Runtime Resolution
+
+For:
+
+```bash
+mesh-llm serve unsloth/Qwen3.6-35B-A3B-GGUF:Q4_K_XL
+```
+
+the intended runtime flow is:
+
+1. Resolve `unsloth/Qwen3.6-35B-A3B-GGUF:Q4_K_XL` in `meshllm/catalog`.
+2. Prefer a `canonical` entry when one exists; otherwise allow a `community`
+   entry.
+3. Fetch the selected package repo at `package_revision`.
+4. Read `meshllm.json`.
+5. Find the `Q4_K_XL` variant entry.
+6. Load `variants/Q4_K_XL/manifest.json`.
+7. Resolve the ranking and validate `ranking_sha256`.
+8. Download `trunk.gguf` if missing.
+9. Download only the required expert files for the local assignment.
+10. Materialize a local runnable shard.
+11. Launch `llama-server`.
+12. If there is no catalog package, or package resolution fails, build or
+    reuse the local package cache under `~/.cache/mesh-llm/moe/packages/...`.
+13. Assemble the runnable shard from the cached `trunk.gguf` plus the selected
+    experts for the current topology.
+14. Delete legacy topology-specific split artifacts instead of reusing them.
+
+## Hugging Face Client Behavior
+
+Whenever mesh-llm contacts Hugging Face for this workflow, it should use:
+
+- cache-aware clients and paths
+- visible progress reporting for user-facing operations
+
+This applies to both:
+
+- metadata reads such as catalog lookup, package descriptor fetches, and
+  manifest reads
+- data transfer such as package uploads and artifact downloads
+
+### Cache
+
+All Hugging Face reads should reuse the local Hugging Face cache when possible.
+
+That includes:
+
+- `meshllm/catalog` fetches
+- `meshllm.json` fetches
+- variant `manifest.json` fetches
+- `trunk.gguf` downloads
+- expert artifact downloads
+
+The runtime should not repeatedly re-fetch metadata or artifacts that already
+exist in cache and match the required revision or hash.
+
+### Progress
+
+User-facing Hugging Face operations should show progress instead of silently
+blocking.
+
+That includes:
+
+- upload progress for `mesh-llm moe share`
+- download progress for large artifacts
+- lightweight progress indicators or spinners for metadata fetches when they
+  are part of an interactive CLI flow
+
+The intent is:
+
+- if network work is happening, the user should see that it is happening
+- if large files are moving, the user should see per-file and overall progress
+- if cached data is reused, the CLI should make that visible where helpful
+
+## Share Workflow
+
+The preferred UX remains:
 
 ```bash
 mesh-llm moe share MODEL
-mesh-llm moe share MODEL --with-experts
 ```
 
-Meaning:
-
 - `mesh-llm moe share MODEL`
-  publishes the existing ranking artifacts only:
-  - `ranking.csv`
-  - `metadata.json`
+  publishes the complete variant package:
   - `analysis.json`
-- `mesh-llm moe share MODEL --with-experts`
-  additionally publishes:
-  - `experts/manifest.json`
-  - `experts/trunk.gguf`
-  - `experts/expert-XYZ.gguf`
+  - `ranking.csv`
+  - `manifest.json`
+  - `run.log`
+  - `trunk.gguf`
+  - `experts/expert-*.gguf`
 
-This keeps the current lightweight share path intact and makes the heavier
-expert publishing flow explicit while we validate the design.
+Under the new spec, share should publish to the package repo layout described
+above and then update `meshllm/catalog` to point at that package revision.
 
-## Why `--with-experts`
+If the publisher does not have permission to create or write the canonical
+`meshllm/...` package repo, they should still be able to:
 
-Publishing rankings is lightweight.
+1. publish the package repo in their own namespace
+2. open a PR adding a `community` entry to `meshllm/catalog`
 
-Publishing expert components is much heavier:
+Publishing order:
 
-- many large GGUF files
-- slower upload time
-- more expensive reruns if the component format changes
+1. upload the package repo changes
+2. obtain the resulting package revision
+3. update `meshllm/catalog`
 
-So expert publishing should start as opt-in.
+The catalog must not point at a package revision that does not exist yet.
 
 ## Upload Path
 
-All MoE share uploads should move to the Rust `huggingface_hub_rust` client.
+All MoE share uploads should use the Rust `huggingface_hub_rust` client.
 
-Do not keep two separate upload implementations where:
+Do not keep:
 
-- ranking-only share uses the current hand-rolled NDJSON path
-- `--with-experts` uses a different large-file upload backend
+- one small-artifact NDJSON path
+- another path for large-file expert uploads
 
-Instead, the entire MoE share workflow should use one upload path based on the
-Hub repo commit APIs exposed by `huggingface_hub_rust`.
+The entire MoE share flow should use one Hub upload implementation with:
 
-That gives us:
+- contribution PR creation
+- xet/LFS-backed large-file support
+- shared progress reporting
+- shared retry and resume behavior
+- cache-aware metadata and branch inspection
 
-- one implementation for ranking-only and expert-component uploads
-- one auth path
-- one progress and retry path
-- one PR workflow
-- one codepath to maintain
+## llama.cpp Tooling Decision
 
-The Rust client already supports:
+Keep `llama-moe-split` as the stable runnable-shard tool.
 
-- normal repo commit creation
-- preupload classification for regular files vs. large files
-- xet/LFS-backed upload for large files
-- `create_pr = true` on commit creation
+Do not turn it into the kitchen-sink interface for the new artifact model.
 
-So the intended implementation is:
+Instead:
 
-- `mesh-llm moe share MODEL`
-  uploads `ranking.csv`, `metadata.json`, `analysis.json`, and optional
-  `run.log` through `huggingface_hub_rust`
-- `mesh-llm moe share MODEL --with-experts`
-  uploads those same files plus `experts/manifest.json`, `experts/trunk.gguf`,
-  and `experts/expert-XYZ.gguf` through the same Rust path
+- move shared internals into reusable code in the llama.cpp fork
+- keep `llama-moe-split` as the stable legacy split tool rather than the new
+  runtime fallback path
+- use a sibling tool for component extraction and assembly
 
-User-facing behavior should still preserve the contribution PR workflow.
-
-In other words:
-
-- small artifacts should not continue using the current custom NDJSON request
-- large artifacts should not require shelling out to `hf`
-- all MoE share uploads should go through `huggingface_hub_rust` with PR
-  creation enabled
-
-## Required llama.cpp Support
-
-This design only works if we have a primitive to move between:
-
-- full original GGUF
-- trunk-only artifact
-- per-expert artifact
-- runnable local shard
-
-## llama-moe-split Decision
-
-The decision is:
-
-- keep `llama-moe-split` as the stable runnable-shard tool
-- do not turn it into a kitchen-sink CLI for the new artifact workflow
-- extract shared internals underneath it as needed
-- add a new sibling tool in the llama.cpp fork for expert component work
-
-Why:
-
-- `llama-moe-split` already has a clear meaning: take a full GGUF and emit a
-  runnable shard GGUF
-- mesh-llm already depends on that behavior today
-- the new expert-components path is a different abstraction: extract trunk,
-  extract per-expert components, and assemble a shard later
-- keeping the current split path stable gives us a low-risk fallback while the
-  new path is being proven out
-
-Recommended implementation structure:
-
-- move shared tensor-selection and GGUF-writing logic into reusable internal
-  code in the llama.cpp fork
-- keep `llama-moe-split` as the compatibility and fallback path
-- add a sibling tool for the expert-components workflow
-
-That new sibling tool should support:
+Required component operations:
 
 - extract trunk
-- extract a single expert
+- extract one expert
 - assemble `trunk + selected experts -> runnable shard.gguf`
 
-The exact tool name is still open, but it should be a separate tool or cleanly
-separated subcommand surface, not a semantic rewrite of `llama-moe-split`.
+Without that assembly step, `serve` cannot consume the new package format.
 
-Without that assembly step, `serve` cannot consume the published expert
-components because `llama-server` still expects a runnable shard GGUF.
+## Implementation Plan
 
-## Fastest Path To Try It
+### Phase 1: Define and freeze the new spec
 
-The smallest path that gives us a real end-to-end experiment is:
+1. Finalize this package layout and file schema.
+2. Treat `meshllm/moe-analysis` as legacy.
+3. Treat raw blob URL catalog entries as legacy.
+4. Decide the exact schema for `meshllm/catalog`.
 
-1. Add `--with-experts` to `mesh-llm moe share`.
-2. Define the dataset layout and manifest schema.
-3. Implement trunk/expert extraction and local assembly in the llama.cpp fork.
-4. Add a hidden or developer-focused round-trip command that materializes a
-   shard from published components.
-5. Validate that the materialized shard loads in `llama-server`.
-6. Run a smoke test on at least one small MoE model.
-7. Only then teach `mesh-llm serve` to prefer published expert components.
+Deliverables:
 
-## Suggested Phases
+- published spec
+- agreed schema examples
+- explicit legacy boundary
 
-### Phase 1: Local artifact proof
+### Phase 2: Introduce the new package format in mesh-llm
 
-Implement `mesh-llm moe share MODEL --with-experts`, but initially focus on
-generating the component layout locally.
+1. Add data structures for:
+   - `meshllm/catalog` entries
+   - `meshllm.json`
+   - variant `manifest.json`
+   - variant `analysis.json`
+2. Teach share to stage files into:
+   - `meshllm.json`
+   - `variants/<variant>/analysis.json`
+   - `variants/<variant>/ranking.csv`
+   - `variants/<variant>/manifest.json`
+   - `variants/<variant>/run.log`
+   - `variants/<variant>/trunk.gguf`
+   - `variants/<variant>/experts/expert-*.gguf`
+3. Remove assumptions that expert artifacts live under the old dataset prefix.
 
-Goal:
+Deliverables:
 
-- prove the format
-- prove the extractor
-- prove the assembler
+- local staging of the new layout
+- serialization for the new schema
+- local cache layout that mirrors the published package layout
 
-Do not change `serve` yet.
+### Phase 3: Publish into per-source package repos
 
-### Phase 2: Round-trip command
+1. Change `moe share` so it publishes into the per-source Mesh repo instead of
+   the old analysis dataset.
+2. Reuse the Rust Hub upload path for the complete package upload flow.
+3. Preserve contribution PR creation.
+4. Support publishing into either:
+   - the canonical `meshllm/...` namespace
+   - a publisher-owned namespace for community packages
+5. After package upload succeeds, update `meshllm/catalog` to point to the
+   new package revision with the correct `publisher` and `trust`.
+6. Ensure all Hugging Face metadata reads and uploads use cache-aware clients
+   and visible progress reporting.
 
-Add a hidden or dev command such as:
+Deliverables:
 
-```bash
-mesh-llm moe materialize MODEL --from-experts --nodes 2 --shard-index 0
-```
+- package repo publication
+- catalog publication
+- no dependency on `meshllm/moe-analysis` for new uploads
 
-That command should:
+### Phase 4: Teach `serve` the new resolver
 
-- read the published ranking
-- compute the node assignment
-- fetch or reuse `trunk + needed experts`
-- assemble a local runnable shard
-- validate that it loads successfully
+1. Resolve canonical Mesh refs through `meshllm/catalog`.
+2. Prefer `canonical` entries over `community` entries.
+3. Fetch `meshllm.json` from the package repo revision.
+4. Resolve the requested variant.
+5. Load the variant `manifest.json`.
+6. Download `trunk.gguf` plus only the needed experts.
+7. Assemble a local shard and launch it.
+8. If there is no catalog package, or package resolution fails, prefer a
+   local package-shaped component cache:
+   - write `meshllm.json` plus `variants/<variant>/...` into
+     `~/.cache/mesh-llm/moe/packages/<source-owner>/<source-repo>/<source-revision>/`
+   - reuse locally extracted `trunk.gguf`
+   - reuse locally extracted `experts/expert-*.gguf`
+   - assemble the required shard for the current topology from those local
+     components
+9. Delete any legacy topology-specific GGUF split cache entries instead of
+   reusing them.
+10. Ensure `moe share` can upload directly from the local package cache when it
+    already matches the current ranking and manifest.
+11. Ensure Hugging Face metadata and artifact fetches use cache-first behavior
+    and visible progress in interactive CLI flows.
 
-Goal:
+Deliverables:
 
-- test the full artifact loop without adding runtime risk to `serve`
+- runtime resolution from `meshllm/catalog`
+- package-shaped local cache reuse when topology changes
+- topology-independent expert reuse
+- no new topology-specific split cache
 
-### Phase 3: Runtime integration
+### Phase 5: Legacy cleanup
 
-After the round-trip path is stable, update `mesh-llm serve`:
+1. Stop treating `meshllm/moe-analysis` as a publication target.
+2. Stop relying on direct artifact URLs for MoE package resolution.
+3. Remove or quarantine legacy catalog entries that cannot be represented as
+   canonical `owner/repo:variant` Mesh refs.
+4. Keep only the new Hugging Face-backed `meshllm/catalog` path at runtime.
+5. Store catalog data as one file per source repo under
+   `entries/<owner>/<repo>.json`, with:
+   - curated variant metadata
+   - zero or more package pointers per variant
+6. Use local fixture entries under `mesh-llm/tests/fixtures/catalog/` for tests
+   instead of any bundled runtime snapshot.
 
-1. resolve ranking as today
-2. look for matching `experts/manifest.json`
-3. fetch trunk and only the required experts
-4. materialize the shard in local cache
-5. launch from that shard
-6. fall back to the existing local split flow on any miss or validation failure
+Deliverables:
 
-Goal:
-
-- reuse published expert components when available
-- preserve today's known-good behavior as fallback
-
-## Non-Goals For The First Iteration
-
-- publishing a separate full split set for every node count
-- making `--with-experts` the default immediately
-- removing the local `llama-moe-split` fallback
-- introducing a per-tensor artifact format that is too granular to manage
+- one canonical MoE publication path
+- one canonical MoE resolver path
+- one canonical per-source catalog entry format
 
 ## Open Questions
 
-- Should `trunk.gguf` include all router and shared-expert tensors, or should
-  some of those be split into separate component classes?
-- Should each expert be one file, or should we bundle experts into coarse blocks
-  while still allowing selective download?
-- What is the cleanest local cache layout for materialized shards and downloaded
-  components?
-- Should runtime eagerly prefetch likely future experts after a mesh expansion,
-  or stay strictly demand-driven at first?
+- Should `manifest.json` include any additional assembler-level compatibility
+  fields beyond `ranking_sha256`, expert counts, and hashes?
+- Should `run.log` always be uploaded, or should share allow a lighter-weight
+  publication mode later?
+- Do we want a separate discovery view later, or is the per-source catalog
+  entry format enough on its own?
 
 ## Current Recommendation
 
-Build this as an extension to `mesh-llm moe share` behind `--with-experts`,
-store the artifacts in the existing dataset under `.../full-v1/experts/`,
-migrate the entire MoE share upload path to `huggingface_hub_rust` with PR
-creation, prove the round-trip locally first, and only then integrate it into
-`serve`.
+Build the new system around:
+
+- `meshllm/catalog` as the resolver index
+- `entries/<owner>/<repo>.json` as the canonical catalog storage shape
+- one Mesh-owned per-source package repo
+- `meshllm.json` as the repo descriptor
+- `variants/<variant>/...` as the active artifact layout
+- `analysis.json`, `ranking.csv`, `manifest.json`, `run.log`, `trunk.gguf`,
+  and `experts/` as the variant files
+
+and treat the old `meshllm/moe-analysis` plus raw URL catalog model as legacy.

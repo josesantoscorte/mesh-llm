@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "source_repo": "unsloth/Qwen3.5-0.8B-GGUF",
+  "variants": {
+    "Qwen3.5-0.8B-Q4_K_M": {
+      "source": {
+        "repo": "unsloth/Qwen3.5-0.8B-GGUF",
+        "revision": "main",
+        "file": "Qwen3.5-0.8B-Q4_K_M.gguf"
+      },
+      "curated": {
+        "name": "Qwen3.5-0.8B-Vision-Q4_K_M",
+        "size": "508MB",
+        "description": "Tiny vision model, OCR, screenshots, runs anywhere",
+        "draft": null,
+        "moe": null,
+        "extra_files": [],
+        "mmproj": {
+          "file": "mmproj-BF16.gguf",
+          "repo": "unsloth/Qwen3.5-0.8B-GGUF",
+          "revision": "main"
+        }
+      },
+      "packages": []
+    }
+  }
+}

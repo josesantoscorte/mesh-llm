@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "source_repo": "bartowski/Qwen2.5-Coder-14B-Instruct-GGUF",
+  "variants": {
+    "Qwen2.5-Coder-14B-Instruct-Q4_K_M": {
+      "source": {
+        "repo": "bartowski/Qwen2.5-Coder-14B-Instruct-GGUF",
+        "revision": "main",
+        "file": "Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf"
+      },
+      "curated": {
+        "name": "Qwen2.5-Coder-14B-Instruct-Q4_K_M",
+        "size": "9.0GB",
+        "description": "Strong code gen, fills gap between 7B and 32B",
+        "draft": "Qwen2.5-0.5B-Instruct-Q4_K_M",
+        "moe": null,
+        "extra_files": [],
+        "mmproj": null
+      },
+      "packages": []
+    }
+  }
+}
