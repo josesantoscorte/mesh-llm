@@ -45,7 +45,7 @@ const SHARE_UPLOAD_BATCH_MAX_BYTES: u64 = 1_500_000_000;
 const SHARE_UPLOAD_STALL_TIMEOUT: Duration = Duration::from_secs(180);
 const SHARE_UPLOAD_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const SHARE_UPLOAD_MAX_RETRIES: usize = 3;
-const SHARE_REPO_READY_TIMEOUT: Duration = Duration::from_secs(30);
+const SHARE_REPO_READY_TIMEOUT: Duration = Duration::from_secs(120);
 const SHARE_REPO_READY_POLL_INTERVAL: Duration = Duration::from_millis(750);
 const FULL_ANALYZE_CONTEXT_SIZE: u32 = 4096;
 const FULL_ANALYZE_GPU_LAYERS: u32 = 0;
@@ -488,19 +488,17 @@ pub(crate) async fn dispatch_moe_command(command: &MoeCommand, cli: &Cli) -> Res
     match command {
         MoeCommand::Plan {
             model,
-            ranking_file,
             json,
             max_vram,
             nodes,
-            dataset_repo,
+            catalog_repo,
         } => {
             run_plan(
                 model,
-                ranking_file.as_deref(),
                 *json,
                 max_vram.or(cli.max_vram),
                 *nodes,
-                dataset_repo,
+                catalog_repo,
             )
             .await
         }
@@ -538,27 +536,21 @@ pub(crate) async fn dispatch_moe_command(command: &MoeCommand, cli: &Cli) -> Res
 
 async fn run_plan(
     model: &str,
-    ranking_file: Option<&Path>,
     json_output: bool,
     max_vram: Option<f64>,
     nodes: Option<usize>,
-    dataset_repo: &str,
+    catalog_repo: &str,
 ) -> Result<()> {
     if !json_output {
         eprintln!("📍 Resolving MoE model: {model}");
-        if let Some(path) = ranking_file {
-            eprintln!("📦 Using explicit ranking override: {}", path.display());
-        } else {
-            eprintln!("📦 Checking local MoE ranking cache...");
-            eprintln!("☁️ Checking {dataset_repo} for published rankings...");
-        }
+        eprintln!("📦 Checking local MoE package cache...");
+        eprintln!("☁️ Checking {catalog_repo} for published MoE packages...");
     }
     let report = moe_planner::plan_moe(MoePlanArgs {
         model: model.to_string(),
-        ranking_file: ranking_file.map(Path::to_path_buf),
         max_vram_gb: max_vram,
         nodes,
-        dataset_repo: dataset_repo.to_string(),
+        catalog_repo: catalog_repo.to_string(),
         progress: !json_output,
     })
     .await?;
@@ -794,12 +786,9 @@ struct FullAnalyzeArtifacts {
 }
 
 fn full_analyze_artifacts(model: &moe_planner::MoeModelContext) -> FullAnalyzeArtifacts {
-    let ranking_path = moe::ranking_cache_path(&model.path);
-    let analysis_path = ranking_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("analysis.json");
-    let log_path = log_path_for(&model.path, "full-v1");
+    let ranking_path = moe::package_cache_ranking_path(&model.path);
+    let analysis_path = moe::package_cache_analysis_path(&model.path);
+    let log_path = moe::package_cache_run_log_path(&model.path);
     FullAnalyzeArtifacts {
         ranking: moe_planner::ResolvedRanking {
             path: ranking_path.clone(),
@@ -975,8 +964,9 @@ async fn run_publish(
             resolved.display_name
         )
     })?;
-    let log_path = log_path_for(&resolved.path, &ranking.analyzer_id);
+    let log_path = moe::package_cache_run_log_path(&resolved.path);
     let bundle = sync_local_package_cache(&resolved, &ranking, Some(log_path.as_path()))?;
+    let package_ranking_path = moe::package_cache_ranking_path(&resolved.path);
     models::hf_token_override().ok_or_else(|| {
         share_error(
             "Missing Hugging Face token",
@@ -1033,7 +1023,7 @@ async fn run_publish(
 
     println!("📤 MoE package publish");
     println!("📦 {}", resolved.display_name);
-    println!("   ranking: {}", ranking.path.display());
+    println!("   ranking: {}", package_ranking_path.display());
     println!("   source: {}", ranking.source.label());
     println!("📚 Catalog");
     println!("   repo: {catalog_repo}");
@@ -1185,6 +1175,64 @@ async fn run_publish(
         .filter(|file| completed_paths.contains(&file.repo_path))
         .map(|file| file.size_bytes)
         .sum::<u64>();
+
+    if use_direct_main {
+        let bootstrap_files = staged_files
+            .iter()
+            .filter(|file| matches!(file.repo_path.as_str(), "README.md" | "meshllm.json"))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !bootstrap_files.is_empty() {
+            let bootstrap_batch = ShareUploadBatch {
+                total_bytes: bootstrap_files.iter().map(|file| file.size_bytes).sum(),
+                files: bootstrap_files,
+            };
+            let progress = Arc::new(ShareUploadProgress::new(
+                staged_files.len(),
+                staged_files.iter().map(|file| file.size_bytes).sum(),
+            ));
+            progress.begin_batch(
+                1,
+                1,
+                completed_paths.len(),
+                completed_bytes,
+                &bootstrap_batch,
+            );
+            let bootstrap_commit = upload_share_batch_with_retry(
+                &package_repo,
+                None,
+                None,
+                &bootstrap_batch,
+                &progress,
+                format!("Initialize {}", publish_target.package_repo),
+                format!(
+                    "Initialize `{}` with the first Mesh-LLM package metadata.",
+                    publish_target.package_repo
+                ),
+                false,
+            )
+            .await
+            .map_err(|err| {
+                share_error(
+                    "Failed to initialize empty package repository",
+                    &format!(
+                        "Create the first commit in {}: {}",
+                        publish_target.package_repo, err
+                    ),
+                )
+            })?;
+            for file in &bootstrap_batch.files {
+                completed_paths.insert(file.repo_path.clone());
+            }
+            completed_bytes += bootstrap_batch.total_bytes;
+            if let Some(commit_oid) = bootstrap_commit.commit_oid {
+                branch_head = commit_oid;
+            }
+            println!("✅ Initialized empty package repo");
+            println!("   branch: main");
+        }
+    }
+
     let pending_files = staged_files
         .iter()
         .filter(|file| !completed_paths.contains(&file.repo_path))
@@ -1203,10 +1251,17 @@ async fn run_publish(
         staged_files.iter().map(|file| file.size_bytes).sum(),
     ));
     let mut final_commit: Option<CommitInfo> = None;
-    println!(
-        "⬆️ Opening contribution PR in {} upload batch(es)...",
-        batches.len()
-    );
+    if use_direct_main {
+        println!(
+            "⬆️ Uploading new package in {} remaining batch(es)...",
+            batches.len()
+        );
+    } else {
+        println!(
+            "⬆️ Opening contribution PR in {} upload batch(es)...",
+            batches.len()
+        );
+    }
     for (index, batch) in batches.iter().enumerate() {
         progress.begin_batch(
             index + 1,
@@ -1217,7 +1272,11 @@ async fn run_publish(
         );
         let batch_commit = upload_share_batch_with_retry(
             &package_repo,
-            &upload_branch,
+            if use_direct_main && index == 0 {
+                None
+            } else {
+                Some(upload_branch.as_str())
+            },
             if use_direct_main && index == 0 {
                 None
             } else {
@@ -1243,7 +1302,16 @@ async fn run_publish(
             completed_paths.insert(file.repo_path.clone());
         }
         completed_bytes += batch.total_bytes;
-        if let Some(commit_oid) = batch_commit.commit_oid.clone() {
+        if !use_direct_main {
+            if let Some(head_commit) = dataset_branch_head(&package_repo, &upload_branch)
+                .await
+                .with_context(|| format!("Refresh branch head for {}", upload_branch))?
+            {
+                branch_head = head_commit;
+            } else if let Some(commit_oid) = batch_commit.commit_oid.clone() {
+                branch_head = commit_oid;
+            }
+        } else if let Some(commit_oid) = batch_commit.commit_oid.clone() {
             branch_head = commit_oid;
         }
         final_commit = Some(match (final_commit.take(), batch_commit.pr_url.clone()) {
@@ -1412,7 +1480,7 @@ async fn load_share_branch_state(
 
 async fn upload_share_batch_with_retry(
     dataset: &hf_hub::HFRepository,
-    branch: &str,
+    branch: Option<&str>,
     parent_commit: Option<String>,
     batch: &ShareUploadBatch,
     progress: &Arc<ShareUploadProgress>,
@@ -1434,20 +1502,35 @@ async fn upload_share_batch_with_retry(
         })
         .collect::<Vec<_>>();
     let mut last_error = None;
+    let mut current_parent_commit = parent_commit;
 
     for attempt in 1..=SHARE_UPLOAD_MAX_RETRIES {
         let progress_handler: Progress = Some(progress.clone());
-        let builder = RepoCreateCommitParams::builder()
-            .operations(operations.clone())
-            .commit_message(commit_message.clone())
-            .commit_description(commit_description.clone())
-            .revision(branch.to_string())
-            .create_pr(create_pr)
-            .progress(progress_handler);
-        let params = if let Some(parent_commit) = parent_commit.clone() {
-            builder.parent_commit(parent_commit).build()
+        let params = if let Some(branch) = branch {
+            let builder = RepoCreateCommitParams::builder()
+                .operations(operations.clone())
+                .commit_message(commit_message.clone())
+                .commit_description(commit_description.clone())
+                .revision(branch.to_string())
+                .create_pr(create_pr)
+                .progress(progress_handler);
+            if let Some(parent_commit) = current_parent_commit.clone() {
+                builder.parent_commit(parent_commit).build()
+            } else {
+                builder.build()
+            }
         } else {
-            builder.build()
+            let builder = RepoCreateCommitParams::builder()
+                .operations(operations.clone())
+                .commit_message(commit_message.clone())
+                .commit_description(commit_description.clone())
+                .create_pr(create_pr)
+                .progress(progress_handler);
+            if let Some(parent_commit) = current_parent_commit.clone() {
+                builder.parent_commit(parent_commit).build()
+            } else {
+                builder.build()
+            }
         };
         match create_commit_with_stall_monitor(dataset, &params, progress).await {
             Ok(commit) => return Ok(commit),
@@ -1456,26 +1539,34 @@ async fn upload_share_batch_with_retry(
                     .downcast_ref::<HFError>()
                     .is_some_and(|hf| matches!(hf, HFError::RepoNotFound { .. }));
                 last_error = Some(err);
-                match load_share_branch_state(dataset, branch, &batch.files).await {
-                    Ok(Some(state)) => {
-                        if state.uploaded_paths == batch_paths {
-                            return Ok(CommitInfo {
-                                commit_url: None,
-                                commit_message: Some(commit_message.clone()),
-                                commit_description: Some(commit_description.clone()),
-                                commit_oid: Some(state.head_commit),
-                                pr_url: None,
-                                pr_num: None,
-                            });
+                if let Some(branch) = branch {
+                    match load_share_branch_state(dataset, branch, &batch.files).await {
+                        Ok(Some(state)) => {
+                            current_parent_commit = Some(state.head_commit.clone());
+                            if state.uploaded_paths == batch_paths {
+                                return Ok(CommitInfo {
+                                    commit_url: None,
+                                    commit_message: Some(commit_message.clone()),
+                                    commit_description: Some(commit_description.clone()),
+                                    commit_oid: Some(state.head_commit),
+                                    pr_url: None,
+                                    pr_num: None,
+                                });
+                            }
                         }
+                        Ok(None) => {}
+                        Err(state_err)
+                            if repo_not_ready
+                                && state_err.downcast_ref::<HFError>().is_some_and(|hf| {
+                                    matches!(hf, HFError::RepoNotFound { .. })
+                                }) => {}
+                        Err(state_err) => return Err(state_err),
                     }
-                    Ok(None) => {}
-                    Err(state_err)
-                        if repo_not_ready
-                            && state_err
-                                .downcast_ref::<HFError>()
-                                .is_some_and(|hf| matches!(hf, HFError::RepoNotFound { .. })) => {}
-                    Err(state_err) => return Err(state_err),
+                }
+                if let Some(branch) = branch {
+                    if let Ok(Some(head_commit)) = dataset_branch_head(dataset, branch).await {
+                        current_parent_commit = Some(head_commit);
+                    }
                 }
                 if repo_not_ready {
                     tokio::time::sleep(SHARE_REPO_READY_POLL_INTERVAL).await;
@@ -1483,7 +1574,7 @@ async fn upload_share_batch_with_retry(
                 if attempt < SHARE_UPLOAD_MAX_RETRIES {
                     eprintln!(
                         "↻ Retrying upload batch to {} (attempt {}/{})",
-                        branch,
+                        branch.unwrap_or("default branch"),
                         attempt + 1,
                         SHARE_UPLOAD_MAX_RETRIES
                     );
@@ -1867,7 +1958,7 @@ async fn ensure_repo_ready(
     ensure_repo_exists(api, repo_id, repo_type).await?;
     let started = std::time::Instant::now();
     loop {
-        match repo_exists(api, repo_id, repo_type).await {
+        match repo_visible_on_hub(repo_id, repo_type).await {
             Ok(true) => return Ok(()),
             Ok(false) => {
                 if started.elapsed() >= SHARE_REPO_READY_TIMEOUT {
@@ -1881,6 +1972,54 @@ async fn ensure_repo_ready(
             Err(err) => return Err(err),
         }
         tokio::time::sleep(SHARE_REPO_READY_POLL_INTERVAL).await;
+    }
+}
+
+async fn repo_visible_on_hub(repo_id: &str, repo_type: RepoType) -> Result<bool> {
+    let endpoint = std::env::var("HF_ENDPOINT")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "https://huggingface.co".to_string());
+    let base = endpoint.trim_end_matches('/');
+    let repo_url = match repo_type {
+        RepoType::Model => format!("{base}/api/models/{repo_id}"),
+        RepoType::Dataset => format!("{base}/api/datasets/{repo_id}"),
+        RepoType::Space => format!("{base}/api/spaces/{repo_id}"),
+        RepoType::Kernel => {
+            return Err(anyhow::anyhow!(
+                "Kernel repositories are not supported for MoE package publication"
+            ));
+        }
+    };
+
+    let client = reqwest::Client::new();
+    let mut request = client.get(&repo_url);
+    if let Some(token) = models::hf_token_override() {
+        request = request.bearer_auth(token);
+    }
+    let response = request
+        .send()
+        .await
+        .with_context(|| format!("Check Hub visibility for {repo_id}"))?;
+
+    let status = response.status();
+    match status.as_u16() {
+        200 => Ok(true),
+        401 | 403 => Err(anyhow::anyhow!(
+            "Not authorized to inspect {} on the Hub ({})",
+            repo_id,
+            status
+        )),
+        404 => Ok(false),
+        _ => {
+            let detail = response.text().await.unwrap_or_default();
+            Err(anyhow::anyhow!(
+                "Unexpected Hub response while checking {} visibility: {} {}",
+                repo_id,
+                status,
+                detail
+            ))
+        }
     }
 }
 
@@ -1942,25 +2081,65 @@ fn build_package_readme(meshllm: &moe_planner::MeshllmPackageJson, package_repo:
     let _ = writeln!(&mut out);
     let _ = writeln!(
         &mut out,
-        "Derived Mesh-LLM MoE package for `{}`.",
+        "This repository stores Mesh-LLM topology-independent MoE package artifacts derived from `{}`.",
         meshllm.source.repo
     );
-    let _ = writeln!(&mut out, "Published in `{}`.", package_repo);
+    let _ = writeln!(
+        &mut out,
+        "It is published as `{}` and is meant to be consumed by `mesh-llm serve`.",
+        package_repo
+    );
     let _ = writeln!(&mut out);
     let _ = writeln!(&mut out, "## Source");
     let _ = writeln!(&mut out);
     let _ = writeln!(&mut out, "- repo: `{}`", meshllm.source.repo);
     let _ = writeln!(&mut out, "- revision: `{}`", meshllm.source.revision);
     let _ = writeln!(&mut out);
-    let _ = writeln!(&mut out, "## Variants");
+    let _ = writeln!(&mut out, "## What This Repository Contains");
+    let _ = writeln!(&mut out);
+    let _ = writeln!(
+        &mut out,
+        "- `meshllm.json` describes the upstream source repo and all published variants in this package repository."
+    );
+    let _ = writeln!(
+        &mut out,
+        "- `variants/<variant>/manifest.json` is the runtime entrypoint used to materialize MoE shards."
+    );
+    let _ = writeln!(
+        &mut out,
+        "- `variants/<variant>/ranking.csv` and `variants/<variant>/analysis.json` contain the analyzer output for that variant."
+    );
+    let _ = writeln!(
+        &mut out,
+        "- `variants/<variant>/trunk.gguf` plus `variants/<variant>/experts/` hold the topology-independent component artifacts."
+    );
+    let _ = writeln!(&mut out);
+    let _ = writeln!(&mut out, "## Available Variants");
     let _ = writeln!(&mut out);
     for (variant, entry) in &meshllm.variants {
-        let _ = writeln!(
-            &mut out,
-            "- `{}`: `{}` (`{}`)",
-            variant, entry.manifest, entry.distribution_id
-        );
+        let model_ref = format!("{}:{}", meshllm.source.repo, variant);
+        let _ = writeln!(&mut out, "### `{}`", variant);
+        let _ = writeln!(&mut out);
+        let _ = writeln!(&mut out, "- Mesh model ref: `{}`", model_ref);
+        let _ = writeln!(&mut out, "- Distribution id: `{}`", entry.distribution_id);
+        let _ = writeln!(&mut out, "- Manifest: `{}`", entry.manifest);
+        let _ = writeln!(&mut out, "- Serve with:");
+        let _ = writeln!(&mut out);
+        let _ = writeln!(&mut out, "```bash");
+        let _ = writeln!(&mut out, "mesh-llm serve '{}'", model_ref);
+        let _ = writeln!(&mut out, "```");
+        let _ = writeln!(&mut out);
     }
+    let _ = writeln!(&mut out, "## Notes");
+    let _ = writeln!(&mut out);
+    let _ = writeln!(
+        &mut out,
+        "- This is a derived Mesh-LLM package repository, not the original upstream model repository."
+    );
+    let _ = writeln!(
+        &mut out,
+        "- `mesh-llm` will prefer published package artifacts from this repository when a matching catalog entry exists."
+    );
     out
 }
 

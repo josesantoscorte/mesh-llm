@@ -24,9 +24,7 @@ pub(crate) fn print_json(value: Value) -> Result<()> {
 
 pub(crate) fn ranking_source_label(source: &RankingSource) -> &'static str {
     match source {
-        RankingSource::Override => "override",
         RankingSource::LocalCache => "local_cache",
-        RankingSource::HuggingFaceDataset => "huggingface_dataset",
         RankingSource::HuggingFacePackage => "huggingface_package",
     }
 }

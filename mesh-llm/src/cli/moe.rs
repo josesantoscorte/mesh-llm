@@ -1,5 +1,4 @@
 use clap::{Args, Subcommand, ValueEnum};
-use std::path::PathBuf;
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum MoeCommand {
@@ -7,9 +6,6 @@ pub(crate) enum MoeCommand {
     Plan {
         /// Model spec: local path, catalog name, HF exact ref, HF repo selector like `org/repo:BF16@main`, or HF URL.
         model: String,
-        /// Override the ranking CSV path instead of resolving from cache or Hugging Face.
-        #[arg(long)]
-        ranking_file: Option<PathBuf>,
         /// Emit JSON output.
         #[arg(long)]
         json: bool,
@@ -19,9 +15,9 @@ pub(crate) enum MoeCommand {
         /// Optional node count override. When omitted, mesh-llm recommends a minimum node count.
         #[arg(long)]
         nodes: Option<usize>,
-        /// Legacy published rankings dataset repo used only for direct ranking lookup during planning.
-        #[arg(long, default_value = "meshllm/moe-rankings")]
-        dataset_repo: String,
+        /// Mesh catalog dataset repo used for published package resolution during planning.
+        #[arg(long, default_value = "meshllm/catalog")]
+        catalog_repo: String,
     },
     /// Run local MoE analysis and cache the result.
     Analyze {

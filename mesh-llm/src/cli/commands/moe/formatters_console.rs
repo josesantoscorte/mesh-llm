@@ -5,9 +5,7 @@ use anyhow::Result;
 impl MoePlanFormatter for ConsoleFormatter {
     fn render(&self, report: &MoePlanReport) -> Result<()> {
         let ranking_hint = match report.ranking.source {
-            RankingSource::Override => "explicit override",
             RankingSource::LocalCache => "local cache",
-            RankingSource::HuggingFaceDataset => "Hugging Face dataset",
             RankingSource::HuggingFacePackage => "Hugging Face package",
         };
         println!("🧠 MoE plan");

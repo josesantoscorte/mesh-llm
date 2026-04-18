@@ -10,12 +10,12 @@ It is a planning document for the Rust CLI and runtime behavior. It builds on:
 ## Goals
 
 - Make MoE analysis and planning available from the main `mesh-llm` CLI.
-- Reuse published rankings from `meshllm/moe-rankings` when available.
+- Reuse published MoE package rankings from `meshllm/catalog` when available.
 - Prefer local cached rankings when they are strong enough.
 - Use Hugging Face when it has a stronger published artifact.
 - Keep local cache on ties; published data only wins when it is stronger.
 - Make planner and analyze output obvious, inspectable, and operationally friendly.
-- Allow users to contribute locally generated rankings back to `meshllm/moe-rankings`.
+- Allow users to publish locally generated MoE packages back through `meshllm/catalog`.
 
 ## Command Family
 
@@ -44,15 +44,15 @@ Purpose:
 Planner ranking resolution should follow this precedence:
 
 1. local `~/.cache/mesh-llm/...`
-2. Hugging Face dataset `meshllm/moe-rankings`
+2. Hugging Face dataset `meshllm/catalog`
 
 However, local cache should only win when it is current enough.
 
 Final resolution rule:
 
 1. Inspect local cached rankings.
-2. Inspect `meshllm/moe-rankings`.
-3. If Hugging Face has a stronger artifact than local cache, use the Hugging Face artifact via the Hugging Face cache/download path. Do not copy it into `~/.cache/mesh-llm/...`. If local and published artifacts have equal analyzer strength, keep the local cache.
+2. Inspect `meshllm/catalog`.
+3. If Hugging Face has a stronger published package artifact than local cache, use the Hugging Face artifact via the Hugging Face cache/download path. If local and published artifacts have equal analyzer strength, keep the local cache.
 4. Otherwise use local cache.
 
 This means planner behavior is:
@@ -276,7 +276,7 @@ Example:
 ```text
 🧠 Generated local MoE ranking for this model
 📍 Cached at: ~/.cache/mesh-llm/...
-☁️ No published ranking was found in meshllm/moe-rankings
+☁️ No published MoE package was found in meshllm/catalog
 📤 Consider contributing it with:
    mesh-llm moe publish <model>
 ```

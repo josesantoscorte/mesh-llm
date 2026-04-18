@@ -16,7 +16,6 @@ use crate::models::{
 };
 
 const DEFAULT_DATASET_REVISION: &str = "main";
-pub(crate) const DEFAULT_MOE_RANKINGS_DATASET: &str = "meshllm/moe-rankings";
 pub(crate) const DEFAULT_MOE_CATALOG_DATASET: &str = "meshllm/catalog";
 const ANALYSIS_JSON_FILENAME: &str = "analysis.json";
 const DEFAULT_MASS_CHECKPOINTS: [usize; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
@@ -26,10 +25,9 @@ const MODEL_LOAD_HEADROOM_DENOMINATOR: u64 = 10;
 #[derive(Clone, Debug)]
 pub(crate) struct MoePlanArgs {
     pub model: String,
-    pub ranking_file: Option<PathBuf>,
     pub max_vram_gb: Option<f64>,
     pub nodes: Option<usize>,
-    pub dataset_repo: String,
+    pub catalog_repo: String,
     pub progress: bool,
 }
 
@@ -189,18 +187,14 @@ impl MoeStartupFitEstimate {
 
 #[derive(Clone, Debug)]
 pub(crate) enum RankingSource {
-    Override,
     LocalCache,
-    HuggingFaceDataset,
     HuggingFacePackage,
 }
 
 impl RankingSource {
     pub(crate) fn label(&self) -> &'static str {
         match self {
-            Self::Override => "override",
             Self::LocalCache => "local cache",
-            Self::HuggingFaceDataset => "Hugging Face dataset",
             Self::HuggingFacePackage => "Hugging Face package",
         }
     }
@@ -477,33 +471,9 @@ pub(crate) fn normalize_distribution_id(name: &str) -> String {
 }
 
 #[cfg(test)]
-pub(crate) fn local_submit_ranking(
-    model: &MoeModelContext,
-    ranking_file: Option<&Path>,
-) -> Result<ResolvedRanking> {
-    if let Some(path) = ranking_file {
-        if !path.exists() {
-            bail!("Ranking file not found: {}", path.display());
-        }
-        let inferred = infer_analyzer_from_ranking_path(path).ok_or_else(|| {
-            anyhow::anyhow!(
-                "Could not infer analyzer id from {}. Use a ranking CSV produced by `mesh-llm moe analyze` or a path containing `micro-v1` or `full-v1`.",
-                path.display()
-            )
-        })?;
-        let metadata_path = sibling_metadata_path(path);
-        let analysis_path = sibling_analysis_path(path);
-        return Ok(ResolvedRanking {
-            path: path.to_path_buf(),
-            metadata_path,
-            analysis_path,
-            analyzer_id: inferred.to_string(),
-            source: RankingSource::Override,
-            reason: "explicit --ranking-file override".to_string(),
-        });
-    }
-
-    let Some(artifact) = moe::best_shared_ranking_artifact(&model.path) else {
+pub(crate) fn local_submit_ranking(model: &MoeModelContext) -> Result<ResolvedRanking> {
+    let path = moe::package_cache_ranking_path(&model.path);
+    if !path.exists() {
         bail!(
                 "No local ranking artifact found for {}. Run `mesh-llm moe analyze full {}` or `mesh-llm moe analyze micro {}` first.",
                 model.display_name,
@@ -511,18 +481,14 @@ pub(crate) fn local_submit_ranking(
                 model.input
             );
     };
-    let path = moe::shared_ranking_cache_path(&model.path, &artifact);
-    let analyzer_id = match artifact.kind {
-        moe::SharedRankingKind::Analyze => "full-v1",
-        moe::SharedRankingKind::MicroAnalyze => "micro-v1",
-    };
     Ok(ResolvedRanking {
         analysis_path: sibling_analysis_path(&path),
         path,
         metadata_path: None,
-        analyzer_id: analyzer_id.to_string(),
+        analyzer_id: analyzer_id_from_analysis(&moe::package_cache_analysis_path(&model.path))
+            .unwrap_or_else(|_| "full-v1".to_string()),
         source: RankingSource::LocalCache,
-        reason: "best local cached ranking artifact".to_string(),
+        reason: "local materialized package ranking".to_string(),
     })
 }
 
@@ -547,6 +513,7 @@ pub(crate) fn validate_ranking(model: &MoeModelContext, ranking: &ResolvedRankin
     Ok(())
 }
 
+#[cfg(test)]
 fn infer_analyzer_from_ranking_path(path: &Path) -> Option<&'static str> {
     let text = path.to_string_lossy().to_ascii_lowercase();
     if text.contains("/full-v1/") || text.contains("\\full-v1\\") {
@@ -584,12 +551,7 @@ fn ranking_kind_for_analyzer(analyzer_id: &str) -> moe::SharedRankingKind {
     }
 }
 
-fn sibling_metadata_path(path: &Path) -> Option<PathBuf> {
-    let parent = path.parent()?;
-    let metadata = parent.join("metadata.json");
-    metadata.exists().then_some(metadata)
-}
-
+#[cfg(test)]
 fn sibling_analysis_path(path: &Path) -> Option<PathBuf> {
     let parent = path.parent()?;
     let analysis = parent.join(ANALYSIS_JSON_FILENAME);
@@ -630,28 +592,20 @@ pub(crate) fn resolve_runtime_ranking(
 type AnalysisDetails = (Option<&'static str>, Option<usize>, u32, u32, bool);
 
 fn resolve_local_runtime_ranking(model_path: &Path) -> Option<ResolvedRanking> {
-    moe::best_shared_ranking_artifact(model_path).map(|artifact| {
-        let analyzer_id = match artifact.kind {
-            moe::SharedRankingKind::Analyze => "full-v1",
-            moe::SharedRankingKind::MicroAnalyze => "micro-v1",
-        };
-        ResolvedRanking {
-            path: moe::shared_ranking_cache_path(model_path, &artifact),
-            metadata_path: None,
-            analysis_path: sibling_analysis_path(&moe::shared_ranking_cache_path(
-                model_path, &artifact,
-            )),
-            analyzer_id: analyzer_id.to_string(),
-            source: RankingSource::LocalCache,
-            reason: format!(
-                "local {} ranking cache",
-                if artifact.kind == moe::SharedRankingKind::Analyze {
-                    "full"
-                } else {
-                    "micro"
-                }
-            ),
-        }
+    let path = moe::package_cache_ranking_path(model_path);
+    if !path.exists() {
+        return None;
+    }
+    let analysis_path = moe::package_cache_analysis_path(model_path);
+    let analyzer_id =
+        analyzer_id_from_analysis(&analysis_path).unwrap_or_else(|_| "full-v1".to_string());
+    Some(ResolvedRanking {
+        path,
+        metadata_path: None,
+        analysis_path: analysis_path.exists().then_some(analysis_path),
+        analyzer_id,
+        source: RankingSource::LocalCache,
+        reason: "local materialized package ranking".to_string(),
     })
 }
 
@@ -659,25 +613,6 @@ async fn resolve_best_ranking(
     model: &MoeModelContext,
     args: &MoePlanArgs,
 ) -> Result<ResolvedRanking> {
-    if let Some(path) = args.ranking_file.as_deref() {
-        if !path.exists() {
-            bail!("Ranking file not found: {}", path.display());
-        }
-        let metadata_path = sibling_metadata_path(path);
-        let analysis_path = sibling_analysis_path(path);
-        let analyzer_id = infer_analyzer_from_ranking_path(path)
-            .unwrap_or("override")
-            .to_string();
-        return Ok(ResolvedRanking {
-            path: path.to_path_buf(),
-            metadata_path,
-            analysis_path,
-            analyzer_id,
-            source: RankingSource::Override,
-            reason: "explicit --ranking-file override".to_string(),
-        });
-    }
-
     let local_legacy = resolve_local_runtime_ranking(&model.path);
 
     let Some(source_repo) = model.source_repo.as_ref() else {
@@ -688,15 +623,6 @@ async fn resolve_best_ranking(
             )
         });
     };
-    let Some(source_revision) = model.source_revision.as_ref() else {
-        return local_legacy.ok_or_else(|| {
-            anyhow::anyhow!(
-                "No published ranking lookup is possible without a resolved source revision for {}.",
-                model.display_name
-            )
-        });
-    };
-
     if local_legacy
         .as_ref()
         .is_some_and(|ranking| ranking_method_priority(ranking) >= 2)
@@ -705,43 +631,28 @@ async fn resolve_best_ranking(
         return Ok(local_legacy.expect("checked is_some above"));
     }
 
-    let dataset_repo = args.dataset_repo.clone();
-    let source_repo = source_repo.clone();
-    let source_revision = source_revision.clone();
-    let distribution_id = model.distribution_id.clone();
+    let model_ref = canonical_model_ref_from_source(
+        source_repo,
+        &model.distribution_id,
+        Some(model.distribution_id.clone()),
+    );
     let local_fallback = local_legacy.clone();
-    let remote_dataset_repo = dataset_repo.clone();
-    let remote_source_repo = source_repo.clone();
-    let remote_source_revision = source_revision.clone();
-    let remote_distribution_id = distribution_id.clone();
-    let remote_progress = args.progress;
     let mut remote_spinner = args.progress.then(|| {
         start_spinner(&format!(
-            "Checking published MoE data for {}",
+            "Checking published MoE package for {}",
             model.display_name
         ))
     });
     if let Some(spinner) = remote_spinner.as_mut() {
         spinner.set_message(format!(
-            "Fetching published MoE ranking and analysis for {}",
+            "Fetching published MoE package ranking and analysis for {}",
             model.display_name
         ));
     }
-    let remote_lookup = tokio::task::spawn_blocking(move || {
-        fetch_remote_ranking(
-            &remote_dataset_repo,
-            &remote_source_repo,
-            &remote_source_revision,
-            &remote_distribution_id,
-            remote_progress,
-        )
-    })
-    .await;
+    let remote_lookup = fetch_remote_package_ranking(&args.catalog_repo, &model_ref, args.progress);
     if let Some(spinner) = remote_spinner.as_mut() {
         spinner.finish();
     }
-    let remote_lookup =
-        remote_lookup.context("Join blocking Hugging Face MoE ranking lookup task")?;
 
     let remote = match remote_lookup {
         Ok(remote) => remote,
@@ -751,10 +662,9 @@ async fn resolve_best_ranking(
     };
     select_preferred_ranking(local_legacy, remote).ok_or_else(|| {
         anyhow::anyhow!(
-            "No published ranking found in {} for {}@{} {} and no local cache exists.",
-            args.dataset_repo,
+            "No published MoE package ranking found in {} for {}:{} and no local cache exists.",
+            args.catalog_repo,
             source_repo,
-            source_revision,
             model.distribution_id
         )
     })
@@ -786,108 +696,6 @@ fn select_preferred_ranking(
         (None, Some(remote)) => Some(remote),
         (None, None) => None,
     }
-}
-
-fn fetch_remote_ranking(
-    dataset_repo_name: &str,
-    source_repo: &str,
-    source_revision: &str,
-    distribution_id: &str,
-    progress: bool,
-) -> Result<Option<ResolvedRanking>> {
-    let api = build_hf_api(progress).context("Build Hugging Face client for MoE ranking lookup")?;
-    let (owner, name) = dataset_repo_name
-        .split_once('/')
-        .unwrap_or(("", dataset_repo_name));
-    let dataset_repo = api.dataset(owner, name);
-    let info = dataset_repo.info(
-        &RepoInfoParams::builder()
-            .revision(DEFAULT_DATASET_REVISION.to_string())
-            .build(),
-    )?;
-    let hf_hub::RepoInfo::Dataset(info) = info else {
-        bail!("Expected dataset repo info for {}", dataset_repo_name);
-    };
-    find_remote_ranking(
-        &api,
-        dataset_repo_name,
-        info.sha.as_deref().unwrap_or(DEFAULT_DATASET_REVISION),
-        info.siblings.as_deref().unwrap_or(&[]),
-        source_repo,
-        source_revision,
-        distribution_id,
-    )
-}
-
-fn find_remote_ranking(
-    api: &hf_hub::HFClientSync,
-    dataset_repo: &str,
-    dataset_revision: &str,
-    siblings: &[hf_hub::RepoSibling],
-    source_repo: &str,
-    source_revision: &str,
-    distribution_id: &str,
-) -> Result<Option<ResolvedRanking>> {
-    let prefix = canonical_dataset_prefix(source_repo, source_revision, distribution_id);
-    for analyzer_id in ["full-v1", "micro-v1"] {
-        let metadata_rel = format!("{prefix}/{analyzer_id}/metadata.json");
-        let ranking_rel = format!("{prefix}/{analyzer_id}/ranking.csv");
-        let analysis_rel = format!("{prefix}/{analyzer_id}/{ANALYSIS_JSON_FILENAME}");
-        let has_metadata = siblings.iter().any(|entry| entry.rfilename == metadata_rel);
-        let has_ranking = siblings.iter().any(|entry| entry.rfilename == ranking_rel);
-        let has_analysis = siblings.iter().any(|entry| entry.rfilename == analysis_rel);
-        if !(has_metadata && has_ranking && has_analysis) {
-            continue;
-        }
-
-        let (owner, name) = dataset_repo.split_once('/').unwrap_or(("", dataset_repo));
-        let pinned = api.dataset(owner, name);
-        let metadata_path = pinned
-            .download_file(
-                &RepoDownloadFileParams::builder()
-                    .filename(metadata_rel.clone())
-                    .revision(dataset_revision.to_string())
-                    .build(),
-            )
-            .with_context(|| format!("Download {}", metadata_rel))?;
-        let ranking_path = pinned
-            .download_file(
-                &RepoDownloadFileParams::builder()
-                    .filename(ranking_rel.clone())
-                    .revision(dataset_revision.to_string())
-                    .build(),
-            )
-            .with_context(|| format!("Download {}", ranking_rel))?;
-        let analysis_path = pinned
-            .download_file(
-                &RepoDownloadFileParams::builder()
-                    .filename(analysis_rel.clone())
-                    .revision(dataset_revision.to_string())
-                    .build(),
-            )
-            .with_context(|| format!("Download {}", analysis_rel))?;
-        return Ok(Some(ResolvedRanking {
-            analysis_path: Some(analysis_path),
-            path: ranking_path,
-            metadata_path: Some(metadata_path),
-            analyzer_id: analyzer_id.to_string(),
-            source: RankingSource::HuggingFaceDataset,
-            reason: format!("published {} ranking in {}", analyzer_id, dataset_repo),
-        }));
-    }
-
-    Ok(None)
-}
-
-fn canonical_dataset_prefix(
-    source_repo: &str,
-    source_revision: &str,
-    distribution_id: &str,
-) -> String {
-    let (namespace, repo) = source_repo
-        .split_once('/')
-        .unwrap_or(("unknown", source_repo));
-    format!("data/{namespace}/{repo}/{source_revision}/gguf/{distribution_id}")
 }
 
 pub(crate) fn catalog_entry_path_for_source_repo(source_repo: &str) -> Result<String> {
@@ -1606,20 +1414,14 @@ pub(crate) fn estimate_startup_fit_from_analysis(
 }
 
 pub(crate) fn fetch_remote_startup_fit(
-    dataset_repo_name: &str,
+    catalog_repo_name: &str,
     source_repo: &str,
-    source_revision: &str,
     distribution_id: &str,
     target_vram_bytes: u64,
     progress: bool,
 ) -> Result<Option<MoeStartupFitEstimate>> {
-    let Some(ranking) = fetch_remote_ranking(
-        dataset_repo_name,
-        source_repo,
-        source_revision,
-        distribution_id,
-        progress,
-    )?
+    let model_ref = canonical_model_ref_from_source(source_repo, distribution_id, None);
+    let Some(ranking) = fetch_remote_package_ranking(catalog_repo_name, &model_ref, progress)?
     else {
         return Ok(None);
     };
@@ -2110,20 +1912,16 @@ mod tests {
     }
 
     #[test]
-    fn local_submit_ranking_override_infers_analyzer_and_metadata() {
-        let dir = temp_case_dir("submit-override");
-        let analyzer_dir = dir.join("micro-v1");
-        let ranking_path = analyzer_dir.join("ranking.csv");
-        let metadata_path = analyzer_dir.join("metadata.json");
-        let analysis_path = analyzer_dir.join("analysis.json");
-        fs::create_dir_all(&analyzer_dir).unwrap();
-        fs::write(&ranking_path, "0\n1\n").unwrap();
-        fs::write(&metadata_path, "{}\n").unwrap();
-        fs::write(&analysis_path, "{}\n").unwrap();
+    fn local_submit_ranking_reads_materialized_package_artifacts() {
+        let dir = temp_case_dir("submit-package");
+        let previous_xdg = std::env::var_os("XDG_CACHE_HOME");
+        std::env::set_var("XDG_CACHE_HOME", &dir);
 
         let model = MoeModelContext {
             input: "demo".to_string(),
-            path: PathBuf::from("/tmp/demo.gguf"),
+            path: PathBuf::from(
+                "/tmp/hf/models--unsloth--demo/snapshots/abcdef123456/demo-Q4_K_M.gguf",
+            ),
             display_name: "demo.gguf".to_string(),
             source_repo: Some("unsloth/demo".to_string()),
             source_revision: Some("abcdef123456".to_string()),
@@ -2134,16 +1932,28 @@ mod tests {
             total_model_bytes: 1024,
         };
 
-        let resolved = local_submit_ranking(&model, Some(&ranking_path)).unwrap();
+        let ranking_path = moe::package_cache_ranking_path(&model.path);
+        let analysis_path = moe::package_cache_analysis_path(&model.path);
+        fs::create_dir_all(ranking_path.parent().unwrap()).unwrap();
+        fs::write(&ranking_path, "0\n1\n").unwrap();
+        fs::write(
+            &analysis_path,
+            serde_json::json!({ "analyzer_id": "micro-v1" }).to_string() + "\n",
+        )
+        .unwrap();
+
+        let resolved = local_submit_ranking(&model).unwrap();
         assert_eq!(resolved.analyzer_id, "micro-v1");
-        assert_eq!(
-            resolved.metadata_path.as_deref(),
-            Some(metadata_path.as_path())
-        );
+        assert!(resolved.metadata_path.is_none());
         assert_eq!(
             resolved.analysis_path.as_deref(),
             Some(analysis_path.as_path())
         );
+        if let Some(previous) = previous_xdg {
+            std::env::set_var("XDG_CACHE_HOME", previous);
+        } else {
+            std::env::remove_var("XDG_CACHE_HOME");
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2300,12 +2110,12 @@ mod tests {
         let remote = fake_ranking(
             "/tmp/remote.csv",
             "full-v1",
-            RankingSource::HuggingFaceDataset,
+            RankingSource::HuggingFacePackage,
         );
 
         let selected = select_preferred_ranking(Some(local), Some(remote)).unwrap();
         assert_eq!(selected.analyzer_id, "full-v1");
-        assert!(matches!(selected.source, RankingSource::HuggingFaceDataset));
+        assert!(matches!(selected.source, RankingSource::HuggingFacePackage));
     }
 
     #[test]
@@ -2314,7 +2124,7 @@ mod tests {
         let remote = fake_ranking(
             "/tmp/remote.csv",
             "micro-v1",
-            RankingSource::HuggingFaceDataset,
+            RankingSource::HuggingFacePackage,
         );
 
         let selected = select_preferred_ranking(Some(local), Some(remote)).unwrap();

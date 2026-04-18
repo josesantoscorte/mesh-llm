@@ -131,7 +131,7 @@ fn split_cache_root() -> PathBuf {
 }
 
 fn component_cache_root() -> PathBuf {
-    mesh_cache_dir().join("moe").join("packages")
+    mesh_cache_dir().join("packages")
 }
 
 fn ranking_cache_root() -> PathBuf {
@@ -1182,7 +1182,6 @@ mod tests {
             package_dir,
             PathBuf::from("/tmp/mesh-llm-cache-root")
                 .join("mesh-llm")
-                .join("moe")
                 .join("packages")
                 .join("unsloth")
                 .join("Qwen3.6-35B-A3B-GGUF")

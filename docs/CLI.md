@@ -377,7 +377,7 @@ mesh-llm moe plan unsloth/gemma-4-26B-A4B-it-GGUF:UD-Q4_K_S --max-vram 16 --json
 Behavior:
 
 - Checks local mesh-llm ranking cache first.
-- Checks `meshllm/moe-rankings` on Hugging Face and uses it when it provides a stronger ranking than local cache. If local and published rankings have the same analyzer strength, the local cache wins.
+- Checks `meshllm/catalog` on Hugging Face and uses the best published MoE package ranking when it provides a stronger artifact than local cache. If local and published rankings have the same analyzer strength, the local cache wins.
 - Keeps Hugging Face dataset files in the normal Hugging Face cache; it does not copy dataset artifacts into `~/.cache/mesh-llm`.
 - Prefers `full-*` rankings over `micro-*` for the same model/distribution.
 - Prints ranking provenance clearly so you can see whether the planner used local cache, Hugging Face, or an explicit override.
@@ -386,7 +386,7 @@ Switches:
 
 - `--max-vram <MAX_VRAM>`: target per-node VRAM budget in GB.
 - `--nodes <NODES>`: optional explicit node count to evaluate.
-- `--ranking-file <RANKING_FILE>`: bypass normal ranking resolution and use one specific ranking CSV.
+- `--catalog-repo <CATALOG_REPO>`: catalog dataset used to resolve published MoE packages. Defaults to `meshllm/catalog`.
 - `--json`: machine-readable output.
 
 ### `moe analyze full`
@@ -436,7 +436,7 @@ mesh-llm moe publish unsloth/gemma-4-26B-A4B-it-GGUF:UD-Q4_K_S
 Behavior:
 
 - Runs a local full analysis first when the full package cache is missing.
-- Materializes the package cache under `~/.cache/mesh-llm/moe/packages/...`.
+- Materializes the package cache under `~/.cache/mesh-llm/packages/...`.
 - Publishes `meshllm.json`, `ranking.csv`, `analysis.json`, `run.log` when available, `manifest.json`, `trunk.gguf`, and `experts/*`.
 - Creates or reuses the package repo and opens the catalog PR.
 - Uses PR-based uploads instead of writing directly to `main`.

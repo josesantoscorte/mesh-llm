@@ -658,19 +658,17 @@ async fn preflight_remote_startup_model(
     }
 
     spinner.set_message(format!(
-        "Fetching published MoE analysis for {}",
+        "Fetching published MoE package analysis for {}",
         identity.local_file_name
     ));
-    let dataset_repo = moe_planner::DEFAULT_MOE_RANKINGS_DATASET.to_string();
+    let catalog_repo = moe_planner::DEFAULT_MOE_CATALOG_DATASET.to_string();
     let source_repo = identity.repo_id.clone();
-    let source_revision = identity.revision.clone();
     let distribution_id = moe_planner::normalize_distribution_id(&identity.local_file_name);
     let target_vram_bytes = mesh::detect_vram_bytes_capped(max_vram_gb);
     let fetched = tokio::task::spawn_blocking(move || {
         moe_planner::fetch_remote_startup_fit(
-            &dataset_repo,
+            &catalog_repo,
             &source_repo,
-            &source_revision,
             &distribution_id,
             target_vram_bytes,
             false,
