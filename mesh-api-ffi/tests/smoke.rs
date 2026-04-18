@@ -43,7 +43,7 @@ impl EventListener for ReentrantListener {
 #[test]
 fn create_client_with_invalid_token_fails() {
     let result = create_client("".to_string(), "".to_string());
-    assert!(matches!(result, Err(FfiError::InvalidInviteToken)));
+    assert!(matches!(result, Err(FfiError::InvalidInviteToken(_))));
 }
 
 #[test]
@@ -56,7 +56,7 @@ fn create_client_with_valid_token_succeeds() {
 fn create_client_with_empty_owner_keypair_fails() {
     // Empty keypair is rejected rather than silently generating a fresh identity.
     let result = create_client("".to_string(), "valid-token".to_string());
-    assert!(matches!(result, Err(FfiError::InvalidOwnerKeypair)));
+    assert!(matches!(result, Err(FfiError::InvalidOwnerKeypair(_))));
 }
 
 #[test]
@@ -76,7 +76,7 @@ fn client_handle_cancel_unknown_id_is_noop() {
 #[test]
 fn create_client_with_invalid_owner_keypair_fails() {
     let result = create_client("deadbeef".to_string(), "valid-token".to_string());
-    assert!(matches!(result, Err(FfiError::InvalidOwnerKeypair)));
+    assert!(matches!(result, Err(FfiError::InvalidOwnerKeypair(_))));
 }
 
 #[test]

@@ -13,24 +13,24 @@ uniffi::setup_scaffolding!("mesh_ffi");
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum FfiError {
-    #[error("invalid invite token")]
-    InvalidInviteToken,
-    #[error("invalid owner keypair")]
-    InvalidOwnerKeypair,
-    #[error("client build failed")]
-    BuildFailed,
-    #[error("join failed")]
-    JoinFailed,
-    #[error("discovery failed")]
-    DiscoveryFailed,
-    #[error("stream failed")]
-    StreamFailed,
-    #[error("cancelled")]
-    Cancelled,
-    #[error("reconnect failed")]
-    ReconnectFailed,
-    #[error("host unavailable")]
-    HostUnavailable,
+    #[error("invalid invite token: {0}")]
+    InvalidInviteToken(String),
+    #[error("invalid owner keypair: {0}")]
+    InvalidOwnerKeypair(String),
+    #[error("client build failed: {0}")]
+    BuildFailed(String),
+    #[error("join failed: {0}")]
+    JoinFailed(String),
+    #[error("discovery failed: {0}")]
+    DiscoveryFailed(String),
+    #[error("stream failed: {0}")]
+    StreamFailed(String),
+    #[error("cancelled: {0}")]
+    Cancelled(String),
+    #[error("reconnect failed: {0}")]
+    ReconnectFailed(String),
+    #[error("host unavailable: {0}")]
+    HostUnavailable(String),
 }
 
 #[derive(uniffi::Record)]
@@ -187,11 +187,11 @@ pub fn create_client(
 ) -> Result<Arc<MeshClientHandle>, FfiError> {
     let token = invite_token
         .parse::<InviteToken>()
-        .map_err(|_| FfiError::InvalidInviteToken)?;
+        .map_err(FfiError::InvalidInviteToken)?;
     let kp = parse_owner_keypair(&owner_keypair_bytes_hex)?;
     let client = ClientBuilder::new(kp, token)
         .build()
-        .map_err(|_| FfiError::BuildFailed)?;
+        .map_err(|error| FfiError::BuildFailed(error.to_string()))?;
     Ok(spawn_client_worker(client)?)
 }
 
@@ -218,7 +218,7 @@ fn spawn_client_worker(client: MeshClient) -> Result<Arc<MeshClientHandle>, FfiE
     let worker = thread::Builder::new()
         .name("mesh-ffi-client".to_string())
         .spawn(move || run_client_worker(client, command_rx))
-        .map_err(|_| FfiError::BuildFailed)?;
+        .map_err(|error| FfiError::BuildFailed(error.to_string()))?;
     Ok(Arc::new(MeshClientHandle {
         command_tx,
         worker: Mutex::new(Some(worker)),
@@ -232,17 +232,21 @@ fn parse_owner_keypair(owner_keypair_bytes_hex: &str) -> Result<OwnerKeypair, Ff
     // want a new keypair should create one explicitly before calling create_client.
     let trimmed = owner_keypair_bytes_hex.trim();
     if trimmed.is_empty() {
-        return Err(FfiError::InvalidOwnerKeypair);
+        return Err(FfiError::InvalidOwnerKeypair(
+            "owner keypair must not be empty".to_string(),
+        ));
     }
-    OwnerKeypair::from_hex(trimmed).map_err(|_| FfiError::InvalidOwnerKeypair)
+    OwnerKeypair::from_hex(trimmed).map_err(|error| FfiError::InvalidOwnerKeypair(error.to_string()))
 }
 
 fn map_mesh_api_error(error: mesh_api::MeshApiError) -> FfiError {
     match error {
-        mesh_api::MeshApiError::Client(_) => FfiError::BuildFailed,
-        mesh_api::MeshApiError::Discovery(_) => FfiError::DiscoveryFailed,
-        mesh_api::MeshApiError::NoPublicMeshFound => FfiError::HostUnavailable,
-        mesh_api::MeshApiError::InvalidInviteToken(_) => FfiError::InvalidInviteToken,
+        mesh_api::MeshApiError::Client(error) => FfiError::BuildFailed(error.to_string()),
+        mesh_api::MeshApiError::Discovery(message) => FfiError::DiscoveryFailed(message),
+        mesh_api::MeshApiError::NoPublicMeshFound => {
+            FfiError::HostUnavailable("no public mesh matched the requested criteria".to_string())
+        }
+        mesh_api::MeshApiError::InvalidInviteToken(message) => FfiError::InvalidInviteToken(message),
     }
 }
 
@@ -251,13 +255,17 @@ impl MeshClientHandle {
     pub fn join(&self) -> Result<(), FfiError> {
         let (response_tx, response_rx) = mpsc::sync_channel(1);
         self.send_command(ClientCommand::Join { response_tx })?;
-        response_rx.recv().map_err(|_| FfiError::JoinFailed)?
+        response_rx
+            .recv()
+            .map_err(|error| FfiError::JoinFailed(error.to_string()))?
     }
 
     pub fn list_models(&self) -> Result<Vec<ModelDto>, FfiError> {
         let (response_tx, response_rx) = mpsc::sync_channel(1);
         self.send_command(ClientCommand::ListModels { response_tx })?;
-        response_rx.recv().map_err(|_| FfiError::DiscoveryFailed)?
+        response_rx
+            .recv()
+            .map_err(|error| FfiError::DiscoveryFailed(error.to_string()))?
     }
 
     pub fn chat(&self, request: ChatRequestDto, listener: Box<dyn EventListener>) -> String {
@@ -318,7 +326,9 @@ impl MeshClientHandle {
     pub fn reconnect(&self) -> Result<(), FfiError> {
         let (response_tx, response_rx) = mpsc::sync_channel(1);
         self.send_command(ClientCommand::Reconnect { response_tx })?;
-        response_rx.recv().map_err(|_| FfiError::ReconnectFailed)?
+        response_rx
+            .recv()
+            .map_err(|error| FfiError::ReconnectFailed(error.to_string()))?
     }
 }
 
@@ -326,7 +336,7 @@ impl MeshClientHandle {
     fn send_command(&self, command: ClientCommand) -> Result<(), FfiError> {
         self.command_tx
             .send(command)
-            .map_err(|_| FfiError::HostUnavailable)
+            .map_err(|error| FfiError::HostUnavailable(error.to_string()))
     }
 }
 
@@ -376,7 +386,9 @@ fn run_client_worker(mut client: MeshClient, command_rx: mpsc::Receiver<ClientCo
     while let Ok(command) = command_rx.recv() {
         match command {
             ClientCommand::Join { response_tx } => {
-                let result = client.join_blocking().map_err(|_| FfiError::JoinFailed);
+                let result = client
+                    .join_blocking()
+                    .map_err(|error| FfiError::JoinFailed(error.to_string()));
                 let _ = response_tx.send(result);
             }
             ClientCommand::ListModels { response_tx } => {
@@ -391,7 +403,7 @@ fn run_client_worker(mut client: MeshClient, command_rx: mpsc::Receiver<ClientCo
                             })
                             .collect()
                     })
-                    .map_err(|_| FfiError::DiscoveryFailed);
+                    .map_err(|error| FfiError::DiscoveryFailed(error.to_string()));
                 let _ = response_tx.send(result);
             }
             ClientCommand::Chat {
@@ -441,7 +453,7 @@ fn run_client_worker(mut client: MeshClient, command_rx: mpsc::Receiver<ClientCo
             ClientCommand::Reconnect { response_tx } => {
                 let result = client
                     .reconnect_blocking()
-                    .map_err(|_| FfiError::ReconnectFailed);
+                    .map_err(|error| FfiError::ReconnectFailed(error.to_string()));
                 let _ = response_tx.send(result);
             }
             ClientCommand::Shutdown => break,

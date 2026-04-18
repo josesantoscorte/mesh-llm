@@ -1,9 +1,13 @@
 use crate::crypto::keys::OwnerKeypair;
-use crate::protocol::{connect_mesh, STREAM_TUNNEL_HTTP};
+use crate::protocol::{
+    connect_mesh, connection_protocol, read_len_prefixed, write_len_prefixed, ControlProtocol,
+    NODE_PROTOCOL_GENERATION, STREAM_GOSSIP, STREAM_TUNNEL_HTTP, ValidateControlFrame,
+};
 use crate::runtime::CoreRuntime;
 use base64::Engine as _;
 use iroh::endpoint::{Connection, QuicTransportConfig, RelayMode};
 use iroh::{Endpoint, EndpointAddr, RelayConfig, RelayMap, SecretKey};
+use prost::Message as _;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -114,6 +118,7 @@ impl ClientBuilder {
                 invite_token,
                 bootstrap_addr: None,
                 connection: None,
+                admitted: false,
             })),
             cancel_flags: Arc::new(Mutex::new(HashMap::new())),
             listeners: Arc::new(Mutex::new(
@@ -141,6 +146,7 @@ struct ClientState {
     invite_token: String,
     bootstrap_addr: Option<EndpointAddr>,
     connection: Option<Connection>,
+    admitted: bool,
 }
 
 pub struct MeshClient {
@@ -353,7 +359,7 @@ impl MeshClient {
     }
 
     async fn ensure_connected(&self) -> Result<Connection, ClientError> {
-        let (endpoint, bootstrap_addr, existing_connection) = {
+        let (endpoint, bootstrap_addr, existing_connection, admitted) = {
             let state = self.state.lock().unwrap();
             (
                 state.endpoint.clone(),
@@ -363,37 +369,51 @@ impl MeshClient {
                     .map(Ok)
                     .unwrap_or_else(|| decode_invite_token(&state.invite_token)),
                 state.connection.clone(),
+                state.admitted,
             )
         };
 
-        if let Some(connection) = existing_connection {
-            return Ok(connection);
+        if let Some(connection) = existing_connection.clone() {
+            if admitted {
+                return Ok(connection);
+            }
         }
 
         self.emit_event(crate::events::Event::Connecting);
 
         let bootstrap_addr = bootstrap_addr.map_err(ClientError::Join)?;
 
-        let connection = tokio::time::timeout(
-            self.config.connect_timeout,
-            connect_mesh(endpoint.as_ref(), bootstrap_addr.clone()),
-        )
-        .await
-        .map_err(|_| {
-            ClientError::Join(format!(
-                "timed out after {}s while connecting to mesh",
-                self.config.connect_timeout.as_secs()
-            ))
-        })?
-        .map_err(|err| ClientError::Join(err.to_string()))?;
+        let connection = if let Some(connection) = existing_connection {
+            connection
+        } else {
+            tokio::time::timeout(
+                self.config.connect_timeout,
+                connect_mesh(endpoint.as_ref(), bootstrap_addr.clone()),
+            )
+            .await
+            .map_err(|_| {
+                ClientError::Join(format!(
+                    "timed out after {}s while connecting to mesh",
+                    self.config.connect_timeout.as_secs()
+                ))
+            })?
+            .map_err(|err| ClientError::Join(err.to_string()))?
+        };
+
+        ensure_connection_admitted(connection.clone(), endpoint.as_ref())
+            .await
+            .map_err(ClientError::Join)?;
 
         {
             let mut state = self.state.lock().unwrap();
             if let Some(existing) = state.connection.clone() {
-                return Ok(existing);
+                if state.admitted {
+                    return Ok(existing);
+                }
             }
             state.bootstrap_addr = Some(bootstrap_addr.clone());
             state.connection = Some(connection.clone());
+            state.admitted = true;
         }
 
         self.emit_event(crate::events::Event::Joined {
@@ -404,7 +424,9 @@ impl MeshClient {
     }
 
     fn clear_connection(&self) {
-        self.state.lock().unwrap().connection = None;
+        let mut state = self.state.lock().unwrap();
+        state.connection = None;
+        state.admitted = false;
     }
 
     fn emit_event(&self, event: crate::events::Event) {
@@ -529,51 +551,122 @@ async fn mesh_http_request(
     let mut last_error = None;
 
     for _ in 0..2 {
-        let (endpoint, bootstrap_addr, existing_connection) = {
-            let state = state.lock().unwrap();
-            (
-                state.endpoint.clone(),
-                state
-                    .bootstrap_addr
-                    .clone()
-                    .map(Ok)
-                    .unwrap_or_else(|| decode_invite_token(&state.invite_token)),
-                state.connection.clone(),
-            )
-        };
-
-        let connection = if let Some(connection) = existing_connection {
-            connection
-        } else {
-            let bootstrap_addr = bootstrap_addr?;
-            let connection = tokio::time::timeout(
-                connect_timeout,
-                connect_mesh(endpoint.as_ref(), bootstrap_addr.clone()),
-            )
-            .await
-            .map_err(|_| {
-                format!(
-                    "timed out after {}s while connecting to mesh",
-                    connect_timeout.as_secs()
-                )
-            })?
-            .map_err(|err| err.to_string())?;
-            let mut guard = state.lock().unwrap();
-            guard.bootstrap_addr = Some(bootstrap_addr);
-            guard.connection = Some(connection.clone());
-            connection
-        };
+        let connection = ensure_mesh_connection(state.clone(), connect_timeout).await?;
 
         match perform_http_request(connection, request.as_slice()).await {
             Ok(response) => return Ok(response),
             Err(error) => {
-                state.lock().unwrap().connection = None;
+                let mut guard = state.lock().unwrap();
+                guard.connection = None;
+                guard.admitted = false;
                 last_error = Some(error);
             }
         }
     }
 
     Err(last_error.unwrap_or_else(|| "mesh request failed".to_string()))
+}
+
+async fn ensure_mesh_connection(
+    state: Arc<Mutex<ClientState>>,
+    connect_timeout: Duration,
+) -> Result<Connection, String> {
+    let (endpoint, bootstrap_addr, existing_connection, admitted) = {
+        let state = state.lock().unwrap();
+        (
+            state.endpoint.clone(),
+            state
+                .bootstrap_addr
+                .clone()
+                .map(Ok)
+                .unwrap_or_else(|| decode_invite_token(&state.invite_token)),
+            state.connection.clone(),
+            state.admitted,
+        )
+    };
+
+    let bootstrap_addr = bootstrap_addr?;
+    let connection = if let Some(connection) = existing_connection {
+        connection
+    } else {
+        tokio::time::timeout(
+            connect_timeout,
+            connect_mesh(endpoint.as_ref(), bootstrap_addr.clone()),
+        )
+        .await
+        .map_err(|_| {
+            format!(
+                "timed out after {}s while connecting to mesh",
+                connect_timeout.as_secs()
+            )
+        })?
+        .map_err(|err| err.to_string())?
+    };
+
+    if !admitted {
+        ensure_connection_admitted(connection.clone(), endpoint.as_ref()).await?;
+    }
+
+    let mut guard = state.lock().unwrap();
+    guard.bootstrap_addr = Some(bootstrap_addr);
+    guard.connection = Some(connection.clone());
+    guard.admitted = true;
+    Ok(connection)
+}
+
+async fn ensure_connection_admitted(
+    connection: Connection,
+    endpoint: &Endpoint,
+) -> Result<(), String> {
+    match connection_protocol(&connection) {
+        ControlProtocol::ProtoV1 => perform_proto_gossip_admission(connection, endpoint).await,
+        ControlProtocol::JsonV0 => Err("legacy JSON gossip admission is not supported".to_string()),
+    }
+}
+
+async fn perform_proto_gossip_admission(
+    connection: Connection,
+    endpoint: &Endpoint,
+) -> Result<(), String> {
+    let (mut send, mut recv) = connection
+        .open_bi()
+        .await
+        .map_err(|err| format!("open gossip stream: {err}"))?;
+    send.write_all(&[STREAM_GOSSIP])
+        .await
+        .map_err(|err| format!("write gossip stream type: {err}"))?;
+
+    let self_announcement = crate::proto::node::PeerAnnouncement {
+        endpoint_id: endpoint.id().as_bytes().to_vec(),
+        role: crate::proto::node::NodeRole::Client as i32,
+        version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        serialized_addr: serde_json::to_vec(&endpoint.addr())
+            .map_err(|err| format!("serialize endpoint addr: {err}"))?,
+        hosted_models_known: Some(true),
+        ..Default::default()
+    };
+    let frame = crate::proto::node::GossipFrame {
+        r#gen: NODE_PROTOCOL_GENERATION,
+        peers: vec![self_announcement],
+        sender_id: endpoint.id().as_bytes().to_vec(),
+    };
+
+    write_len_prefixed(&mut send, &frame.encode_to_vec())
+        .await
+        .map_err(|err| format!("write gossip payload: {err}"))?;
+    send.finish()
+        .map_err(|err| format!("finish gossip payload: {err}"))?;
+
+    let response = read_len_prefixed(&mut recv)
+        .await
+        .map_err(|err| format!("read gossip response: {err}"))?;
+    let response_frame = crate::proto::node::GossipFrame::decode(response.as_slice())
+        .map_err(|err| format!("decode gossip response: {err}"))?;
+    response_frame
+        .validate_frame()
+        .map_err(|err| format!("validate gossip response: {err}"))?;
+    let _ = recv.read_to_end(0).await;
+    Ok(())
 }
 
 async fn perform_http_request(connection: Connection, request: &[u8]) -> Result<Vec<u8>, String> {
@@ -605,10 +698,16 @@ async fn perform_http_request(connection: Connection, request: &[u8]) -> Result<
 }
 
 fn parse_json_response<T: for<'de> Deserialize<'de>>(response: &[u8]) -> Result<T, String> {
-    let header_end = response
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .ok_or_else(|| "malformed HTTP response".to_string())?;
+    let header_end = match response.windows(4).position(|window| window == b"\r\n\r\n") {
+        Some(index) => index,
+        None => {
+            // Some mesh paths hand back the upstream JSON body directly instead of a fully
+            // framed HTTP response. Accept that shape too so the embedded SDK stays tolerant
+            // across tunnel/proxy implementations.
+            return serde_json::from_slice(response)
+                .map_err(|err| format!("malformed HTTP response: decode JSON without headers: {err}"));
+        }
+    };
     let status_line_end = response
         .windows(2)
         .position(|window| window == b"\r\n")

@@ -12,7 +12,7 @@ impl EventListener for MockListener {
 fn client_exports_compile() {
     let _listener: Box<dyn EventListener> = Box::new(MockListener);
     let result = create_client("deadbeef".to_string(), "".to_string());
-    assert!(matches!(result, Err(FfiError::InvalidInviteToken)));
+    assert!(matches!(result, Err(FfiError::InvalidInviteToken(_))));
     let _query = PublicMeshQueryDto {
         model: None,
         min_vram_gb: None,

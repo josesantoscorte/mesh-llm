@@ -123,29 +123,9 @@ lipo -create \
   "$TARGET_DIR/x86_64-apple-ios-macabi/release/libmesh_ffi.a" \
   -output "$TARGET_DIR/ios-macabi-fat/libmesh_ffi.a"
 
-create_framework() {
-  local ARCH="$1"
-  local LIB_PATH="$2"
-  local FRAMEWORK_DIR="$TARGET_DIR/frameworks/$ARCH/$FRAMEWORK_NAME.framework"
-
-  mkdir -p "$FRAMEWORK_DIR/Headers"
-  mkdir -p "$FRAMEWORK_DIR/Modules"
-
-  # Copy static library as the framework binary (no extension)
-  cp "$LIB_PATH" "$FRAMEWORK_DIR/$FRAMEWORK_NAME"
-  cp "$FFI_DIR/MeshLLMFFI.h" "$FRAMEWORK_DIR/Headers/MeshLLMFFI.h"
-  cp "$FFI_DIR/MeshLLMFFI.modulemap" "$FRAMEWORK_DIR/Modules/module.modulemap"
-
-  # Embed PrivacyInfo.xcprivacy (required for App Store submission)
-  if [ -f "$SWIFT_DIR/PrivacyInfo.xcprivacy" ]; then
-    cp "$SWIFT_DIR/PrivacyInfo.xcprivacy" "$FRAMEWORK_DIR/PrivacyInfo.xcprivacy"
-    echo "  Embedded PrivacyInfo.xcprivacy in $ARCH framework"
-  else
-    echo "WARNING: PrivacyInfo.xcprivacy not found at $SWIFT_DIR/PrivacyInfo.xcprivacy"
-  fi
-
-  # Minimal Info.plist (required by xcodebuild -create-xcframework)
-  cat > "$FRAMEWORK_DIR/Info.plist" << 'PLIST'
+write_framework_info_plist() {
+  local PLIST_PATH="$1"
+  cat > "$PLIST_PATH" << 'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -163,6 +143,64 @@ create_framework() {
 </dict>
 </plist>
 PLIST
+}
+
+create_framework() {
+  local ARCH="$1"
+  local LIB_PATH="$2"
+  local FRAMEWORK_DIR="$TARGET_DIR/frameworks/$ARCH/$FRAMEWORK_NAME.framework"
+
+  rm -rf "$FRAMEWORK_DIR"
+
+  if [[ "$ARCH" == "macos" || "$ARCH" == "ios-macabi" ]]; then
+    local VERSION_DIR="$FRAMEWORK_DIR/Versions/A"
+    local RESOURCES_DIR="$VERSION_DIR/Resources"
+
+    mkdir -p "$FRAMEWORK_DIR/Headers"
+    mkdir -p "$FRAMEWORK_DIR/Modules"
+    mkdir -p "$FRAMEWORK_DIR/Resources"
+    mkdir -p "$VERSION_DIR/Headers"
+    mkdir -p "$VERSION_DIR/Modules"
+    mkdir -p "$RESOURCES_DIR"
+
+    cp "$LIB_PATH" "$VERSION_DIR/$FRAMEWORK_NAME"
+    cp "$LIB_PATH" "$FRAMEWORK_DIR/$FRAMEWORK_NAME"
+    cp "$FFI_DIR/MeshLLMFFI.h" "$VERSION_DIR/Headers/MeshLLMFFI.h"
+    cp "$FFI_DIR/MeshLLMFFI.h" "$FRAMEWORK_DIR/Headers/MeshLLMFFI.h"
+    cp "$FFI_DIR/MeshLLMFFI.modulemap" "$VERSION_DIR/Modules/module.modulemap"
+    cp "$FFI_DIR/MeshLLMFFI.modulemap" "$FRAMEWORK_DIR/Modules/module.modulemap"
+
+    if [ -f "$SWIFT_DIR/PrivacyInfo.xcprivacy" ]; then
+      cp "$SWIFT_DIR/PrivacyInfo.xcprivacy" "$RESOURCES_DIR/PrivacyInfo.xcprivacy"
+      cp "$SWIFT_DIR/PrivacyInfo.xcprivacy" "$FRAMEWORK_DIR/Resources/PrivacyInfo.xcprivacy"
+      echo "  Embedded PrivacyInfo.xcprivacy in $ARCH framework"
+    else
+      echo "WARNING: PrivacyInfo.xcprivacy not found at $SWIFT_DIR/PrivacyInfo.xcprivacy"
+    fi
+
+    write_framework_info_plist "$RESOURCES_DIR/Info.plist"
+
+    ln -sfn A "$FRAMEWORK_DIR/Versions/Current"
+
+    echo "  Created hybrid versioned framework bundle for $ARCH"
+    return
+  fi
+
+  mkdir -p "$FRAMEWORK_DIR/Headers"
+  mkdir -p "$FRAMEWORK_DIR/Modules"
+
+  cp "$LIB_PATH" "$FRAMEWORK_DIR/$FRAMEWORK_NAME"
+  cp "$FFI_DIR/MeshLLMFFI.h" "$FRAMEWORK_DIR/Headers/MeshLLMFFI.h"
+  cp "$FFI_DIR/MeshLLMFFI.modulemap" "$FRAMEWORK_DIR/Modules/module.modulemap"
+
+  if [ -f "$SWIFT_DIR/PrivacyInfo.xcprivacy" ]; then
+    cp "$SWIFT_DIR/PrivacyInfo.xcprivacy" "$FRAMEWORK_DIR/PrivacyInfo.xcprivacy"
+    echo "  Embedded PrivacyInfo.xcprivacy in $ARCH framework"
+  else
+    echo "WARNING: PrivacyInfo.xcprivacy not found at $SWIFT_DIR/PrivacyInfo.xcprivacy"
+  fi
+
+  write_framework_info_plist "$FRAMEWORK_DIR/Info.plist"
 
   echo "  Created framework bundle for $ARCH"
 }

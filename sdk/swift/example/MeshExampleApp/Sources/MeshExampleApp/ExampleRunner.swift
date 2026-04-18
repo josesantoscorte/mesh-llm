@@ -49,7 +49,8 @@ struct MeshExampleRunner {
             throw ExampleError.noModels
         }
 
-        let selectedModel = environment["MESH_SDK_MODEL_ID"] ?? models[0].id
+        let requestedModel = environment["MESH_SDK_MODEL_ID"]
+        let selectedModel = models.first(where: { $0.id == requestedModel })?.id ?? models[0].id
         let request = ChatRequest(
             model: selectedModel,
             messages: [ChatMessage(role: "user", content: "hello")]
@@ -92,12 +93,20 @@ struct MeshExampleRunner {
 
     func waitForModels(_ client: any MeshExampleClient) async throws -> [Model] {
         let deadline = now().addingTimeInterval(30)
+        var lastError: Error?
         while now() < deadline {
-            let models = try await client.listModels()
-            if !models.isEmpty {
-                return models
+            do {
+                let models = try await client.listModels()
+                if !models.isEmpty {
+                    return models
+                }
+            } catch {
+                lastError = error
             }
             try await sleep(.milliseconds(250))
+        }
+        if let lastError {
+            throw lastError
         }
         return []
     }

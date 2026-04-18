@@ -63,16 +63,45 @@ final class ExampleRunnerTests: XCTestCase {
         let selectedModel = await client.lastChatRequest?.model
         XCTAssertEqual(selectedModel, "mesh-model-2")
     }
+
+    func testRunnerRetriesTransientModelListingFailures() async throws {
+        let client = MockMeshExampleClient(
+            modelResponses: [
+                .failure(TestError.transient),
+                .success([]),
+                .success([Model(id: "mesh-model-1", name: "mesh-model-1")]),
+            ],
+            streamedEvents: [
+                .tokenDelta(requestId: "req-1", delta: "hello"),
+                .completed(requestId: "req-1"),
+            ]
+        )
+        let runner = MeshExampleRunner(
+            environment: [:],
+            sleep: { _ in },
+            writeStdout: { _ in }
+        )
+
+        try await runner.run(client: client)
+
+        let selectedModel = await client.lastChatRequest?.model
+        XCTAssertEqual(selectedModel, "mesh-model-1")
+    }
 }
 
 private actor MockMeshExampleClient: MeshExampleClient {
-    private var remainingModelResponses: [[Model]]
+    private var remainingModelResponses: [Result<[Model], Error>]
     private let streamedEvents: [MeshEvent]
     private(set) var joinCallCount = 0
     private(set) var disconnectCallCount = 0
     private(set) var lastChatRequest: ChatRequest?
 
     init(modelResponses: [[Model]], streamedEvents: [MeshEvent]) {
+        self.remainingModelResponses = modelResponses.map(Result.success)
+        self.streamedEvents = streamedEvents
+    }
+
+    init(modelResponses: [Result<[Model], Error>], streamedEvents: [MeshEvent]) {
         self.remainingModelResponses = modelResponses
         self.streamedEvents = streamedEvents
     }
@@ -85,7 +114,7 @@ private actor MockMeshExampleClient: MeshExampleClient {
         if remainingModelResponses.isEmpty {
             return []
         }
-        return remainingModelResponses.removeFirst()
+        return try remainingModelResponses.removeFirst().get()
     }
 
     nonisolated func chatStream(_ request: ChatRequest) -> AsyncThrowingStream<MeshEvent, Error> {
@@ -111,6 +140,10 @@ private actor MockMeshExampleClient: MeshExampleClient {
     private func streamedEventsSnapshot() -> [MeshEvent] {
         streamedEvents
     }
+}
+
+private enum TestError: Error {
+    case transient
 }
 
 private final class LockedLines: @unchecked Sendable {
