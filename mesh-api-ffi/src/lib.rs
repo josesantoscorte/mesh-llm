@@ -376,11 +376,12 @@ fn run_client_worker(mut client: MeshClient, command_rx: mpsc::Receiver<ClientCo
     while let Ok(command) = command_rx.recv() {
         match command {
             ClientCommand::Join { response_tx } => {
-                let result = block_on(client.join()).map_err(|_| FfiError::JoinFailed);
+                let result = client.join_blocking().map_err(|_| FfiError::JoinFailed);
                 let _ = response_tx.send(result);
             }
             ClientCommand::ListModels { response_tx } => {
-                let result = block_on(client.list_models())
+                let result = client
+                    .list_models_blocking()
                     .map(|models| {
                         models
                             .into_iter()
@@ -428,17 +429,19 @@ fn run_client_worker(mut client: MeshClient, command_rx: mpsc::Receiver<ClientCo
                 client.cancel(RequestId(request_id));
             }
             ClientCommand::Status { response_tx } => {
-                let status = block_on(client.status());
+                let status = client.status_blocking();
                 let _ = response_tx.send(StatusDto {
                     connected: status.connected,
                     peer_count: status.peer_count as u64,
                 });
             }
             ClientCommand::Disconnect => {
-                block_on(client.disconnect());
+                client.disconnect_blocking();
             }
             ClientCommand::Reconnect { response_tx } => {
-                let result = block_on(client.reconnect()).map_err(|_| FfiError::ReconnectFailed);
+                let result = client
+                    .reconnect_blocking()
+                    .map_err(|_| FfiError::ReconnectFailed);
                 let _ = response_tx.send(result);
             }
             ClientCommand::Shutdown => break,

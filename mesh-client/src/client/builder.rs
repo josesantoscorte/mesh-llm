@@ -154,10 +154,22 @@ pub struct MeshClient {
 }
 
 impl MeshClient {
+    fn block_on<F>(&self, future: F) -> F::Output
+    where
+        F: Future,
+    {
+        self.runtime.handle().block_on(future)
+    }
+
     /// Join the mesh using the invite token.
     pub async fn join(&mut self) -> Result<(), ClientError> {
         let _ = self.ensure_connected().await?;
         Ok(())
+    }
+
+    pub fn join_blocking(&mut self) -> Result<(), ClientError> {
+        let handle = self.runtime.handle().clone();
+        handle.block_on(self.join())
     }
 
     /// List available models on the mesh.
@@ -189,6 +201,10 @@ impl MeshClient {
         });
 
         Ok(models)
+    }
+
+    pub fn list_models_blocking(&self) -> Result<Vec<Model>, ClientError> {
+        self.block_on(self.list_models())
     }
 
     /// Start a chat completion request. Sync — returns a `RequestId` immediately.
@@ -304,12 +320,21 @@ impl MeshClient {
         }
     }
 
+    pub fn status_blocking(&self) -> Status {
+        self.block_on(self.status())
+    }
+
     pub async fn disconnect(&mut self) {
         self.user_disconnected = true;
         self.clear_connection();
         self.emit_event(crate::events::Event::Disconnected {
             reason: "disconnect_requested".to_string(),
         });
+    }
+
+    pub fn disconnect_blocking(&mut self) {
+        let handle = self.runtime.handle().clone();
+        handle.block_on(self.disconnect())
     }
 
     pub async fn reconnect(&mut self) -> Result<(), ClientError> {
@@ -320,6 +345,11 @@ impl MeshClient {
             reason: "reconnect_requested".to_string(),
         });
         self.join().await
+    }
+
+    pub fn reconnect_blocking(&mut self) -> Result<(), ClientError> {
+        let handle = self.runtime.handle().clone();
+        handle.block_on(self.reconnect())
     }
 
     async fn ensure_connected(&self) -> Result<Connection, ClientError> {

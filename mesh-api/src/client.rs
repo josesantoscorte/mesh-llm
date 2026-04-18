@@ -76,11 +76,25 @@ impl MeshClient {
         Ok(())
     }
 
+    pub fn join_blocking(&mut self) -> Result<(), MeshApiError> {
+        self.inner.join_blocking()?;
+        Ok(())
+    }
+
     pub async fn list_models(&self) -> Result<Vec<Model>, MeshApiError> {
         Ok(self
             .inner
             .list_models()
             .await?
+            .into_iter()
+            .map(Model::from)
+            .collect())
+    }
+
+    pub fn list_models_blocking(&self) -> Result<Vec<Model>, MeshApiError> {
+        Ok(self
+            .inner
+            .list_models_blocking()?
             .into_iter()
             .map(Model::from)
             .collect())
@@ -114,12 +128,25 @@ impl MeshClient {
         Status::from(self.inner.status().await)
     }
 
+    pub fn status_blocking(&self) -> Status {
+        Status::from(self.inner.status_blocking())
+    }
+
     pub async fn disconnect(&mut self) {
         self.inner.disconnect().await;
     }
 
+    pub fn disconnect_blocking(&mut self) {
+        self.inner.disconnect_blocking();
+    }
+
     pub async fn reconnect(&mut self) -> Result<(), MeshApiError> {
         self.inner.reconnect().await?;
+        Ok(())
+    }
+
+    pub fn reconnect_blocking(&mut self) -> Result<(), MeshApiError> {
+        self.inner.reconnect_blocking()?;
         Ok(())
     }
 }
