@@ -253,16 +253,40 @@ This design only works if we have a primitive to move between:
 - per-expert artifact
 - runnable local shard
 
-So we need one of:
+## llama-moe-split Decision
 
-- an extension to `llama-moe-split`, or
-- a new sibling tool in the llama.cpp fork
+The decision is:
 
-That tool needs to support:
+- keep `llama-moe-split` as the stable runnable-shard tool
+- do not turn it into a kitchen-sink CLI for the new artifact workflow
+- extract shared internals underneath it as needed
+- add a new sibling tool in the llama.cpp fork for expert component work
+
+Why:
+
+- `llama-moe-split` already has a clear meaning: take a full GGUF and emit a
+  runnable shard GGUF
+- mesh-llm already depends on that behavior today
+- the new expert-components path is a different abstraction: extract trunk,
+  extract per-expert components, and assemble a shard later
+- keeping the current split path stable gives us a low-risk fallback while the
+  new path is being proven out
+
+Recommended implementation structure:
+
+- move shared tensor-selection and GGUF-writing logic into reusable internal
+  code in the llama.cpp fork
+- keep `llama-moe-split` as the compatibility and fallback path
+- add a sibling tool for the expert-components workflow
+
+That new sibling tool should support:
 
 - extract trunk
 - extract a single expert
 - assemble `trunk + selected experts -> runnable shard.gguf`
+
+The exact tool name is still open, but it should be a separate tool or cleanly
+separated subcommand surface, not a semantic rewrite of `llama-moe-split`.
 
 Without that assembly step, `serve` cannot consume the published expert
 components because `llama-server` still expects a runnable shard GGUF.
