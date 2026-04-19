@@ -366,6 +366,7 @@ pub(crate) async fn api_proxy(
                                 &request.raw,
                                 request.response_adapter,
                                 &affinity,
+                                &tracker,
                             )
                             .await;
                             proxy::release_request_objects(

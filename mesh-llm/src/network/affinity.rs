@@ -987,14 +987,21 @@ pub const SMALL_PROMPT_TOKENS: u32 = 1024;
 /// TTFB multiplier for computing proportional timeouts from history.
 pub const TTFB_TIMEOUT_MULTIPLIER: u32 = 3;
 
+/// How long TTFB samples stay relevant. Samples older than this are
+/// ignored by `median()` and `is_slow()`. This prevents stale data from
+/// permanently marking a model as slow after it recovers — once all
+/// samples expire, the model is treated as unknown (not slow) and auto
+/// routing will try it again, learning a fresh sample.
+pub const TTFB_SAMPLE_TTL: Duration = Duration::from_secs(120);
+
 /// Per-model ring buffer of recent TTFB (time-to-first-byte) samples.
 ///
 /// Used by auto routing to detect slow/overloaded models and route
 /// around them. Each node tracks its own experience — nothing is
-/// gossiped.
+/// gossiped. Samples expire after `TTFB_SAMPLE_TTL`.
 #[derive(Debug)]
 struct ModelTtfbRing {
-    samples: VecDeque<Duration>,
+    samples: VecDeque<(Instant, Duration)>,
 }
 
 impl ModelTtfbRing {
@@ -1008,17 +1015,27 @@ impl ModelTtfbRing {
         if self.samples.len() >= TTFB_RING_SIZE {
             self.samples.pop_front();
         }
-        self.samples.push_back(ttfb);
+        self.samples.push_back((Instant::now(), ttfb));
     }
 
-    /// Median of recorded samples. Returns None if empty.
+    /// Return only samples younger than `TTFB_SAMPLE_TTL`.
+    fn fresh_samples(&self) -> Vec<Duration> {
+        let cutoff = Instant::now() - TTFB_SAMPLE_TTL;
+        self.samples
+            .iter()
+            .filter(|(ts, _)| *ts > cutoff)
+            .map(|(_, d)| *d)
+            .collect()
+    }
+
+    /// Median of non-expired samples. Returns None if all expired or empty.
     fn median(&self) -> Option<Duration> {
-        if self.samples.is_empty() {
+        let mut fresh = self.fresh_samples();
+        if fresh.is_empty() {
             return None;
         }
-        let mut sorted: Vec<Duration> = self.samples.iter().copied().collect();
-        sorted.sort();
-        Some(sorted[sorted.len() / 2])
+        fresh.sort();
+        Some(fresh[fresh.len() / 2])
     }
 
     fn is_slow(&self, threshold: Duration) -> bool {
@@ -1247,5 +1264,27 @@ mod ttfb_tests {
         tracker.record("fast-model", Duration::from_secs(2));
         let result = affinity.lookup_auto_model_if_responsive(0xBEEF, &tracker);
         assert_eq!(result, Some("fast-model".to_string()));
+    }
+
+    #[test]
+    fn fresh_samples_includes_recent_excludes_nothing_when_fresh() {
+        // All samples are created now, so all should be fresh
+        let tracker = ModelLatencyTracker::new();
+        tracker.record("model", Duration::from_secs(30));
+        tracker.record("model", Duration::from_secs(40));
+        tracker.record("model", Duration::from_secs(50));
+        // All 3 samples are < 2 minutes old, so median should be 40s
+        assert_eq!(tracker.median_ttfb("model"), Some(Duration::from_secs(40)));
+        assert!(tracker.is_slow("model", TTFB_SLOW_THRESHOLD));
+    }
+
+    #[test]
+    fn no_samples_means_not_slow() {
+        // Empty tracker: model is unknown, treated as not slow.
+        // This is the key behavior for expiry — when all samples expire,
+        // is_slow returns false, allowing auto to try the model again.
+        let tracker = ModelLatencyTracker::new();
+        assert!(!tracker.is_slow("model", TTFB_SLOW_THRESHOLD));
+        assert_eq!(tracker.median_ttfb("model"), None);
     }
 }

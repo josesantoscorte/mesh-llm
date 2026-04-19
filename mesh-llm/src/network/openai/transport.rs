@@ -1560,26 +1560,6 @@ async fn route_local_attempt(
     }
 }
 
-async fn route_remote_attempt(
-    node: &mesh::Node,
-    tcp_stream: &mut TcpStream,
-    host_id: iroh::EndpointId,
-    prefetched: &[u8],
-    retry_context_overflow: bool,
-    response_adapter: ResponseAdapter,
-) -> RouteAttemptResult {
-    route_remote_attempt_with_timeout(
-        node,
-        tcp_stream,
-        host_id,
-        prefetched,
-        retry_context_overflow,
-        response_adapter,
-        None,
-    )
-    .await
-}
-
 async fn route_remote_attempt_with_timeout(
     node: &mesh::Node,
     tcp_stream: &mut TcpStream,
@@ -2236,6 +2216,7 @@ async fn route_attempt_for_target(
     prefetched: &[u8],
     retry_context_overflow: bool,
     response_adapter: ResponseAdapter,
+    custom_timeout: Option<Duration>,
 ) -> RouteAttemptResult {
     match target {
         election::InferenceTarget::Local(port) | election::InferenceTarget::MoeLocal(port) => {
@@ -2251,13 +2232,14 @@ async fn route_attempt_for_target(
         }
         election::InferenceTarget::Remote(host_id)
         | election::InferenceTarget::MoeRemote(host_id) => {
-            route_remote_attempt(
+            route_remote_attempt_with_timeout(
                 node,
                 tcp_stream,
                 *host_id,
                 prefetched,
                 retry_context_overflow,
                 response_adapter,
+                custom_timeout,
             )
             .await
         }
@@ -2275,6 +2257,7 @@ pub async fn route_model_request(
     prefetched: &[u8],
     response_adapter: ResponseAdapter,
     affinity: &AffinityRouter,
+    ttfb_tracker: &crate::network::affinity::ModelLatencyTracker,
 ) -> bool {
     let route_started = Instant::now();
     let mut tcp_stream = tcp_stream;
@@ -2329,6 +2312,15 @@ pub async fn route_model_request(
     let total_targets = ordered.len();
     let mut attempts = 0usize;
     let mut refreshed = false;
+    // When multiple targets exist, use adaptive timeout so we bail early
+    // on a drowning host and try the next. With a single target, use the
+    // full default timeout — nowhere else to go, 429 gate is protection.
+    let custom_timeout = if total_targets > 1 {
+        Some(ttfb_tracker.first_byte_timeout(model, required_tokens, response_first_byte_timeout()))
+    } else {
+        None
+    };
+
     for (idx, target) in ordered.into_iter().enumerate() {
         attempts += 1;
         let attempt_started = Instant::now();
@@ -2340,6 +2332,7 @@ pub async fn route_model_request(
             prefetched,
             retry_context_overflow,
             response_adapter,
+            custom_timeout,
         )
         .await;
         tracing::info!(
@@ -2354,6 +2347,7 @@ pub async fn route_model_request(
         );
         match attempt_result {
             RouteAttemptResult::Delivered { status_code } => {
+                ttfb_tracker.record(model, route_started.elapsed());
                 if should_learn_affinity(status_code) {
                     if let Some(prefix_hash) = selection.learn_prefix_hash {
                         affinity.learn_target(model, prefix_hash, &target);
@@ -2485,6 +2479,7 @@ pub async fn route_moe_request(
             prefetched,
             retry_context_overflow,
             ResponseAdapter::None,
+            None, // MoE uses default timeout
         )
         .await;
         tracing::info!(
@@ -2578,6 +2573,7 @@ pub async fn route_to_target(
         prefetched,
         false,
         response_adapter,
+        None, // single target, default timeout
     )
     .await;
     tracing::info!(
