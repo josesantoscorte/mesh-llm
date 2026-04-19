@@ -3,7 +3,9 @@ use crate::{InviteToken, OwnerKeypair};
 use mesh_client::ClientError;
 use std::sync::Arc;
 use std::time::Duration;
-use thiserror::Error;
+use thiserror::Error;'
+
+
 
 pub const MAX_RECONNECT_ATTEMPTS: u32 = mesh_client::client::builder::MAX_RECONNECT_ATTEMPTS;
 
