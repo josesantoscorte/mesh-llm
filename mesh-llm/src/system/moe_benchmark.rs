@@ -241,6 +241,18 @@ struct PackageCalibrationBaselineCache {
     outputs: Vec<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct PackageCalibrationCandidateCache {
+    version: u32,
+    ranking_hash: String,
+    corpus_hashes: Vec<(String, String)>,
+    max_tokens: u32,
+    context_size: u32,
+    n_gpu_layers: u32,
+    min_experts_per_node: u32,
+    report: PackageCalibrationCandidateReport,
+}
+
 struct LoadedCalibrationCorpus {
     source: PromptImportSource,
     prompts: Vec<PromptCorpusEntry>,
@@ -254,7 +266,7 @@ struct LocalServerRunner {
     child: Child,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct PackageCalibrationCandidateReport {
     min_experts_per_node: u32,
     node_count: usize,
@@ -264,10 +276,10 @@ struct PackageCalibrationCandidateReport {
     corpora: Vec<PackageCalibrationCandidateCorpusReport>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct PackageCalibrationCandidateCorpusReport {
-    source: &'static str,
-    dataset: &'static str,
+    source: String,
+    dataset: String,
     prompt_count: usize,
     mean_score: f64,
     worst_node_score: f64,
@@ -514,6 +526,10 @@ pub(crate) async fn run_local_package_calibration_benchmark(
         }
         if passes {
             passing_bound = Some(min_experts);
+        } else if min_experts == search_ceiling {
+            bail!(
+                "Identity benchmark candidate failed the quality floor. The full-model control path is not matching the baseline closely enough, so the calibration result is not trustworthy."
+            );
         } else if passing_bound.is_some() {
             failing_bound = Some(min_experts);
             break;
@@ -611,6 +627,17 @@ async fn evaluate_package_benchmark_candidate(
     temp_root: &Path,
 ) -> Result<PackageCalibrationCandidateReport> {
     let candidate_started = Instant::now();
+    if let Some(report) = load_candidate_cache(&model.path, min_experts, ranking_vec, corpora)? {
+        eprintln!(
+            "   candidate {}: min_experts_per_node={} -> cached mean={:.3} worst={:.3} ({:.1}s)",
+            candidate_index,
+            min_experts,
+            report.mean_score,
+            report.worst_node_score,
+            candidate_started.elapsed().as_secs_f64()
+        );
+        return Ok(report);
+    }
     let node_count = ((model.expert_count as f64) / (min_experts as f64))
         .ceil()
         .max(1.0) as usize;
@@ -624,6 +651,7 @@ async fn evaluate_package_benchmark_candidate(
     if identity_candidate {
         eprintln!("     identity candidate: using original model without assembly");
     }
+    let node_order = package_benchmark_node_order(ranking_vec, &assignments);
     let assembly_concurrency =
         benchmark_assembly_concurrency(temp_root, model.total_model_bytes, assignments.len());
     let mut node_scores = vec![0.0; assignments.len()];
@@ -653,7 +681,8 @@ async fn evaluate_package_benchmark_candidate(
         let mut next_index = 0usize;
         let mut join_set = JoinSet::new();
 
-        while next_index < assignments.len() && join_set.len() < assembly_concurrency {
+        while next_index < node_order.len() && join_set.len() < assembly_concurrency {
+            let node_index = node_order[next_index];
             queue_candidate_shard_assembly(
                 &mut join_set,
                 bin_dir,
@@ -662,6 +691,7 @@ async fn evaluate_package_benchmark_candidate(
                 min_experts,
                 &assignments,
                 next_index,
+                node_index,
             );
             next_index += 1;
         }
@@ -675,7 +705,8 @@ async fn evaluate_package_benchmark_candidate(
                 shard_path.display()
             );
 
-            while next_index < assignments.len() && join_set.len() < assembly_concurrency {
+            while next_index < node_order.len() && join_set.len() < assembly_concurrency {
+                let node_index = node_order[next_index];
                 queue_candidate_shard_assembly(
                     &mut join_set,
                     bin_dir,
@@ -684,6 +715,7 @@ async fn evaluate_package_benchmark_candidate(
                     min_experts,
                     &assignments,
                     next_index,
+                    node_index,
                 );
                 next_index += 1;
             }
@@ -700,6 +732,15 @@ async fn evaluate_package_benchmark_candidate(
                 &mut corpus_node_scores,
             )
             .await?;
+
+            if node_failed_quality_floor(node_index, &corpus_node_scores) {
+                eprintln!(
+                    "     short-circuit: node {}/{} fell below quality floor; stopping candidate early",
+                    node_index + 1,
+                    assignments.len()
+                );
+                break;
+            }
         }
     }
 
@@ -713,8 +754,8 @@ async fn evaluate_package_benchmark_candidate(
             let corpus_mean_score = mean_score(&node_scores);
             let worst_node_score = node_scores.iter().copied().fold(1.0_f64, f64::min);
             PackageCalibrationCandidateCorpusReport {
-                source: corpus.source.short_name(),
-                dataset: corpus.source.dataset_name(),
+                source: corpus.source.short_name().to_string(),
+                dataset: corpus.source.dataset_name().to_string(),
                 prompt_count: corpus.prompts.len(),
                 mean_score: corpus_mean_score,
                 worst_node_score,
@@ -730,14 +771,16 @@ async fn evaluate_package_benchmark_candidate(
         candidate_started.elapsed().as_secs_f64()
     );
 
-    Ok(PackageCalibrationCandidateReport {
+    let report = PackageCalibrationCandidateReport {
         min_experts_per_node: min_experts,
         node_count,
         mean_score: candidate_mean_score,
         worst_node_score,
         node_scores,
         corpora: corpus_reports,
-    })
+    };
+    save_candidate_cache(&model.path, min_experts, ranking_vec, corpora, &report)?;
+    Ok(report)
 }
 
 async fn evaluate_package_benchmark_node(
@@ -791,6 +834,7 @@ async fn evaluate_package_benchmark_node(
             &corpus.prompts,
             &format!("{runner_label} [{}]", corpus.source.short_name()),
             request_concurrency,
+            Some(&corpus.baseline_outputs),
         )
         .await
         {
@@ -809,6 +853,15 @@ async fn evaluate_package_benchmark_node(
                     corpus_mean,
                     corpus_started.elapsed().as_secs_f64()
                 );
+                if corpus_mean < PACKAGE_BENCHMARK_QUALITY_FLOOR {
+                    eprintln!(
+                        "       short-circuit: {} fell below quality floor on node {}/{}",
+                        corpus.source.short_name(),
+                        node_index + 1,
+                        node_count
+                    );
+                    break;
+                }
             }
             Err(err) => {
                 node_result = Err(err);
@@ -829,11 +882,45 @@ async fn evaluate_package_benchmark_node(
     Ok(())
 }
 
+fn node_failed_quality_floor(node_index: usize, corpus_node_scores: &[Vec<f64>]) -> bool {
+    corpus_node_scores.iter().any(|scores| {
+        scores.get(node_index).copied().unwrap_or(0.0) < PACKAGE_BENCHMARK_QUALITY_FLOOR
+    })
+}
+
 fn package_candidate_passes_quality_floor(candidate: &PackageCalibrationCandidateReport) -> bool {
     candidate
         .corpora
         .iter()
         .all(|corpus| corpus.worst_node_score >= PACKAGE_BENCHMARK_QUALITY_FLOOR)
+}
+
+fn package_benchmark_node_order(
+    ranking: &[u32],
+    assignments: &[moe::NodeAssignment],
+) -> Vec<usize> {
+    let rank_positions = ranking
+        .iter()
+        .enumerate()
+        .map(|(idx, expert)| (*expert, idx))
+        .collect::<HashMap<_, _>>();
+    let mut order = assignments
+        .iter()
+        .enumerate()
+        .map(|(node_index, assignment)| {
+            let risk_score = assignment
+                .experts
+                .iter()
+                .map(|expert| rank_positions.get(expert).copied().unwrap_or(ranking.len()))
+                .sum::<usize>();
+            (node_index, risk_score)
+        })
+        .collect::<Vec<_>>();
+    order.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    order
+        .into_iter()
+        .map(|(node_index, _)| node_index)
+        .collect()
 }
 
 fn package_benchmark_search_floor(model: &moe_planner::MoeModelContext) -> u32 {
@@ -1141,6 +1228,80 @@ fn prompt_corpus_hash(prompts: &[PromptCorpusEntry]) -> Result<String> {
     Ok(hex::encode(sha2::Sha256::digest(bytes)))
 }
 
+fn ranking_hash(ranking: &[u32]) -> Result<String> {
+    let bytes = serde_json::to_vec(ranking).context("Serialize ranking for benchmark hash")?;
+    Ok(hex::encode(sha2::Sha256::digest(bytes)))
+}
+
+fn candidate_cache_path(model_path: &Path, min_experts: u32) -> PathBuf {
+    moe::package_cache_variant_dir(model_path)
+        .join("benchmark-candidates")
+        .join(format!("min-{min_experts}.json"))
+}
+
+fn candidate_corpus_hashes(corpora: &[LoadedCalibrationCorpus]) -> Result<Vec<(String, String)>> {
+    corpora
+        .iter()
+        .map(|corpus| {
+            Ok((
+                corpus.source.short_name().to_string(),
+                prompt_corpus_hash(&corpus.prompts)?,
+            ))
+        })
+        .collect()
+}
+
+fn load_candidate_cache(
+    model_path: &Path,
+    min_experts: u32,
+    ranking: &[u32],
+    corpora: &[LoadedCalibrationCorpus],
+) -> Result<Option<PackageCalibrationCandidateReport>> {
+    let cache_path = candidate_cache_path(model_path, min_experts);
+    let Ok(content) = fs::read_to_string(&cache_path) else {
+        return Ok(None);
+    };
+    let cache: PackageCalibrationCandidateCache = serde_json::from_str(&content)
+        .with_context(|| format!("Parse {}", cache_path.display()))?;
+    if cache.version != PACKAGE_BENCHMARK_VERSION
+        || cache.min_experts_per_node != min_experts
+        || cache.ranking_hash != ranking_hash(ranking)?
+        || cache.corpus_hashes != candidate_corpus_hashes(corpora)?
+        || cache.max_tokens != PACKAGE_BENCHMARK_MAX_TOKENS
+        || cache.context_size != PACKAGE_BENCHMARK_CONTEXT_SIZE
+        || cache.n_gpu_layers != PACKAGE_BENCHMARK_GPU_LAYERS
+    {
+        return Ok(None);
+    }
+    Ok(Some(cache.report))
+}
+
+fn save_candidate_cache(
+    model_path: &Path,
+    min_experts: u32,
+    ranking: &[u32],
+    corpora: &[LoadedCalibrationCorpus],
+    report: &PackageCalibrationCandidateReport,
+) -> Result<()> {
+    let cache = PackageCalibrationCandidateCache {
+        version: PACKAGE_BENCHMARK_VERSION,
+        ranking_hash: ranking_hash(ranking)?,
+        corpus_hashes: candidate_corpus_hashes(corpora)?,
+        max_tokens: PACKAGE_BENCHMARK_MAX_TOKENS,
+        context_size: PACKAGE_BENCHMARK_CONTEXT_SIZE,
+        n_gpu_layers: PACKAGE_BENCHMARK_GPU_LAYERS,
+        min_experts_per_node: min_experts,
+        report: report.clone(),
+    };
+    let path = candidate_cache_path(model_path, min_experts);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, serde_json::to_string_pretty(&cache)? + "\n")
+        .with_context(|| format!("Write {}", path.display()))?;
+    Ok(())
+}
+
 fn load_baseline_cache(
     model_path: &Path,
     source: PromptImportSource,
@@ -1223,7 +1384,7 @@ async fn load_or_create_baseline_outputs(
     )
     .await?;
     let outputs =
-        evaluate_prompts_with_server(&runner, prompts, "baseline", request_concurrency).await;
+        evaluate_prompts_with_server(&runner, prompts, "baseline", request_concurrency, None).await;
     runner.shutdown().await;
     let outputs = outputs?;
     save_baseline_cache(&model.path, source, dataset, prompts, &outputs)?;
@@ -1278,7 +1439,27 @@ async fn load_package_benchmark_corpora(
             baseline_outputs,
         });
     }
+    corpora.sort_by_key(corpus_estimated_cost);
     Ok(corpora)
+}
+
+fn corpus_estimated_cost(corpus: &LoadedCalibrationCorpus) -> (usize, usize, &'static str) {
+    let total_chars = corpus
+        .prompts
+        .iter()
+        .map(|prompt| {
+            prompt
+                .messages
+                .iter()
+                .map(|message| message.content.len())
+                .sum::<usize>()
+        })
+        .sum::<usize>();
+    (
+        total_chars,
+        corpus.prompts.len(),
+        corpus.source.short_name(),
+    )
 }
 
 fn queue_candidate_shard_assembly(
@@ -1288,6 +1469,7 @@ fn queue_candidate_shard_assembly(
     temp_root: &Path,
     min_experts: u32,
     assignments: &[moe::NodeAssignment],
+    _queue_index: usize,
     node_index: usize,
 ) {
     let experts = assignments[node_index].experts.clone();
@@ -1480,6 +1662,7 @@ async fn evaluate_prompts_with_server(
     prompts: &[PromptCorpusEntry],
     phase_label: &str,
     request_concurrency: usize,
+    baseline_outputs: Option<&[String]>,
 ) -> Result<Vec<String>> {
     let phase_started = Instant::now();
     let mut outputs: Vec<Option<String>> = vec![None; prompts.len()];
@@ -1535,6 +1718,21 @@ async fn evaluate_prompts_with_server(
         outputs[index] = Some(output);
         completed += 1;
         eprintln!("       progress: {completed}/{} prompt(s)", prompts.len());
+        if let Some(baseline_outputs) = baseline_outputs {
+            if let Some(running_mean) =
+                prompt_cutoff_running_mean(&outputs, baseline_outputs, completed, prompts.len())
+            {
+                let remaining = prompts.len().saturating_sub(completed);
+                if prompt_cutoff_cannot_recover(running_mean, completed, remaining) {
+                    eprintln!(
+                        "       short-circuit: running mean {:.3} cannot recover above quality floor with {} prompt(s) remaining",
+                        running_mean,
+                        remaining
+                    );
+                    break;
+                }
+            }
+        }
     }
 
     let outputs = outputs
@@ -1546,6 +1744,33 @@ async fn evaluate_prompts_with_server(
         phase_started.elapsed().as_secs_f64()
     );
     Ok(outputs)
+}
+
+fn prompt_cutoff_running_mean(
+    outputs: &[Option<String>],
+    baseline_outputs: &[String],
+    completed: usize,
+    total: usize,
+) -> Option<f64> {
+    if completed == 0 || baseline_outputs.len() != total || outputs.len() != total {
+        return None;
+    }
+    let mut sum = 0.0;
+    let mut seen = 0usize;
+    for (candidate, baseline) in outputs.iter().zip(baseline_outputs) {
+        let Some(candidate) = candidate.as_ref() else {
+            continue;
+        };
+        sum += token_dice_similarity(baseline, candidate);
+        seen += 1;
+    }
+    (seen == completed).then_some(sum / completed as f64)
+}
+
+fn prompt_cutoff_cannot_recover(running_mean: f64, completed: usize, remaining: usize) -> bool {
+    let best_possible = ((running_mean * completed as f64) + remaining as f64)
+        / (completed + remaining).max(1) as f64;
+    best_possible < PACKAGE_BENCHMARK_QUALITY_FLOOR
 }
 
 async fn request_server_completion(
