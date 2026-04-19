@@ -2225,6 +2225,7 @@ async fn route_attempt_for_target(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn route_model_request(
     node: mesh::Node,
     tcp_stream: TcpStream,
@@ -2235,7 +2236,6 @@ pub async fn route_model_request(
     prefetched: &[u8],
     response_adapter: ResponseAdapter,
     affinity: &AffinityRouter,
-    ttfb_tracker: &crate::network::affinity::ModelLatencyTracker,
 ) -> bool {
     let route_started = Instant::now();
     let mut tcp_stream = tcp_stream;
@@ -2290,15 +2290,6 @@ pub async fn route_model_request(
     let total_targets = ordered.len();
     let mut attempts = 0usize;
     let mut refreshed = false;
-    // When multiple targets exist, use adaptive timeout so we bail early
-    // on a drowning host and try the next. With a single target, use the
-    // full default timeout — nowhere else to go, 429 gate is protection.
-    let custom_timeout = if total_targets > 1 {
-        Some(ttfb_tracker.first_byte_timeout(model, required_tokens, response_first_byte_timeout()))
-    } else {
-        None
-    };
-
     for (idx, target) in ordered.into_iter().enumerate() {
         attempts += 1;
         let attempt_started = Instant::now();
@@ -2310,7 +2301,7 @@ pub async fn route_model_request(
             prefetched,
             retry_context_overflow,
             response_adapter,
-            custom_timeout,
+            None, // explicit model: use default timeout, 429 gate is the protection
         )
         .await;
         tracing::info!(
@@ -2325,7 +2316,6 @@ pub async fn route_model_request(
         );
         match attempt_result {
             RouteAttemptResult::Delivered { status_code } => {
-                ttfb_tracker.record(model, route_started.elapsed());
                 if should_learn_affinity(status_code) {
                     if let Some(prefix_hash) = selection.learn_prefix_hash {
                         affinity.learn_target(model, prefix_hash, &target);
@@ -2406,6 +2396,7 @@ pub async fn route_model_request(
     true
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn route_moe_request(
     node: mesh::Node,
     tcp_stream: TcpStream,

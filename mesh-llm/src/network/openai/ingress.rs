@@ -208,7 +208,7 @@ pub(crate) async fn api_proxy(
 
                     let use_pipeline = classification
                         .as_ref()
-                        .map(|cl| pipeline::should_pipeline(cl))
+                        .map(pipeline::should_pipeline)
                         .unwrap_or(false)
                         && request.response_adapter == proxy::ResponseAdapter::None;
 
@@ -366,7 +366,6 @@ pub(crate) async fn api_proxy(
                                 &request.raw,
                                 request.response_adapter,
                                 &affinity,
-                                &tracker,
                             )
                             .await;
                             proxy::release_request_objects(
@@ -394,7 +393,6 @@ pub(crate) async fn api_proxy(
                 }
                 Err(err) => {
                     let _ = proxy::send_400(tcp_stream, &err.to_string()).await;
-                    return;
                 }
             };
         });
@@ -461,12 +459,12 @@ pub(crate) fn callable_models(targets: &election::ModelTargets) -> Vec<String> {
     let mut models: Vec<String> = targets
         .targets
         .iter()
-        .filter_map(|(name, hosts)| {
+        .filter(|(_, hosts)| {
             hosts
                 .iter()
                 .any(|target| !matches!(target, election::InferenceTarget::None))
-                .then(|| name.clone())
         })
+        .map(|(name, _)| name.clone())
         .collect();
     models.sort();
     models
