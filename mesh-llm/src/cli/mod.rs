@@ -271,6 +271,10 @@ pub(crate) struct Cli {
     #[arg(long, default_value = "3131")]
     pub(crate) console: u16,
 
+    /// Disable the embedded web UI but keep the management API on the --console port.
+    #[arg(long)]
+    pub(crate) headless: bool,
+
     /// Publish this mesh for discovery by others.
     #[arg(long)]
     pub(crate) publish: bool,
@@ -336,7 +340,7 @@ pub(crate) struct Cli {
     #[arg(long, value_enum)]
     pub(crate) llama_flavor: Option<crate::inference::launch::BinaryFlavor>,
 
-    /// Device for rpc-server (e.g. MTL0, CUDA0, HIP0, Vulkan0, CPU).
+    /// Device for rpc-server (e.g. MTL0, CUDA0, ROCm0, Vulkan0, CPU).
     #[arg(long, hide = true)]
     pub(crate) device: Option<String>,
 
@@ -710,7 +714,8 @@ fn shell_display(arg: &OsString) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::Parser;
+    use crate::cli::moe::MoeAnalyzeCommand;
+    use clap::{CommandFactory, Parser};
 
     #[test]
     fn normalize_runtime_surface_args_rewrites_serve_invocation() {
@@ -863,6 +868,65 @@ mod tests {
     }
 
     #[test]
+    fn moe_analyze_full_accepts_share_flag() {
+        let cli = Cli::parse_from([
+            "mesh-llm",
+            "moe",
+            "analyze",
+            "full",
+            "Qwen/Qwen3",
+            "--share",
+            "--dataset-repo",
+            "meshllm/custom-rankings",
+        ]);
+
+        match cli.command.expect("moe command expected") {
+            Command::Moe {
+                command:
+                    MoeCommand::Analyze {
+                        command:
+                            MoeAnalyzeCommand::Full {
+                                share,
+                                hf_job,
+                                model,
+                                ..
+                            },
+                    },
+            } => {
+                assert!(share);
+                assert_eq!(model, "Qwen/Qwen3");
+                assert_eq!(hf_job.dataset_repo, "meshllm/custom-rankings");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn moe_analyze_micro_accepts_share_flag() {
+        let cli = Cli::parse_from([
+            "mesh-llm",
+            "moe",
+            "analyze",
+            "micro",
+            "Qwen/Qwen3",
+            "--share",
+        ]);
+
+        match cli.command.expect("moe command expected") {
+            Command::Moe {
+                command:
+                    MoeCommand::Analyze {
+                        command: MoeAnalyzeCommand::Micro { share, model, .. },
+                    },
+            } => {
+                assert!(share);
+                assert_eq!(model, "Qwen/Qwen3");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
     fn gpus_command_accepts_json_flag() {
         let cli = Cli::parse_from(["mesh-llm", "gpus", "--json"]);
 
@@ -899,5 +963,41 @@ mod tests {
             } => {}
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn cli_accepts_headless_flag_for_serve_surface() {
+        let args = vec!["mesh-llm", "serve", "--headless", "--auto"];
+        let normalized = normalize_runtime_surface_args(args);
+        let cli = Cli::try_parse_from(&normalized.normalized).unwrap();
+        assert!(cli.headless);
+    }
+
+    #[test]
+    fn cli_accepts_headless_flag_for_client_surface() {
+        let args = vec!["mesh-llm", "client", "--headless", "--auto"];
+        let normalized = normalize_runtime_surface_args(args);
+        let cli = Cli::try_parse_from(&normalized.normalized).unwrap();
+        assert!(cli.headless);
+    }
+
+    #[test]
+    fn legacy_no_console_remains_ignored_in_headless_tests() {
+        let args = vec!["mesh-llm", "serve", "--no-console"];
+        let normalized = normalize_runtime_surface_args(args);
+        let cli = Cli::try_parse_from(&normalized.normalized).unwrap();
+        assert!(
+            !cli.headless,
+            "--no-console must not activate headless mode"
+        );
+    }
+
+    #[test]
+    fn help_text_mentions_headless_keeps_management_api() {
+        let help = Cli::command().render_help().to_string();
+        assert!(
+            help.contains("headless") || help.contains("management API"),
+            "help text should mention headless or management API"
+        );
     }
 }

@@ -812,6 +812,21 @@ pub async fn discover(
 // Smart auto-join: score meshes, detect staleness, prefer geo match
 // ---------------------------------------------------------------------------
 
+/// Is this mesh eligible for `--auto` when the user did not specify `--mesh-name`?
+///
+/// `--auto` joins the default community mesh. Eligible listings are:
+///   - unnamed (the implicit default), or
+///   - the blessed community name "mesh-llm".
+///
+/// Any other named mesh is still publicly discoverable on Nostr, but it is
+/// not the default — the user must opt in by name via `--mesh-name`.
+pub fn is_auto_eligible(mesh: &DiscoveredMesh) -> bool {
+    match mesh.listing.name.as_deref() {
+        None => true,
+        Some(name) => name.eq_ignore_ascii_case("mesh-llm"),
+    }
+}
+
 /// Score a mesh for auto-join. Higher = better.
 /// Considers region match, capacity, and model availability.
 /// Freshness is mostly irrelevant since Nostr listings expire at 120s (TTL=2×60s),
@@ -819,15 +834,22 @@ pub async fn discover(
 pub fn score_mesh(mesh: &DiscoveredMesh, _now_secs: u64, last_mesh_id: Option<&str>) -> i64 {
     let mut score: i64 = 100; // base score — if we can see it, it's alive
 
-    // Target mesh name: very strong bonus if user asked for a specific mesh
-    // Default "mesh-llm" name: moderate bonus for the community mesh
-    // Other named meshes: penalty (they're someone's private group)
-    if let Some(ref name) = mesh.listing.name {
-        if name.eq_ignore_ascii_case("mesh-llm") {
-            score += 300; // prefer the default community mesh
-        } else {
-            score -= 200; // named mesh — probably someone's private group
-        }
+    // The canonical community mesh is an unnamed listing (`name: None`) — that
+    // is what you get by default when you don't pass `--mesh-name`, and it's
+    // what the public relay shows today. Give it a bonus so it ranks above
+    // anything else in `--auto`. The literal name "mesh-llm" is treated as a
+    // defensive alias for the same thing: nothing in the wild publishes with
+    // that name right now, but older docs and test runs may, and if one ever
+    // appears it should rank alongside unnamed rather than below it.
+    //
+    // Other named meshes are excluded from `--auto` entirely by
+    // `is_auto_eligible`, so they don't get a score adjustment here — when
+    // the user targets one via `--mesh-name`, the raw score is what matters
+    // and any bonus or penalty would skew ranking.
+    match mesh.listing.name.as_deref() {
+        None => score += 300,
+        Some(n) if n.eq_ignore_ascii_case("mesh-llm") => score += 300,
+        Some(_) => {}
     }
 
     // Sticky preference: strong bonus for the mesh we were last on
@@ -888,7 +910,10 @@ pub fn smart_auto(
 
     let last_mesh_id = crate::mesh::load_last_mesh_id();
 
-    // If target name is set, only consider meshes with that exact name
+    // If target name is set, only consider meshes with that exact name.
+    // Otherwise `--auto` considers only the community mesh: unnamed listings
+    // plus the blessed name "mesh-llm". Other named meshes are still publicly
+    // discoverable on Nostr but must be opted into by name via `--mesh-name`.
     let candidates: Vec<&DiscoveredMesh> = if let Some(target) = target_name {
         meshes
             .iter()
@@ -901,7 +926,7 @@ pub fn smart_auto(
             })
             .collect()
     } else {
-        meshes.iter().collect()
+        meshes.iter().filter(|m| is_auto_eligible(m)).collect()
     };
 
     // Score and rank
@@ -914,7 +939,7 @@ pub fn smart_auto(
     // Collect viable candidates.
     // If the user specified --mesh-name, take all candidates (they already
     // filtered by name above — the user explicitly asked for this mesh).
-    // Otherwise, require positive score to filter out stale/private meshes.
+    // Otherwise, require positive score to filter out stale meshes.
     let viable: Vec<(String, DiscoveredMesh)> = scored
         .iter()
         .filter(|(_, score)| target_name.is_some() || *score > 0)
@@ -1196,9 +1221,10 @@ mod scoring_tests {
     }
 
     #[test]
-    fn score_community_mesh_bonus() {
+    fn score_unnamed_community_mesh_bonus() {
+        // Unnamed is the canonical community mesh and should get the bonus.
         let mesh = make_mesh(
-            Some("mesh-llm"),
+            None,
             Some("abc"),
             &["Qwen3-8B-Q4_K_M"],
             3,
@@ -1208,11 +1234,38 @@ mod scoring_tests {
         );
         let score = score_mesh(&mesh, 1500, None);
         // base(100) + community(300) + headroom + nodes(15) + models(10)
-        assert!(score > 400, "community mesh should score high, got {score}");
+        assert!(
+            score > 400,
+            "unnamed community mesh should score high, got {score}"
+        );
     }
 
     #[test]
-    fn score_private_mesh_penalty() {
+    fn score_mesh_llm_alias_matches_unnamed() {
+        // "mesh-llm" is a defensive alias for the community mesh and must
+        // score identically to an unnamed listing with equivalent stats.
+        let unnamed = make_mesh(None, Some("u"), &["m1"], 2, 24_000_000_000, 0, 0);
+        let alias = make_mesh(
+            Some("mesh-llm"),
+            Some("a"),
+            &["m1"],
+            2,
+            24_000_000_000,
+            0,
+            0,
+        );
+        assert_eq!(
+            score_mesh(&unnamed, 1500, None),
+            score_mesh(&alias, 1500, None)
+        );
+    }
+
+    #[test]
+    fn score_other_named_mesh_no_community_bonus() {
+        // Non-community named meshes are excluded from --auto entirely by
+        // `is_auto_eligible`; within `score_mesh` they simply don't get the
+        // community bonus. When the user targets one via --mesh-name, the
+        // raw score is what's used to rank.
         let mesh = make_mesh(
             Some("bobs-cluster"),
             Some("xyz"),
@@ -1223,8 +1276,24 @@ mod scoring_tests {
             0,
         );
         let score = score_mesh(&mesh, 1500, None);
-        // base(100) - private(200) + nodes + models = low
-        assert!(score < 100, "private mesh should score low, got {score}");
+        // base(100) + nodes(15) + models(10) — no community bonus, no penalty
+        assert!(
+            score < 300,
+            "non-community named mesh should not get community bonus, got {score}"
+        );
+        assert!(score > 0, "named mesh with real nodes should be positive");
+    }
+
+    #[test]
+    fn other_named_mesh_not_auto_eligible() {
+        let bobs = make_mesh(Some("bobs-cluster"), Some("x"), &[], 1, 0, 0, 0);
+        let community = make_mesh(Some("mesh-llm"), Some("c"), &[], 1, 0, 0, 0);
+        let community_caps = make_mesh(Some("MESH-LLM"), Some("c2"), &[], 1, 0, 0, 0);
+        let unnamed = make_mesh(None, Some("u"), &[], 1, 0, 0, 0);
+        assert!(!is_auto_eligible(&bobs));
+        assert!(is_auto_eligible(&community));
+        assert!(is_auto_eligible(&community_caps));
+        assert!(is_auto_eligible(&unnamed));
     }
 
     #[test]
@@ -1483,17 +1552,46 @@ mod smart_auto_tests {
     }
 
     #[test]
-    fn smart_auto_prefers_community_mesh() {
+    fn smart_auto_both_community_aliases_eligible() {
+        // Both unnamed listings and the "mesh-llm" alias are eligible for
+        // `--auto` and score equally on name. With other factors equal they
+        // tie at the same score; what matters here is that both appear as
+        // candidates and that `"mesh-llm"` is no longer penalised relative
+        // to unnamed.
         let meshes = vec![
+            make_mesh(None, "ccc", &["Qwen3-8B-Q4_K_M"], 2, 24_000_000_000, 0, 0),
             make_mesh(
                 Some("mesh-llm"),
                 "aaa",
                 &["Qwen3-8B-Q4_K_M"],
-                3,
-                48_000_000_000,
-                1,
-                10,
+                2,
+                24_000_000_000,
+                0,
+                0,
             ),
+        ];
+        let now = 1500;
+        let unnamed_score = score_mesh(&meshes[0], now, None);
+        let alias_score = score_mesh(&meshes[1], now, None);
+        assert_eq!(
+            unnamed_score, alias_score,
+            "None and 'mesh-llm' should score equally as community aliases",
+        );
+        match smart_auto(&meshes, 8.0, None) {
+            AutoDecision::Join { candidates } => {
+                assert_eq!(candidates.len(), 2);
+            }
+            AutoDecision::StartNew { .. } => panic!("should join, not start new"),
+        }
+    }
+
+    #[test]
+    fn smart_auto_excludes_other_named_meshes() {
+        // Without --mesh-name, --auto must only consider the community mesh
+        // (unnamed or name == "mesh-llm"). Other named meshes — even though
+        // they are publicly discoverable on Nostr — should never appear as
+        // candidates unless the user targets them by name.
+        let meshes = vec![
             make_mesh(
                 Some("bobs-cluster"),
                 "bbb",
@@ -1503,14 +1601,58 @@ mod smart_auto_tests {
                 0,
                 0,
             ),
+            make_mesh(
+                Some("alice-cluster"),
+                "aac",
+                &["Qwen3-8B-Q4_K_M"],
+                3,
+                24_000_000_000,
+                0,
+                0,
+            ),
+        ];
+        match smart_auto(&meshes, 8.0, None) {
+            AutoDecision::Join { .. } => {
+                panic!("other named meshes must not be joined by --auto")
+            }
+            AutoDecision::StartNew { models } => {
+                assert!(!models.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn smart_auto_larger_unnamed_beats_smaller_alias() {
+        // Both unnamed and "mesh-llm" are eligible with the same name bonus.
+        // With capacity as the tiebreaker, the larger unnamed mesh wins —
+        // which is what we want, since unnamed is the canonical identity
+        // of the public community mesh.
+        let meshes = vec![
+            make_mesh(
+                None,
+                "unnamed-1",
+                &["Qwen3-8B-Q4_K_M"],
+                5,
+                40_000_000_000,
+                0,
+                0,
+            ),
+            make_mesh(
+                Some("mesh-llm"),
+                "alias-1",
+                &["Qwen3-8B-Q4_K_M"],
+                2,
+                16_000_000_000,
+                0,
+                0,
+            ),
         ];
         match smart_auto(&meshes, 8.0, None) {
             AutoDecision::Join { candidates } => {
-                assert!(!candidates.is_empty());
-                // Community mesh should be first
-                assert_eq!(candidates[0].0, "invite-aaa");
+                assert_eq!(candidates.len(), 2);
+                assert_eq!(candidates[0].0, "invite-unnamed-1");
             }
-            AutoDecision::StartNew { .. } => panic!("should join, not start new"),
+            AutoDecision::StartNew { .. } => panic!("should join"),
         }
     }
 

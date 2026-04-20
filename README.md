@@ -48,6 +48,8 @@ That command:
 - exposes an OpenAI-compatible API at `http://localhost:9337/v1`
 - starts the web console at `http://localhost:3131`
 
+Use `--headless` to disable the embedded web console while keeping the management API (`/api/*`) available on the `--console` port. This is useful for headless server deployments where the UI is not needed.
+
 Check what is available:
 
 ```bash
@@ -90,7 +92,7 @@ just build
 
 Requires: `just`, `cmake`, Rust toolchain, Node.js 24 + npm. NVIDIA GPU builds need `nvcc` (CUDA toolkit). AMD GPU builds need ROCm/HIP. Vulkan GPU builds need the Vulkan development files plus `glslc`. CPU-only and Jetson/Tegra also work. For source builds, `just build` auto-detects CUDA vs ROCm vs Vulkan on Linux, or you can force `backend=rocm` or `backend=vulkan`. See [CONTRIBUTING.md](CONTRIBUTING.md) for details.
 
-Windows source builds are also supported for `cuda`, `rocm`/`hip`, `vulkan`, and `cpu` via `just build`. Metal remains macOS-only. Tagged GitHub releases currently publish macOS bundles plus Linux CPU, Linux ARM64 CPU, Linux CUDA, Linux ROCm, and Linux Vulkan bundles. The Linux ARM64 CPU artifact is `mesh-llm-aarch64-unknown-linux-gnu.tar.gz`. In install and release contexts, `arm64` and `aarch64` mean the same 64-bit ARM target, and generic 32-bit ARM is not a published release target. Windows publish jobs are currently commented out in `.github/workflows/release.yml`, but you can still generate the matching local Windows artifacts with `just release-build-windows`, `just release-build-cuda-windows`, `just release-build-rocm-windows`, `just release-build-vulkan-windows`, and the matching `release-bundle-*-windows` recipes.
+Windows source builds are also supported for `cuda`, `rocm`/`hip`, `vulkan`, and `cpu` via `just build`. Metal remains macOS-only. Tagged stable GitHub releases publish macOS bundles plus Linux CPU, Linux ARM64 CPU, Linux CUDA, Linux ROCm, and Linux Vulkan bundles. Prereleases use the same workflow and can optionally skip the Linux CUDA, Linux ROCm, and Linux Vulkan bundles. The Linux ARM64 CPU artifact is `mesh-llm-aarch64-unknown-linux-gnu.tar.gz`. In install and release contexts, `arm64` and `aarch64` mean the same 64-bit ARM target, and generic 32-bit ARM is not a published release target. Windows publish jobs are currently commented out in `.github/workflows/release.yml`, but you can still generate the matching local Windows artifacts with `just release-build-windows`, `just release-build-cuda-windows`, `just release-build-rocm-windows`, `just release-build-vulkan-windows`, and the matching `release-bundle-*-windows` recipes.
 
 ## Run
 Once installed, you can run:
@@ -180,6 +182,15 @@ mesh-llm client --auto                     # join as API-only client (no GPU)
 mesh-llm discover                          # browse available meshes
 mesh-llm gpus                              # inspect local GPUs and stable IDs
 ```
+
+### Inspect and clean the shared model cache
+```bash
+mesh-llm models installed
+mesh-llm models cleanup --unused-since 30d
+mesh-llm models cleanup --unused-since 30d --yes
+```
+
+`models installed` now shows whether a cached model is mesh-managed or external plus the last time mesh-llm used it. `models cleanup` only removes model files that mesh-llm explicitly marked as mesh-managed; by default it prints a dry run preview and requires `--yes` to delete anything.
 
 ### Multi-model
 ```bash
@@ -306,7 +317,7 @@ sudo loginctl enable-linger "$USER"
 mesh-llm serve --model Qwen2.5-32B    # dashboard at http://localhost:3131
 ```
 
-Live topology, per-node GPU capacity, model picker, and built-in chat. Everything comes from `/api/status` (JSON) and `/api/events` (SSE).
+Live topology, per-node GPU capacity, model picker, and built-in chat. Live members show only the `Client`, `Standby`, `Loading`, and `Serving` badges. Wakeable provider-backed capacity is shown separately from topology and stays out of routing until it rejoins. Everything comes from `/api/status` (JSON) and `/api/events` (SSE).
 
 ## Multimodal Support
 
@@ -503,7 +514,15 @@ When a node is running, open:
 http://localhost:3131
 ```
 
-The console shows live topology, VRAM usage, loaded models, and built-in chat. It is backed by `/api/status` and `/api/events`.
+The console shows live topology with only `Client`, `Standby`, `Loading`, and `Serving` badges for live members, plus separate wakeable capacity, VRAM usage, loaded models, and built-in chat. Wakeable inventory is not part of topology peers or routing until it rejoins. It is backed by `/api/status` and `/api/events`.
+
+To run without the embedded UI (for example, in a headless server environment), pass `--headless`:
+
+```bash
+mesh-llm serve --model Qwen2.5-3B --headless
+```
+
+In headless mode, the web console routes (`/`, `/dashboard`, `/chat`) return 404. The management API (`/api/*`) stays fully available on the `--console` port.
 
 You can also try the hosted demo:
 

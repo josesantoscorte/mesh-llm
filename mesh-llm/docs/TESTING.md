@@ -88,6 +88,20 @@ mesh-llm serve --model Qwen2.5-3B --console
 - Console: `host=true, peers=0`
 - llama-server has 1 RPC entry (self)
 
+### 1a. Headless mode (API-only, no embedded UI)
+
+```bash
+mesh-llm serve --model Qwen2.5-3B --headless --console 3131
+```
+
+- API on `:9337`, management API on `:3131`
+- `GET /api/status` returns 200 with normal JSON
+- `GET /` returns 404 (web console routes are disabled)
+- `GET /dashboard`, `GET /chat`, and `/assets/*` also return 404
+- The management API (`/api/*`) remains fully accessible
+
+This mode is intended for headless server deployments where the embedded web UI is not needed.
+
 ### 2. Two GPU nodes, model fits on host
 
 ```bash
@@ -162,7 +176,7 @@ mesh-llm serve --join <TOKEN>
 ```
 
 - Joiner scans the Hugging Face cache and picks an unserved model already on disk
-- Log: "Assigned to serve GLM-4.7-Flash (needed by mesh, already on disk)"
+- Log: "Selected to serve GLM-4.7-Flash (needed by mesh, already on disk)"
 
 ### 8. Lite client with multi-model
 
@@ -216,6 +230,20 @@ curl -X DELETE localhost:3131/api/runtime/models/Llama-3.2-1B-Instruct-Q4_K_M
 - Dropdown appears when >1 warm model
 - Switching models highlights the serving node in topology view
 - Chat routes to selected model via API proxy
+
+### 11. Console live-state and wakeable capacity
+
+```bash
+cd mesh-llm/ui/
+npm run test:run
+npm run typecheck
+just build
+```
+
+- Live badges show only `Client`, `Standby`, `Loading`, and `Serving`
+- Wakeable capacity renders in a separate section from topology peers and live nodes
+- Wakeable entries do not appear in the topology peer list
+- Validation uses `npm run test:run`, `npm run typecheck`, and `just build`
 
 ## Mesh Identity
 
@@ -479,7 +507,7 @@ mesh-llm --model Qwen3-Coder-Next-Q4_K_M --auto --no-self-update --split --join 
 
 ## Control-Plane Protocol (Protobuf v1)
 
-The control plane prefers QUIC ALPN `mesh-llm/1` using the `meshllm.node.v1` protobuf schema. On `/1`, all five scoped control-plane streams use 4-byte LE framing followed by protobuf bytes. For backward compatibility, nodes may also negotiate `mesh-llm/0`, which keeps the legacy JSON/raw payloads on those same streams.
+The control plane uses QUIC ALPN `mesh-llm/1` with the `meshllm.node.v1` protobuf schema. All five scoped control-plane streams use 4-byte LE framing followed by protobuf bytes.
 
 | Stream | Type | Format |
 |--------|------|--------|
@@ -491,9 +519,6 @@ The control plane prefers QUIC ALPN `mesh-llm/1` using the `meshllm.node.v1` pro
 
 Raw TCP relay streams (0x02 RPC, 0x04 HTTP) are unchanged.
 
-### Testing legacy fallback (`mesh-llm/0`)
-
-To verify backward compatibility, start a node built from the pre-cutover branch (or any build with `ALPN = b"mesh-llm/0"`) and attempt to join a `mesh-llm/1` mesh. The connection should negotiate `/0`, complete gossip, and exchange the legacy JSON/raw control-plane payloads without breaking peer discovery or route-table fetches.
 
 ### Verifying protobuf gossip in logs
 

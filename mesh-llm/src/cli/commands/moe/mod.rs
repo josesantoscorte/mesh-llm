@@ -66,12 +66,14 @@ pub(crate) async fn dispatch_moe_command(command: &MoeCommand, cli: &Cli) -> Res
         MoeCommand::Analyze { command } => match command {
             MoeAnalyzeCommand::Full {
                 model,
+                share,
                 context_size,
                 n_gpu_layers,
                 hf_job,
-            } => run_analyze_full(model, *context_size, *n_gpu_layers, hf_job).await,
+            } => run_analyze_full(model, *share, *context_size, *n_gpu_layers, hf_job).await,
             MoeAnalyzeCommand::Micro {
                 model,
+                share,
                 prompt_count,
                 token_count,
                 context_size,
@@ -80,6 +82,7 @@ pub(crate) async fn dispatch_moe_command(command: &MoeCommand, cli: &Cli) -> Res
             } => {
                 run_analyze_micro(
                     model,
+                    *share,
                     *prompt_count,
                     *token_count,
                     *context_size,
@@ -128,6 +131,7 @@ async fn run_plan(
 
 async fn run_analyze_full(
     model: &str,
+    share: bool,
     context_size: u32,
     n_gpu_layers: u32,
     hf_job: &HfJobArgs,
@@ -163,15 +167,22 @@ async fn run_analyze_full(
         n_gpu_layers.to_string(),
     ];
     run_analyzer_command(&command, &log_path, "full-v1")?;
+    let analysis_path = moe_planner::write_analysis_json(&resolved, &output_path, "full-v1")?;
     println!("✅ Full MoE analysis complete");
     println!("  Ranking: {}", output_path.display());
+    println!("  Analysis: {}", analysis_path.display());
     println!("  Log: {}", log_path.display());
-    print_submit_suggestion(&resolved.path);
+    if share {
+        auto_share_ranking(&resolved, &output_path, &hf_job.dataset_repo).await?;
+    } else {
+        print_submit_suggestion(&resolved.path);
+    }
     Ok(())
 }
 
 async fn run_analyze_micro(
     model: &str,
+    share: bool,
     prompt_count: usize,
     token_count: u32,
     context_size: u32,
@@ -299,16 +310,38 @@ async fn run_analyze_micro(
         &ranking,
         ranking.iter().map(|(_, values)| values.0).sum::<f64>(),
     )?;
+    let analysis_path = moe_planner::write_analysis_json(&resolved, &cache_path, "micro-v1")?;
     println!("✅ Micro MoE analysis complete");
     println!("  Ranking: {}", cache_path.display());
+    println!("  Analysis: {}", analysis_path.display());
     if !wrote_cache {
         println!(
             "  Note: A stronger or equivalent shared ranking already exists, so this micro-v1 result was not promoted as the preferred shared artifact."
         );
     }
     println!("  Log: {}", log_path.display());
-    print_submit_suggestion(&resolved.path);
+    if share {
+        auto_share_ranking(&resolved, cache_path.as_path(), &hf_job.dataset_repo).await?;
+    } else {
+        print_submit_suggestion(&resolved.path);
+    }
     Ok(())
+}
+
+async fn auto_share_ranking(
+    resolved: &moe_planner::MoeModelContext,
+    ranking_path: &Path,
+    dataset_repo: &str,
+) -> Result<()> {
+    println!("📤 Auto-sharing ranking...");
+    run_share_resolved(resolved, Some(ranking_path), dataset_repo)
+        .await
+        .with_context(|| {
+            format!(
+                "Automatic share failed after analyze completed for {}",
+                resolved.display_name
+            )
+        })
 }
 
 fn write_canonical_micro_ranking(
@@ -360,19 +393,27 @@ fn print_submit_suggestion(model_path: &Path) {
         return;
     };
     println!("📤 Contribute this ranking to mesh-llm so other users can reuse it:");
-    println!("  mesh-llm moe share '{}'", identity.canonical_ref);
+    println!("  mesh-llm moe share '{}'", identity.distribution_ref());
 }
 
 async fn run_share(model: &str, ranking_file: Option<&Path>, dataset_repo: &str) -> Result<()> {
+    let resolved = moe_planner::resolve_model_context(model).await?;
+    run_share_resolved(&resolved, ranking_file, dataset_repo).await
+}
+
+async fn run_share_resolved(
+    resolved: &moe_planner::MoeModelContext,
+    ranking_file: Option<&Path>,
+    dataset_repo: &str,
+) -> Result<()> {
     let share_error = |title: &str, detail: &str| -> anyhow::Error {
         eprintln!("❌ {title}");
         eprintln!("   {detail}");
         anyhow::anyhow!("{title}: {detail}")
     };
 
-    let resolved = moe_planner::resolve_model_context(model).await?;
-    let ranking = moe_planner::local_submit_ranking(&resolved, ranking_file)?;
-    moe_planner::validate_ranking(&resolved, &ranking).with_context(|| {
+    let ranking = moe_planner::local_submit_ranking(resolved, ranking_file)?;
+    moe_planner::validate_ranking(resolved, &ranking).with_context(|| {
         format!(
             "Validate ranking {} against model {}",
             ranking.path.display(),
@@ -380,8 +421,9 @@ async fn run_share(model: &str, ranking_file: Option<&Path>, dataset_repo: &str)
         )
     })?;
     let log_path = log_path_for(&resolved.path, &ranking.analyzer_id);
-    let bundle = moe_planner::build_submit_bundle(&resolved, &ranking, Some(log_path.as_path()))?;
-    let api = models::build_hf_api(false).context("Build Hugging Face client for MoE share")?;
+    let bundle = moe_planner::build_submit_bundle(resolved, &ranking, Some(log_path.as_path()))?;
+    let api =
+        models::build_hf_tokio_api(false).context("Build Hugging Face client for MoE share")?;
     let (owner, name) = dataset_repo.split_once('/').unwrap_or(("", dataset_repo));
     let dataset = api.dataset(owner, name);
     let info = dataset
@@ -390,6 +432,7 @@ async fn run_share(model: &str, ranking_file: Option<&Path>, dataset_repo: &str)
                 .revision("main".to_string())
                 .build(),
         )
+        .await
         .with_context(|| format!("Fetch dataset info for {}", dataset_repo))?;
     let hf_hub::RepoInfo::Dataset(info) = info else {
         anyhow::bail!("Expected dataset repo info for {}", dataset_repo);
@@ -448,6 +491,10 @@ async fn run_share(model: &str, ranking_file: Option<&Path>, dataset_repo: &str)
     operations.push(ndjson_file_op(
         &format!("{}/metadata.json", bundle.dataset_prefix),
         bundle.metadata_content.as_bytes(),
+    ));
+    operations.push(ndjson_file_op(
+        &format!("{}/analysis.json", bundle.dataset_prefix),
+        bundle.analysis_content.as_bytes(),
     ));
     if let Some(log_path) = bundle.log_path.as_ref() {
         operations.push(ndjson_file_op(
@@ -567,6 +614,7 @@ mod tests {
         let all = vec![
             "a/ranking.csv".to_string(),
             "a/metadata.json".to_string(),
+            "a/analysis.json".to_string(),
             "a/run.log".to_string(),
         ];
         assert_eq!(classify_share_prefix(&all, &[]), SharePrefixState::New);

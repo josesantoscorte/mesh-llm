@@ -834,6 +834,7 @@ fn refresh_auto_moe_config_from_cache(
     let resolved = crate::system::moe_planner::ResolvedRanking {
         path: moe::shared_ranking_cache_path(model_path, &artifact),
         metadata_path: None,
+        analysis_path: None,
         analyzer_id: match artifact.kind {
             moe::SharedRankingKind::Analyze => "full-v1",
             moe::SharedRankingKind::MicroAnalyze => "micro-v1",
@@ -879,7 +880,7 @@ fn print_runtime_submit_suggestion(model_name: &str, model_path: &Path, ranking_
     eprintln!("⚠️  [{model_name}] This run did not use a published ranking.");
     eprintln!(
         "📤 [{model_name}] Contribute it with: mesh-llm moe share '{}'",
-        identity.canonical_ref
+        identity.distribution_ref()
     );
 }
 

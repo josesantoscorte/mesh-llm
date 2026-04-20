@@ -38,74 +38,6 @@ pub(super) fn peer_meaningfully_changed(old: &PeerInfo, new: &PeerInfo) -> bool 
         || old.gpu_reserved_bytes != new.gpu_reserved_bytes
 }
 
-impl PeerAnnouncementV0 {
-    pub(crate) fn into_internal(self) -> PeerAnnouncement {
-        let serving_models = if !self.serving_models.is_empty() {
-            self.serving_models.clone()
-        } else {
-            self.serving.clone().into_iter().collect()
-        };
-        PeerAnnouncement {
-            addr: self.addr,
-            role: self.role,
-            models: self.models,
-            vram_bytes: self.vram_bytes,
-            model_source: self.model_source,
-            serving_models,
-            hosted_models: None,
-            available_models: self.available_models,
-            requested_models: self.requested_models,
-            version: self.version,
-            model_demand: self.model_demand,
-            mesh_id: self.mesh_id,
-            gpu_name: self.gpu_name,
-            hostname: self.hostname,
-            is_soc: self.is_soc,
-            gpu_vram: self.gpu_vram,
-            gpu_reserved_bytes: self.gpu_reserved_bytes,
-            gpu_mem_bandwidth_gbps: self.gpu_mem_bandwidth_gbps,
-            gpu_compute_tflops_fp32: self.gpu_compute_tflops_fp32,
-            gpu_compute_tflops_fp16: self.gpu_compute_tflops_fp16,
-            available_model_metadata: vec![],
-            experts_summary: None,
-            available_model_sizes: self.available_model_sizes,
-            served_model_descriptors: self.served_model_descriptors,
-            served_model_runtime: self.served_model_runtime,
-            owner_attestation: None,
-        }
-    }
-}
-
-impl From<&PeerAnnouncement> for PeerAnnouncementV0 {
-    fn from(ann: &PeerAnnouncement) -> Self {
-        Self {
-            addr: ann.addr.clone(),
-            role: ann.role.clone(),
-            models: ann.models.clone(),
-            vram_bytes: ann.vram_bytes,
-            model_source: ann.model_source.clone(),
-            serving: ann.serving_models.first().cloned(),
-            serving_models: ann.serving_models.clone(),
-            available_models: ann.available_models.clone(),
-            requested_models: ann.requested_models.clone(),
-            version: ann.version.clone(),
-            model_demand: ann.model_demand.clone(),
-            mesh_id: ann.mesh_id.clone(),
-            gpu_name: ann.gpu_name.clone(),
-            hostname: ann.hostname.clone(),
-            is_soc: ann.is_soc,
-            gpu_vram: ann.gpu_vram.clone(),
-            gpu_reserved_bytes: ann.gpu_reserved_bytes.clone(),
-            gpu_mem_bandwidth_gbps: ann.gpu_mem_bandwidth_gbps.clone(),
-            gpu_compute_tflops_fp32: ann.gpu_compute_tflops_fp32.clone(),
-            gpu_compute_tflops_fp16: ann.gpu_compute_tflops_fp16.clone(),
-            available_model_sizes: ann.available_model_sizes.clone(),
-            served_model_descriptors: ann.served_model_descriptors.clone(),
-            served_model_runtime: ann.served_model_runtime.clone(),
-        }
-    }
-}
-
 pub(super) fn apply_transitive_ann(
     existing: &mut PeerInfo,
     addr: &EndpointAddr,
@@ -167,21 +99,30 @@ pub(super) fn apply_transitive_ann(
     serving_changed
 }
 
-pub fn merge_demand(
-    ours: &mut HashMap<String, ModelDemand>,
-    theirs: &HashMap<String, ModelDemand>,
-) {
-    for (model, their_demand) in theirs {
-        let entry = ours.entry(model.clone()).or_default();
-        entry.last_active = entry.last_active.max(their_demand.last_active);
-        entry.request_count = entry.request_count.max(their_demand.request_count);
-    }
-}
-
 impl Node {
     /// Open a gossip stream on an existing connection to exchange peer info.
     pub(super) async fn initiate_gossip(&self, conn: Connection, remote: EndpointId) -> Result<()> {
-        self.initiate_gossip_inner(conn, remote, true).await
+        // Timeout only the gossip round-trip. A misbehaving peer may accept the
+        // QUIC connection and even the bi-stream but never send a gossip response,
+        // blocking the join path indefinitely and preventing fallback to other
+        // candidates.
+        match tokio::time::timeout(
+            PEER_CONNECT_AND_GOSSIP_TIMEOUT,
+            self.gossip_round_trip(&conn, remote),
+        )
+        .await
+        {
+            Ok(Ok((their_announcements, rtt_ms))) => {
+                self.apply_gossip_announcements(remote, rtt_ms, &their_announcements, true)
+                    .await
+            }
+            Ok(Err(e)) => Err(e),
+            Err(_) => anyhow::bail!(
+                "gossip exchange with {} timed out ({}s)",
+                remote.fmt_short(),
+                PEER_CONNECT_AND_GOSSIP_TIMEOUT.as_secs()
+            ),
+        }
     }
 
     pub(super) async fn initiate_gossip_inner(
@@ -190,6 +131,16 @@ impl Node {
         remote: EndpointId,
         discover_peers: bool,
     ) -> Result<()> {
+        let (their_announcements, rtt_ms) = self.gossip_round_trip(&conn, remote).await?;
+        self.apply_gossip_announcements(remote, rtt_ms, &their_announcements, discover_peers)
+            .await
+    }
+
+    async fn gossip_round_trip(
+        &self,
+        conn: &Connection,
+        remote: EndpointId,
+    ) -> Result<(Vec<(EndpointAddr, PeerAnnouncement)>, u32)> {
         let protocol = connection_protocol(&conn);
         let t0 = std::time::Instant::now();
         let (mut send, mut recv) = conn.open_bi().await?;
@@ -205,8 +156,17 @@ impl Node {
 
         let _ = recv.read_to_end(0).await;
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        Ok((their_announcements, rtt_ms))
+    }
 
-        for (addr, ann) in &their_announcements {
+    async fn apply_gossip_announcements(
+        &self,
+        remote: EndpointId,
+        rtt_ms: u32,
+        their_announcements: &[(EndpointAddr, PeerAnnouncement)],
+        discover_peers: bool,
+    ) -> Result<()> {
+        for (addr, ann) in their_announcements {
             let peer_id = addr.id;
             if peer_id == self.endpoint.id() {
                 continue;
@@ -254,7 +214,7 @@ impl Node {
 
         if discover_peers {
             let my_role = self.role.lock().await.clone();
-            for (addr, ann) in &their_announcements {
+            for (addr, ann) in their_announcements {
                 let peer_id = addr.id;
                 if peer_id == self.endpoint.id() {
                     continue;

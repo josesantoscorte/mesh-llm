@@ -66,7 +66,7 @@ impl BinaryFlavor {
         match self {
             BinaryFlavor::Cpu => &["CPU"],
             BinaryFlavor::Cuda => &["CUDA0", "CPU"],
-            BinaryFlavor::Rocm => &["HIP0", "CPU"],
+            BinaryFlavor::Rocm => &["ROCm0", "HIP0", "CPU"],
             BinaryFlavor::Vulkan => &["Vulkan0", "CPU"],
             BinaryFlavor::Metal => &["MTL0", "CPU"],
         }
@@ -659,7 +659,7 @@ fn preferred_device(available: &[String], flavor: Option<BinaryFlavor>) -> Optio
     let candidates: &[&str] = if let Some(flavor) = flavor {
         flavor.preferred_devices()
     } else {
-        &["MTL0", "CUDA0", "HIP0", "Vulkan0", "CPU"]
+        &["MTL0", "CUDA0", "ROCm0", "HIP0", "Vulkan0", "CPU"]
     };
 
     for candidate in candidates {
@@ -678,7 +678,24 @@ fn resolve_device_for_binary(
     let available = probe_available_devices(binary);
 
     if let Some(device) = requested {
-        if !available.is_empty() && !available.iter().any(|candidate| candidate == device) {
+        if !available.is_empty() {
+            if available.iter().any(|candidate| candidate == device) {
+                return Ok(device.to_string());
+            }
+
+            // Dual support for ROCm/HIP transition
+            let is_amd_requested = device.starts_with("ROCm") || device.starts_with("HIP");
+            if is_amd_requested {
+                let alt_device = if device.starts_with("ROCm") {
+                    device.replace("ROCm", "HIP")
+                } else {
+                    device.replace("HIP", "ROCm")
+                };
+                if available.iter().any(|candidate| candidate == &alt_device) {
+                    return Ok(alt_device);
+                }
+            }
+
             anyhow::bail!(
                 "requested device {device} is not supported by {}. Available devices: {}",
                 binary.display(),
@@ -1138,6 +1155,13 @@ pub async fn start_llama_server(
         args.push("--rpc".to_string());
         args.push(rpc_arg);
     }
+    // Pin slot count explicitly. llama.cpp's default of 4 slots silently
+    // queues anything beyond that in an unbounded deferred deque, which is
+    // the source of the MiniMax-style death spiral: 43k-token prefills
+    // occupy all slots for minutes while new requests pile up invisibly.
+    // The backend proxy enforces a matching inflight cap so the deferred
+    // queue never actually fills. See network/openai/backend.rs.
+    const LLAMA_PARALLEL_SLOTS: usize = 4;
     args.extend_from_slice(&[
         "-ngl".to_string(),
         "99".to_string(),
@@ -1146,6 +1170,8 @@ pub async fn start_llama_server(
         "-fit".to_string(),
         "off".to_string(),
         "--no-mmap".to_string(),
+        "--parallel".to_string(),
+        LLAMA_PARALLEL_SLOTS.to_string(),
         "--host".to_string(),
         "0.0.0.0".to_string(),
         "--port".to_string(),
@@ -1164,6 +1190,18 @@ pub async fn start_llama_server(
         //   "chat_template_kwargs": {"enable_thinking": true}
         "--reasoning-budget".to_string(),
         "0".to_string(),
+        // Anti-repetition default. llama.cpp ships repeat_penalty off
+        // (1.0), which lets small quantized models fall into tight decode
+        // loops ("Ok 1 2 3 4 5 Ok 1 2 3 4 5 ...") on mildly adversarial
+        // prompts. 1.1 over a 256-token window is the conventional mild
+        // setting — it kills loops without measurably affecting normal
+        // prose. Per-request JSON fields (`repeat_penalty`, `repeat_last_n`)
+        // still override these, so clients that tune their own sampling are
+        // unaffected.
+        "--repeat-penalty".to_string(),
+        "1.1".to_string(),
+        "--repeat-last-n".to_string(),
+        "256".to_string(),
     ]);
 
     // Mesh hooks — tell llama-server where to call back.
@@ -1511,7 +1549,7 @@ fn detect_device() -> String {
 
     // ROCm/HIP
     if has_rocm_backend() {
-        return "HIP0".to_string();
+        return "ROCm0".to_string();
     }
 
     // Vulkan

@@ -3,6 +3,7 @@ mod discovery;
 pub mod instance;
 mod local;
 mod proxy;
+pub(crate) mod wakeable;
 
 use self::discovery::{nostr_rediscovery, start_new_mesh};
 use self::local::{
@@ -13,6 +14,7 @@ use self::local::{
 };
 use self::proxy::{api_proxy, bootstrap_proxy};
 use crate::api;
+use crate::cli::terminal_progress::start_spinner;
 use crate::cli::{Cli, Command, RuntimeSurface};
 use crate::crypto::{
     default_keystore_path, default_trust_store_path, keystore_exists, keystore_metadata,
@@ -25,7 +27,7 @@ use crate::models;
 use crate::models::catalog;
 use crate::network::{affinity, nostr, router, tunnel};
 use crate::plugin;
-use crate::system::{autoupdate, benchmark, hardware};
+use crate::system::{autoupdate, benchmark, hardware, moe_planner};
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser};
 use std::collections::HashMap;
@@ -348,9 +350,31 @@ pub(crate) async fn run() -> Result<()> {
             .as_secs();
 
         let last_mesh_id = mesh::load_last_mesh_id();
-        eprintln!("  Found {} mesh(es)", meshes.len());
         let target_name = cli.mesh_name.as_deref();
-        for m in &meshes {
+        // When the user did not target a specific mesh, `--auto` only joins
+        // the community mesh (unnamed or name == "mesh-llm"). Other named
+        // meshes are still publicly discoverable on Nostr, but the user has
+        // to opt in by name. Hide them from the listing so the output matches
+        // what auto will actually consider.
+        let listed: Vec<&nostr::DiscoveredMesh> = if target_name.is_some() {
+            meshes.iter().collect()
+        } else {
+            meshes
+                .iter()
+                .filter(|m| nostr::is_auto_eligible(m))
+                .collect()
+        };
+        let hidden = meshes.len().saturating_sub(listed.len());
+        if hidden > 0 {
+            eprintln!(
+                "  Found {} mesh(es) ({} named mesh(es) hidden; use --mesh-name to join)",
+                listed.len(),
+                hidden
+            );
+        } else {
+            eprintln!("  Found {} mesh(es)", listed.len());
+        }
+        for m in &listed {
             let score = nostr::score_mesh(m, now, last_mesh_id.as_deref());
             eprintln!(
                 "  · {} (score: {}, {} nodes, {:.0}GB, {} clients{})",
@@ -491,7 +515,7 @@ pub(crate) async fn run() -> Result<()> {
         eprintln!();
         return Ok(());
     }
-    let mut startup_models = resolve_startup_models(&startup_specs).await?;
+    let mut startup_models = resolve_startup_models(&startup_specs, cli.max_vram).await?;
     preflight_config_owned_startup_models(&config, &startup_specs, &mut startup_models)?;
     let resolved_models: Vec<PathBuf> = startup_models
         .iter()
@@ -599,9 +623,15 @@ fn build_startup_model_specs(
     Ok(specs)
 }
 
-async fn resolve_startup_models(specs: &[StartupModelSpec]) -> Result<Vec<StartupModelPlan>> {
+async fn resolve_startup_models(
+    specs: &[StartupModelSpec],
+    max_vram_gb: Option<f64>,
+) -> Result<Vec<StartupModelPlan>> {
     let mut plans = Vec::with_capacity(specs.len());
+    let mut preflight_cache: HashMap<String, Option<moe_planner::MoeStartupFitEstimate>> =
+        HashMap::new();
     for spec in specs {
+        preflight_remote_startup_model(spec, max_vram_gb, &mut preflight_cache).await?;
         let resolved_path = resolve_model(&spec.model_ref).await?;
         let mmproj_path = match spec.mmproj_ref.as_ref() {
             Some(mmproj) => Some(resolve_model(mmproj).await?),
@@ -617,6 +647,130 @@ async fn resolve_startup_models(specs: &[StartupModelSpec]) -> Result<Vec<Startu
         });
     }
     Ok(plans)
+}
+
+async fn preflight_remote_startup_model(
+    spec: &StartupModelSpec,
+    max_vram_gb: Option<f64>,
+    cache: &mut HashMap<String, Option<moe_planner::MoeStartupFitEstimate>>,
+) -> Result<()> {
+    if spec.model_ref.exists() {
+        return Ok(());
+    }
+
+    let declared_ref = spec.model_ref.to_string_lossy().to_string();
+    if !declared_ref.contains('/') {
+        let installed_name = declared_ref.strip_suffix(".gguf").unwrap_or(&declared_ref);
+        if models::find_model_path(installed_name).exists() {
+            return Ok(());
+        }
+    }
+
+    let mut spinner = start_spinner(&format!("Checking published MoE fit for {declared_ref}"));
+    let identity = models::resolve_huggingface_model_identity(&declared_ref)
+        .await
+        .with_context(|| format!("Resolve model identity for {declared_ref}"))?;
+    let Some(identity) = identity else {
+        spinner.finish();
+        return Ok(());
+    };
+
+    if let Some(cached) = cache.get(&identity.canonical_ref).cloned() {
+        spinner.finish();
+        return apply_remote_startup_preflight(&declared_ref, &identity.local_file_name, cached);
+    }
+
+    spinner.set_message(format!(
+        "Fetching published MoE analysis for {}",
+        identity.local_file_name
+    ));
+    let dataset_repo = moe_planner::DEFAULT_MOE_RANKINGS_DATASET.to_string();
+    let source_repo = identity.repo_id.clone();
+    let source_revision = identity.revision.clone();
+    let distribution_id = moe_planner::normalize_distribution_id(&identity.local_file_name);
+    let target_vram_bytes = mesh::detect_vram_bytes_capped(max_vram_gb);
+    let fetched = tokio::task::spawn_blocking(move || {
+        moe_planner::fetch_remote_startup_fit(
+            &dataset_repo,
+            &source_repo,
+            &source_revision,
+            &distribution_id,
+            target_vram_bytes,
+            false,
+        )
+    })
+    .await;
+    spinner.finish();
+
+    let fit = match fetched {
+        Ok(Ok(fit)) => fit,
+        Ok(Err(err)) => {
+            eprintln!(
+                "⚠️  [{declared_ref}] Published MoE preflight lookup failed ({err}); continuing with normal model resolution"
+            );
+            None
+        }
+        Err(err) => {
+            eprintln!(
+                "⚠️  [{declared_ref}] Published MoE preflight task failed ({err}); continuing with normal model resolution"
+            );
+            None
+        }
+    };
+    cache.insert(identity.canonical_ref.clone(), fit.clone());
+    apply_remote_startup_preflight(&declared_ref, &identity.local_file_name, fit)
+}
+
+fn apply_remote_startup_preflight(
+    declared_ref: &str,
+    model_label: &str,
+    fit: Option<moe_planner::MoeStartupFitEstimate>,
+) -> Result<()> {
+    let Some(fit) = fit else {
+        return Ok(());
+    };
+    if !fit.any_fit_exists() {
+        anyhow::bail!(
+            "Published MoE preflight says '{}' will not fit locally before download: full model needs about {}, and the smallest conservative split still needs about {} per node with a 50% shared core ({} shared experts). Local budget is {}.",
+            declared_ref,
+            format_vram_gb(fit.full_model_launch_bytes),
+            fit.predicted_max_shard_launch_bytes
+                .map(format_vram_gb)
+                .unwrap_or_else(|| "unknown".to_string()),
+            fit.required_experts_per_node,
+            format_vram_gb(fit.target_vram_bytes),
+        );
+    }
+
+    if fit.full_model_fits() {
+        eprintln!(
+            "🧩 [{}] Published MoE preflight: full model should fit locally (~{} <= {}, mode={}, source={})",
+            model_label,
+            format_vram_gb(fit.full_model_launch_bytes),
+            format_vram_gb(fit.target_vram_bytes),
+            fit.analyzer_id,
+            fit.ranking_source,
+        );
+        return Ok(());
+    }
+
+    if fit.shard_plan_fits() {
+        eprintln!(
+            "🧩 [{}] Published MoE preflight: full model needs ~{}, but a conservative {}-node shard should fit here (~{}/node, mode={}, source={})",
+            model_label,
+            format_vram_gb(fit.full_model_launch_bytes),
+            fit.recommended_nodes.unwrap_or(1),
+            format_vram_gb(fit.predicted_max_shard_launch_bytes.unwrap_or_default()),
+            fit.analyzer_id,
+            fit.ranking_source,
+        );
+        return Ok(());
+    }
+    Ok(())
+}
+
+fn format_vram_gb(bytes: u64) -> String {
+    format!("{:.1}GB", bytes as f64 / 1e9)
 }
 
 fn preflight_config_owned_startup_models(
@@ -728,8 +882,26 @@ fn startup_rpc_backend_device<'a>(
         .map(|gpu| gpu.backend_device.as_str());
 
     if let (Some(cli_device), Some(pinned_device)) = (cli_device, pinned_device) {
+        let is_match = cli_device == pinned_device;
+        let is_lenient_match = is_match || {
+            let is_amd_cli = cli_device.starts_with("ROCm") || cli_device.starts_with("HIP");
+            let is_amd_pinned =
+                pinned_device.starts_with("ROCm") || pinned_device.starts_with("HIP");
+            if is_amd_cli && is_amd_pinned {
+                let cli_idx = cli_device
+                    .trim_start_matches("ROCm")
+                    .trim_start_matches("HIP");
+                let pinned_idx = pinned_device
+                    .trim_start_matches("ROCm")
+                    .trim_start_matches("HIP");
+                cli_idx == pinned_idx && !cli_idx.is_empty()
+            } else {
+                false
+            }
+        };
+
         anyhow::ensure!(
-            cli_device == pinned_device,
+            is_lenient_match,
             "explicit --device '{cli_device}' conflicts with pinned startup GPU backend device '{pinned_device}'"
         );
         return Ok(Some(cli_device));
@@ -1722,7 +1894,7 @@ async fn run_auto(
                     }
                 }
             });
-            api::start(cport, cs2, adapted_rx, cli.listen_all).await;
+            api::start(cport, cs2, adapted_rx, cli.listen_all, cli.headless).await;
         });
         Some(cs)
     } else {
@@ -1758,6 +1930,7 @@ async fn run_auto(
     let force_split = cli.split;
     let llama_flavor = cli.llama_flavor;
     let cb_console_port = console_port;
+    let cli_headless = cli.headless;
     let model_name_for_cb = model_name.clone();
     let model_name_for_election = model_name.clone();
     let node_for_cb = node.clone();
@@ -1820,7 +1993,7 @@ async fn run_auto(
                     let url = format!("http://localhost:{api_port}");
                     eprintln!("  API:     {url}");
                     if let Some(cp) = cb_console_port {
-                        eprintln!("  Console: http://localhost:{cp}");
+                        eprintln!("{}", format_console_ready_line(cli_headless, cp));
                     }
                     update_pi_models_json(&model_name_for_cb, api_port);
                     eprintln!();
@@ -2323,7 +2496,7 @@ async fn run_passive(
         eprintln!("💤 Standby ready:");
     }
     eprintln!("  API:     http://localhost:{local_port}");
-    eprintln!("  Console: http://localhost:{}", cli.console);
+    eprintln!("{}", format_console_ready_line(cli.headless, cli.console));
 
     // Console
     {
@@ -2350,8 +2523,9 @@ async fn run_passive(
         cs.update(false, true).await;
         let (_tx, rx) = tokio::sync::watch::channel(election::InferenceTarget::None);
         let la = cli.listen_all;
+        let headless = cli.headless;
         tokio::spawn(async move {
-            api::start(cport, cs, rx, la).await;
+            api::start(cport, cs, rx, la, headless).await;
         });
     }
 
@@ -2549,6 +2723,16 @@ fn build_serving_list(resolved_models: &[PathBuf], model_name: &str) -> Vec<Stri
         all.insert(0, clean_name);
     }
     all
+}
+
+/// Returns the console-port label line for ready-state output.
+/// In headless mode, advertises the management API; otherwise the web console.
+fn format_console_ready_line(headless: bool, console_port: u16) -> String {
+    if headless {
+        format!("  Management API: http://localhost:{console_port}")
+    } else {
+        format!("  Console: http://localhost:{console_port}")
+    }
 }
 
 #[cfg(test)]
@@ -3134,6 +3318,33 @@ mod tests {
     }
 
     #[test]
+    fn pinned_gpu_startup_rpc_device_allows_lenient_amd_match() {
+        let primary_startup_model = StartupModelPlan {
+            declared_ref: "Qwen3-8B-Q4_K_M".into(),
+            resolved_path: PathBuf::from("/tmp/Qwen3-8B-Q4_K_M.gguf"),
+            mmproj_path: None,
+            ctx_size: Some(8192),
+            gpu_id: Some("pci:0000:65:00.0".into()),
+            pinned_gpu: Some(StartupPinnedGpuTarget {
+                index: 0,
+                stable_id: "pci:0000:65:00.0".into(),
+                backend_device: "ROCm0".into(),
+                vram_bytes: 24_000_000_000,
+            }),
+        };
+
+        let device1 =
+            startup_rpc_backend_device(Some("HIP0"), Some(&primary_startup_model)).unwrap();
+        assert_eq!(device1, Some("HIP0"));
+
+        let mut model_hip = primary_startup_model.clone();
+        model_hip.pinned_gpu.as_mut().unwrap().backend_device = "HIP1".into();
+
+        let device2 = startup_rpc_backend_device(Some("ROCm1"), Some(&model_hip)).unwrap();
+        assert_eq!(device2, Some("ROCm1"));
+    }
+
+    #[test]
     fn test_should_show_serve_config_help_for_bare_serve_without_models() {
         let cli = Cli::parse_from(["mesh-llm"]);
         let startup_specs = Vec::new();
@@ -3314,5 +3525,82 @@ mod tests {
         assert_eq!(*mem_arc.lock().await, Some(vec![10.5, 20.0]));
         assert!(fp32_arc.lock().await.is_none());
         assert!(fp16_arc.lock().await.is_none());
+    }
+
+    #[test]
+    fn headless_host_logs_management_api_without_console_url() {
+        let line = format_console_ready_line(true, 3131);
+        assert!(
+            line.contains("Management API"),
+            "expected 'Management API' in headless output, got: {line}"
+        );
+        assert!(
+            !line.contains("Console:"),
+            "headless output must not contain 'Console:', got: {line}"
+        );
+    }
+
+    #[test]
+    fn default_host_mode_still_logs_console_url() {
+        let line = format_console_ready_line(false, 3131);
+        assert!(
+            line.contains("Console:"),
+            "expected 'Console:' in default output, got: {line}"
+        );
+        assert!(
+            !line.contains("Management API"),
+            "default output must not contain 'Management API', got: {line}"
+        );
+    }
+
+    #[test]
+    fn active_startup_passes_headless_to_management_server() {
+        let headless_line = format_console_ready_line(true, 9090);
+        let normal_line = format_console_ready_line(false, 9090);
+        assert_ne!(
+            headless_line, normal_line,
+            "headless and non-headless output must differ"
+        );
+        assert!(headless_line.contains("9090"));
+        assert!(normal_line.contains("9090"));
+    }
+
+    #[test]
+    fn headless_passive_mode_preserves_api_without_ui() {
+        let line = format_console_ready_line(true, 3131);
+        assert!(
+            line.contains("Management API"),
+            "passive headless output must contain 'Management API', got: {line}"
+        );
+        assert!(
+            !line.contains("Console:"),
+            "passive headless output must not contain 'Console:', got: {line}"
+        );
+    }
+
+    #[test]
+    fn passive_headless_promotion_keeps_ui_disabled() {
+        let promoted_line = format_console_ready_line(true, 3131);
+        assert!(
+            promoted_line.contains("Management API"),
+            "promoted headless node must still advertise Management API, got: {promoted_line}"
+        );
+        assert!(
+            !promoted_line.contains("Console:"),
+            "promoted headless node must not show Console: URL, got: {promoted_line}"
+        );
+    }
+
+    #[test]
+    fn default_passive_mode_still_serves_ui_when_not_headless() {
+        let line = format_console_ready_line(false, 3131);
+        assert!(
+            line.contains("Console:"),
+            "default passive output must contain 'Console:', got: {line}"
+        );
+        assert!(
+            !line.contains("Management API"),
+            "default passive output must not contain 'Management API', got: {line}"
+        );
     }
 }

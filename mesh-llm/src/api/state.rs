@@ -42,6 +42,7 @@ pub(super) struct ApiInner {
     pub(super) node: mesh::Node,
     pub(super) plugin_manager: plugin::PluginManager,
     pub(super) affinity_router: affinity::AffinityRouter,
+    pub(super) headless: bool,
     pub(super) is_host: bool,
     pub(super) is_client: bool,
     pub(super) llama_ready: bool,
@@ -62,4 +63,5 @@ pub(super) struct ApiInner {
     pub(super) inventory_scan_waiters:
         Vec<tokio::sync::oneshot::Sender<crate::models::LocalModelInventorySnapshot>>,
     pub(super) local_instances: Arc<Mutex<Vec<crate::runtime::instance::LocalInstanceSnapshot>>>,
+    pub(super) wakeable_inventory: crate::runtime::wakeable::WakeableInventory,
 }

@@ -1,6 +1,9 @@
 use super::local::HuggingFaceModelIdentity;
 use super::ModelCapabilities;
-use super::{capabilities, catalog, find_model_path, format_size_bytes};
+use super::{
+    capabilities, catalog, find_model_path, format_size_bytes, huggingface_identity_for_path,
+    track_model_usage,
+};
 use crate::cli::terminal_progress::start_spinner;
 use anyhow::{anyhow, bail, Context, Result};
 use hf_hub::{ListModelsParams, RepoInfo, RepoInfoParams};
@@ -137,6 +140,7 @@ pub async fn resolve_model_spec_with_progress(input: &Path, progress: bool) -> R
     let raw = input.to_string_lossy();
 
     if input.exists() {
+        record_resolved_model_usage(input, Some(raw.as_ref()));
         return Ok(input.to_path_buf());
     }
 
@@ -144,6 +148,10 @@ pub async fn resolve_model_spec_with_progress(input: &Path, progress: bool) -> R
         let installed_name = raw.strip_suffix(".gguf").unwrap_or(&raw);
         let installed_path = find_model_path(installed_name);
         if installed_path.exists() {
+            let model_ref = huggingface_identity_for_path(&installed_path)
+                .map(|identity| identity.canonical_ref)
+                .unwrap_or_else(|| installed_name.to_string());
+            record_resolved_model_usage(&installed_path, Some(&model_ref));
             return Ok(installed_path);
         }
         if let Some(entry) = catalog::find_model(&raw) {
@@ -166,6 +174,12 @@ pub async fn resolve_model_spec_with_progress(input: &Path, progress: bool) -> R
         .await
         .with_context(|| format!("Resolve model spec {raw}"))?;
     Ok(path)
+}
+
+fn record_resolved_model_usage(path: &Path, model_ref: Option<&str>) {
+    if let Err(err) = track_model_usage(path, None, model_ref, Some("resolve")) {
+        tracing::warn!("failed to record model usage for {}: {err}", path.display());
+    }
 }
 
 pub async fn show_exact_model(input: &str) -> Result<ModelDetails> {
@@ -393,36 +407,11 @@ where
 {
     let input = canonicalize_model_ref_input(input).await?;
     let parsed = parse_huggingface_repo_ref(&input).or_else(|| parse_huggingface_repo_url(&input));
-    let Some((repo, revision, selector)) = parsed else {
+    let Some((repo, revision, _selector)) = parsed else {
         return Ok(None);
     };
-    if selector.is_some() {
-        return Ok(None);
-    }
-
-    let api = super::build_hf_tokio_api(false)?;
     let revision_ref = revision.as_deref().unwrap_or("main");
-    let (owner, name) = repo.split_once('/').unwrap_or(("", repo.as_str()));
-    let detail = api
-        .model(owner, name)
-        .info(
-            &RepoInfoParams::builder()
-                .revision(revision_ref.to_string())
-                .build(),
-        )
-        .await
-        .with_context(|| format!("Fetch Hugging Face repo {repo}"))?;
-    let RepoInfo::Model(detail) = detail else {
-        return Ok(Some(Vec::new()));
-    };
-
-    let sibling_entries: Vec<(String, Option<u64>)> = detail
-        .siblings
-        .clone()
-        .unwrap_or_default()
-        .iter()
-        .map(|sibling| (sibling.rfilename.clone(), sibling.size))
-        .collect();
+    let sibling_entries = fetch_repo_sibling_entries(&repo, revision_ref).await?;
     let available_bytes = crate::system::hardware::survey().vram_bytes;
     let variants = collect_show_gguf_variants_from_siblings(&sibling_entries, available_bytes);
     if variants.is_empty() {
@@ -452,7 +441,9 @@ where
         }
         let size_label = match size_bytes {
             Some(bytes) => Some(format_size_bytes(bytes)),
-            None => remote_hf_size_label_with_api(&api, &repo, revision.as_deref(), &file).await,
+            None => {
+                remote_size_label(&huggingface_resolve_url(&repo, revision.as_deref(), &file)).await
+            }
         };
         out.push(ModelDetails {
             display_name: Path::new(&file)

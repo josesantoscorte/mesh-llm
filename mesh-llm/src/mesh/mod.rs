@@ -1,8 +1,13 @@
 //! Mesh membership via iroh QUIC connections.
 //!
-//! Multiple ALPNs are accepted for backward compatibility, but control traffic still uses
-//! one QUIC connection per peer. Bi-streams are multiplexed by first byte:
+//! Control traffic uses one QUIC connection per peer. Bi-streams are multiplexed by first byte:
 //! 0x01 = gossip, 0x02 = tunnel (RPC), 0x03 = tunnel map, 0x04 = tunnel (HTTP).
+
+pub use mesh_client::mesh::{
+    infer_available_model_descriptors, infer_local_served_model_descriptor,
+    infer_served_model_descriptors, merge_demand, ModelDemand, ModelRuntimeDescriptor,
+    ModelSourceKind, ServedModelDescriptor, ServedModelIdentity, DEMAND_TTL_SECS, MAX_SPLIT_RTT_MS,
+};
 
 use anyhow::{Context, Result};
 use base64::Engine;
@@ -23,24 +28,6 @@ use crate::crypto::{
 use crate::inference::moe;
 use crate::protocol::*;
 
-/// Demand signal for a model — tracks interest via API requests and --model declarations.
-/// Gossiped across the mesh and merged via max(). Decays naturally when last_active gets old.
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
-pub struct ModelDemand {
-    /// Unix timestamp of the most recent request or declaration.
-    pub last_active: u64,
-    /// Total requests seen (merged across peers via max).
-    pub request_count: u64,
-}
-
-/// How long a demand entry stays relevant without being refreshed.
-pub const DEMAND_TTL_SECS: u64 = 86400; // 24 hours
-
-/// Maximum RTT (ms) for a peer to be included in split mode.
-/// Peers above this threshold are skipped during election.
-/// Used by both the election RTT gate and the RTT-improvement re-election trigger.
-pub const MAX_SPLIT_RTT_MS: u32 = 80;
-
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -53,6 +40,38 @@ fn current_time_unix_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+const MIN_PINNED_GPU_CONFIG_PEER_VERSION: &str = "0.59.0";
+pub(super) const PEER_CONNECT_AND_GOSSIP_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(15);
+
+fn config_uses_pinned_gpu(config: &crate::plugin::MeshConfig) -> bool {
+    config.gpu.assignment == crate::plugin::GpuAssignment::Pinned
+}
+
+fn peer_supports_pinned_gpu_config(peer_version: Option<&str>) -> bool {
+    let Ok(min_version) = semver::Version::parse(MIN_PINNED_GPU_CONFIG_PEER_VERSION) else {
+        return false;
+    };
+    let Some(peer_version) = peer_version else {
+        return false;
+    };
+    let Ok(peer_version) = semver::Version::parse(peer_version) else {
+        return false;
+    };
+
+    peer_version >= min_version
+        || (peer_version.major == min_version.major
+            && peer_version.minor == min_version.minor
+            && peer_version.patch == min_version.patch)
+}
+
+fn pinned_gpu_config_peer_error(peer_version: Option<&str>) -> String {
+    let advertised = peer_version.unwrap_or("unknown");
+    format!(
+        "pinned gpu config sync requires mesh-llm >= {MIN_PINNED_GPU_CONFIG_PEER_VERSION}; subscriber advertised {advertised}"
+    )
 }
 
 fn preflight_pushed_config_for_current_node(config: &crate::plugin::MeshConfig) -> Result<()> {
@@ -117,36 +136,6 @@ fn preflight_pushed_config_for_current_node_with_gpus(
     Ok(())
 }
 
-const MIN_PINNED_GPU_CONFIG_PEER_VERSION: &str = "0.59.0";
-
-fn config_uses_pinned_gpu(config: &crate::plugin::MeshConfig) -> bool {
-    config.gpu.assignment == crate::plugin::GpuAssignment::Pinned
-}
-
-fn peer_supports_pinned_gpu_config(peer_version: Option<&str>) -> bool {
-    let Ok(min_version) = semver::Version::parse(MIN_PINNED_GPU_CONFIG_PEER_VERSION) else {
-        return false;
-    };
-    let Some(peer_version) = peer_version else {
-        return false;
-    };
-    let Ok(peer_version) = semver::Version::parse(peer_version) else {
-        return false;
-    };
-
-    peer_version >= min_version
-        || (peer_version.major == min_version.major
-            && peer_version.minor == min_version.minor
-            && peer_version.patch == min_version.patch)
-}
-
-fn pinned_gpu_config_peer_error(peer_version: Option<&str>) -> String {
-    let advertised = peer_version.unwrap_or("unknown");
-    format!(
-        "pinned gpu config sync requires mesh-llm >= {MIN_PINNED_GPU_CONFIG_PEER_VERSION}; subscriber advertised {advertised}"
-    )
-}
-
 fn endpoint_id_hex(id: EndpointId) -> String {
     hex::encode(id.as_bytes())
 }
@@ -165,126 +154,6 @@ fn node_role_label(role: &NodeRole) -> String {
         NodeRole::Host { .. } => "host".into(),
         NodeRole::Client => "client".into(),
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct ServedModelIdentity {
-    pub model_name: String,
-    pub is_primary: bool,
-    pub source_kind: ModelSourceKind,
-    pub canonical_ref: Option<String>,
-    pub repository: Option<String>,
-    pub revision: Option<String>,
-    pub artifact: Option<String>,
-    pub local_file_name: Option<String>,
-    pub identity_hash: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct ServedModelDescriptor {
-    pub identity: ServedModelIdentity,
-    pub capabilities: crate::models::ModelCapabilities,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub topology: Option<crate::models::ModelTopology>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct ModelRuntimeDescriptor {
-    pub model_name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub identity_hash: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub context_length: Option<u32>,
-    pub ready: bool,
-}
-
-impl ModelRuntimeDescriptor {
-    pub fn advertised_context_length(&self) -> Option<u32> {
-        self.ready.then_some(self.context_length).flatten()
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum ModelSourceKind {
-    Catalog,
-    HuggingFace,
-    LocalGguf,
-    DirectUrl,
-    #[default]
-    Unknown,
-}
-
-pub fn infer_served_model_descriptors(
-    primary_model_name: &str,
-    serving_models: &[String],
-    model_source: Option<&str>,
-    primary_model_path: Option<&std::path::Path>,
-) -> Vec<ServedModelDescriptor> {
-    let primary = model_source
-        .and_then(identity_from_model_source)
-        .or_else(|| {
-            primary_model_path.and_then(|path| identity_from_model_path(primary_model_name, path))
-        });
-    serving_models
-        .iter()
-        .enumerate()
-        .map(|(idx, model_name)| {
-            if idx == 0 || model_name == primary_model_name {
-                let mut identity = primary.clone().unwrap_or_default();
-                identity.model_name = model_name.clone();
-                identity.is_primary = true;
-                if identity.local_file_name.is_none() {
-                    identity.local_file_name = Some(format!("{model_name}.gguf"));
-                }
-                descriptor_from_identity(model_name, identity)
-            } else {
-                descriptor_from_model_path(
-                    model_name,
-                    &crate::models::find_model_path(model_name),
-                    false,
-                )
-                .unwrap_or_else(|| ServedModelDescriptor {
-                    identity: ServedModelIdentity {
-                        model_name: model_name.clone(),
-                        is_primary: false,
-                        source_kind: ModelSourceKind::Unknown,
-                        canonical_ref: None,
-                        repository: None,
-                        revision: None,
-                        artifact: None,
-                        local_file_name: Some(format!("{model_name}.gguf")),
-                        identity_hash: None,
-                    },
-                    capabilities: crate::models::ModelCapabilities::default(),
-                    topology: None,
-                })
-            }
-        })
-        .collect()
-}
-
-pub fn infer_available_model_descriptors(
-    available_models: &[String],
-) -> Vec<ServedModelDescriptor> {
-    available_models
-        .iter()
-        .filter_map(|model_name| {
-            let path = crate::models::find_model_path(model_name);
-            descriptor_from_model_path(model_name, &path, false)
-        })
-        .collect()
-}
-
-pub fn infer_local_served_model_descriptor(
-    model_name: &str,
-    is_primary: bool,
-) -> Option<ServedModelDescriptor> {
-    descriptor_from_model_path(
-        model_name,
-        &crate::models::find_model_path(model_name),
-        is_primary,
-    )
 }
 
 fn infer_remote_served_descriptors(
@@ -459,6 +328,7 @@ fn identity_from_model_path(
     None
 }
 
+#[allow(dead_code)]
 fn descriptor_from_model_path(
     model_name: &str,
     path: &std::path::Path,
@@ -469,6 +339,7 @@ fn descriptor_from_model_path(
     Some(descriptor_from_identity(model_name, identity))
 }
 
+#[allow(dead_code)]
 fn descriptor_from_identity(
     model_name: &str,
     mut identity: ServedModelIdentity,
@@ -510,6 +381,7 @@ fn descriptor_from_identity(
     }
 }
 
+#[allow(dead_code)]
 fn enrich_topology_with_local_shared_ranking(
     path: &std::path::Path,
     topology: &mut Option<crate::models::ModelTopology>,
@@ -764,59 +636,6 @@ fn upsert_mesh_catalog_descriptor(
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct PeerAnnouncementV0 {
-    addr: EndpointAddr,
-    #[serde(default)]
-    role: NodeRole,
-    #[serde(default)]
-    models: Vec<String>,
-    #[serde(default)]
-    vram_bytes: u64,
-    #[serde(default)]
-    model_source: Option<String>,
-    #[serde(default)]
-    serving: Option<String>,
-    #[serde(default)]
-    serving_models: Vec<String>,
-    #[serde(default)]
-    available_models: Vec<String>,
-    #[serde(default)]
-    requested_models: Vec<String>,
-    #[serde(default)]
-    version: Option<String>,
-    #[serde(default)]
-    model_demand: HashMap<String, ModelDemand>,
-    #[serde(default)]
-    mesh_id: Option<String>,
-    #[serde(default)]
-    gpu_name: Option<String>,
-    #[serde(default)]
-    hostname: Option<String>,
-    #[serde(default)]
-    is_soc: Option<bool>,
-    #[serde(default)]
-    gpu_vram: Option<String>,
-    #[serde(default)]
-    gpu_reserved_bytes: Option<String>,
-    #[serde(
-        default,
-        rename = "gpu_bandwidth_gbps",
-        alias = "gpu_mem_bandwidth_gbps"
-    )]
-    gpu_mem_bandwidth_gbps: Option<String>,
-    #[serde(default)]
-    gpu_compute_tflops_fp32: Option<String>,
-    #[serde(default)]
-    gpu_compute_tflops_fp16: Option<String>,
-    #[serde(default)]
-    available_model_sizes: HashMap<String, u64>,
-    #[serde(skip_serializing, skip_deserializing, default)]
-    served_model_descriptors: Vec<ServedModelDescriptor>,
-    #[serde(skip_serializing, skip_deserializing, default)]
-    served_model_runtime: Vec<ModelRuntimeDescriptor>,
-}
-
 /// Merge two demand maps. For each model, take max of last_active and request_count.
 /// Role a node plays in the mesh.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -924,7 +743,6 @@ pub struct OwnerRuntimeConfig {
     pub trust_store: TrustStore,
     pub trust_policy: TrustPolicy,
 }
-
 #[derive(Debug, Clone)]
 pub struct MeshCatalogEntry {
     pub model_name: String,
@@ -1173,6 +991,7 @@ pub struct Node {
     pub peer_change_rx: watch::Receiver<usize>,
     inflight_requests: Arc<std::sync::atomic::AtomicUsize>,
     inflight_change_tx: watch::Sender<u64>,
+    routing_metrics: crate::network::metrics::RoutingMetrics,
     tunnel_tx: tokio::sync::mpsc::Sender<(iroh::endpoint::SendStream, iroh::endpoint::RecvStream)>,
     tunnel_http_tx:
         tokio::sync::mpsc::Sender<(iroh::endpoint::SendStream, iroh::endpoint::RecvStream)>,
@@ -1326,10 +1145,11 @@ impl Node {
     pub fn begin_inflight_request(&self) -> InflightRequestGuard {
         self.inflight_requests
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let _ = self.inflight_change_tx.send(
-            self.inflight_requests
-                .load(std::sync::atomic::Ordering::Relaxed) as u64,
-        );
+        let current = self
+            .inflight_requests
+            .load(std::sync::atomic::Ordering::Relaxed) as u64;
+        let _ = self.inflight_change_tx.send(current);
+        self.routing_metrics.observe_inflight(current);
         InflightRequestGuard {
             inflight_requests: self.inflight_requests.clone(),
             inflight_change_tx: self.inflight_change_tx.clone(),
@@ -1343,6 +1163,78 @@ impl Node {
 
     pub fn inflight_change_rx(&self) -> watch::Receiver<u64> {
         self.inflight_change_tx.subscribe()
+    }
+
+    pub fn record_inference_attempt(
+        &self,
+        model: Option<&str>,
+        target: &crate::inference::election::InferenceTarget,
+        queue_wait: std::time::Duration,
+        attempt_time: std::time::Duration,
+        outcome: crate::network::metrics::AttemptOutcome,
+        completion_tokens: Option<u64>,
+    ) {
+        let attempt_target = match target {
+            crate::inference::election::InferenceTarget::Local(port)
+            | crate::inference::election::InferenceTarget::MoeLocal(port) => {
+                crate::network::metrics::AttemptTarget::Local(format!("127.0.0.1:{port}"))
+            }
+            crate::inference::election::InferenceTarget::Remote(peer_id)
+            | crate::inference::election::InferenceTarget::MoeRemote(peer_id) => {
+                crate::network::metrics::AttemptTarget::Remote(peer_id.fmt_short().to_string())
+            }
+            crate::inference::election::InferenceTarget::None => return,
+        };
+        self.routing_metrics.record_attempt(
+            model,
+            attempt_target,
+            queue_wait,
+            attempt_time,
+            outcome,
+            completion_tokens,
+        );
+    }
+
+    pub fn record_endpoint_attempt(
+        &self,
+        model: Option<&str>,
+        endpoint: &str,
+        queue_wait: std::time::Duration,
+        attempt_time: std::time::Duration,
+        outcome: crate::network::metrics::AttemptOutcome,
+        completion_tokens: Option<u64>,
+    ) {
+        self.routing_metrics.record_attempt(
+            model,
+            crate::network::metrics::AttemptTarget::Endpoint(endpoint.to_string()),
+            queue_wait,
+            attempt_time,
+            outcome,
+            completion_tokens,
+        );
+    }
+
+    pub fn record_routed_request(
+        &self,
+        model: Option<&str>,
+        attempts: usize,
+        outcome: crate::network::metrics::RequestOutcome,
+    ) {
+        self.routing_metrics
+            .record_request(model, attempts, outcome);
+    }
+
+    pub fn routing_metrics_snapshot(
+        &self,
+    ) -> crate::network::metrics::RoutingMetricsStatusSnapshot {
+        self.routing_metrics
+            .status_snapshot(self.inflight_requests())
+    }
+
+    pub fn model_routing_metrics(
+        &self,
+    ) -> HashMap<String, crate::network::metrics::ModelRoutingMetricsSnapshot> {
+        self.routing_metrics.model_snapshots()
     }
 
     pub async fn owner_summary(&self) -> OwnershipSummary {
@@ -1378,7 +1270,7 @@ impl Node {
             .build();
         let mut builder = Endpoint::empty_builder()
             .secret_key(secret_key)
-            .alpns(vec![ALPN_V1.to_vec(), ALPN_V0.to_vec()])
+            .alpns(vec![ALPN_V1.to_vec()])
             .transport_config(transport_config);
 
         {
@@ -1547,6 +1439,7 @@ impl Node {
             peer_change_rx,
             inflight_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             inflight_change_tx,
+            routing_metrics: crate::network::metrics::RoutingMetrics::default(),
             tunnel_tx,
             tunnel_http_tx,
             plugin_manager: Arc::new(Mutex::new(None)),
@@ -1645,6 +1538,7 @@ impl Node {
             peer_change_rx,
             inflight_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             inflight_change_tx,
+            routing_metrics: crate::network::metrics::RoutingMetrics::default(),
             tunnel_tx,
             tunnel_http_tx,
             plugin_manager: Arc::new(Mutex::new(None)),
@@ -1700,6 +1594,15 @@ impl Node {
         }
         let json = serde_json::to_vec(&addr).expect("serializable");
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&json)
+    }
+
+    /// Decode an invite token into an [`EndpointAddr`] without connecting.
+    /// Returns `Err` if the token is not valid base64 or not valid JSON.
+    pub fn decode_invite_token(invite_token: &str) -> Result<EndpointAddr> {
+        let json = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(invite_token)
+            .context("invalid invite token encoding")?;
+        serde_json::from_slice(&json).context("invalid invite token JSON")
     }
 
     #[cfg(test)]
@@ -1763,17 +1666,9 @@ impl Node {
         });
     }
 
-    /// Decode an invite token into an [`EndpointAddr`] without connecting.
-    /// Returns `Err` if the token is not valid base64 or not valid JSON.
-    pub fn decode_invite_token(invite_token: &str) -> Result<EndpointAddr> {
-        let json = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(invite_token)
-            .context("invalid invite token encoding")?;
-        serde_json::from_slice(&json).context("invalid invite token JSON")
-    }
-
     pub async fn join(&self, invite_token: &str) -> Result<()> {
-        let addr = Self::decode_invite_token(invite_token)?;
+        let json = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(invite_token)?;
+        let addr: EndpointAddr = serde_json::from_slice(&json)?;
         // Clear dead status — explicit join should always attempt connection
         self.state.lock().await.dead_peers.remove(&addr.id);
         self.connect_to_peer(addr).await
@@ -2790,37 +2685,6 @@ impl Node {
         RoutingTable { hosts, mesh_id }
     }
 
-    #[cfg(test)]
-    pub async fn request_route_table(&self, conn: &Connection) -> Result<RoutingTable> {
-        use prost::Message as _;
-        let protocol = connection_protocol(conn);
-        let (mut send, mut recv) = conn.open_bi().await?;
-        send.write_all(&[STREAM_ROUTE_REQUEST]).await?;
-        if protocol == ControlProtocol::ProtoV1 {
-            let req = crate::proto::node::RouteTableRequest {
-                requester_id: self.endpoint.id().as_bytes().to_vec(),
-                gen: NODE_PROTOCOL_GENERATION,
-            };
-            write_len_prefixed(&mut send, &req.encode_to_vec()).await?;
-        }
-        send.finish()?;
-        match protocol {
-            ControlProtocol::ProtoV1 => {
-                let buf = read_len_prefixed(&mut recv).await?;
-                let proto_table = crate::proto::node::RouteTable::decode(buf.as_slice())
-                    .map_err(|e| anyhow::anyhow!("route table decode failed: {e}"))?;
-                proto_table
-                    .validate_frame()
-                    .map_err(|e| anyhow::anyhow!("invalid route table: {e}"))?;
-                Ok(proto_route_table_to_local(&proto_table))
-            }
-            ControlProtocol::JsonV0 => {
-                let buf = recv.read_to_end(MAX_CONTROL_FRAME_BYTES).await?;
-                Ok(serde_json::from_slice(&buf)?)
-            }
-        }
-    }
-
     pub fn vram_bytes(&self) -> u64 {
         self.vram_bytes
     }
@@ -2900,11 +2764,6 @@ impl Node {
     ) -> Result<()> {
         use prost::Message as _;
 
-        let legacy_json: HashMap<String, u16> = my_tunnel_map
-            .iter()
-            .map(|(id, port)| (hex::encode(id.as_bytes()), *port))
-            .collect();
-        let legacy_bytes = serde_json::to_vec(&legacy_json)?;
         let owner_peer_id = self.endpoint.id().as_bytes().to_vec();
         let entries: Vec<crate::proto::node::TunnelEntry> = my_tunnel_map
             .iter()
@@ -2932,19 +2791,13 @@ impl Node {
 
         for (peer_id, conn) in conns {
             let proto_bytes = proto_bytes.clone();
-            let legacy_bytes = legacy_bytes.clone();
-            let protocol = connection_protocol(&conn);
             tokio::spawn(async move {
                 match conn.open_bi().await {
                     Ok((mut send, _recv)) => {
                         if send.write_all(&[STREAM_TUNNEL_MAP]).await.is_err() {
                             return;
                         }
-                        let body = match protocol {
-                            ControlProtocol::ProtoV1 => &proto_bytes,
-                            ControlProtocol::JsonV0 => &legacy_bytes,
-                        };
-                        if write_len_prefixed(&mut send, body).await.is_err() {
+                        if write_len_prefixed(&mut send, &proto_bytes).await.is_err() {
                             return;
                         }
                         let _ = send.finish();
@@ -3077,43 +2930,21 @@ impl Node {
 
     async fn _dispatch_streams(&self, conn: Connection, remote: EndpointId) {
         let protocol = connection_protocol(&conn);
-        let connection_stable_id = conn.stable_id();
         loop {
             let (send, mut recv) = match conn.accept_bi().await {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::info!("Connection to {} closed: {e}", remote.fmt_short());
-                    // Remove the stale connection only if it still owns the
-                    // tracked slot. A newer connection may already have
-                    // replaced it.
+                    // Remove the stale connection
                     {
                         let mut state = self.state.lock().await;
-                        if should_remove_connection(
-                            state.connections.get(&remote).map(|conn| conn.stable_id()),
-                            connection_stable_id,
-                        ) {
-                            state.connections.remove(&remote);
-                        }
+                        state.connections.remove(&remote);
                     }
                     // Try to reconnect — if the peer is still alive, re-learn their role
-                    let (addr, replaced_by_newer_conn) = {
+                    let addr = {
                         let state = self.state.lock().await;
-                        (
-                            state.peers.get(&remote).map(|p| p.addr.clone()),
-                            state
-                                .connections
-                                .get(&remote)
-                                .map(|tracked| tracked.stable_id())
-                                .is_some_and(|tracked| tracked != connection_stable_id),
-                        )
+                        state.peers.get(&remote).map(|p| p.addr.clone())
                     };
-                    if replaced_by_newer_conn {
-                        tracing::debug!(
-                            "Connection to {} already replaced by a newer stream dispatcher",
-                            remote.fmt_short()
-                        );
-                        break;
-                    }
                     if let Some(addr) = addr {
                         tracing::info!("Attempting reconnect to {}...", remote.fmt_short());
                         match tokio::time::timeout(
@@ -3262,71 +3093,40 @@ impl Node {
                         use prost::Message as _;
                         let mut send = send;
                         let table = node.routing_table().await;
-                        match protocol {
-                            ControlProtocol::ProtoV1 => {
-                                let proto_table = routing_table_to_proto(&table);
-                                let _ = write_len_prefixed(&mut send, &proto_table.encode_to_vec())
-                                    .await;
-                            }
-                            ControlProtocol::JsonV0 => {
-                                if let Ok(json) = serde_json::to_vec(&table) {
-                                    let _ = send.write_all(&json).await;
-                                }
-                            }
-                        }
+                        let proto_table = routing_table_to_proto(&table);
+                        let _ = write_len_prefixed(&mut send, &proto_table.encode_to_vec()).await;
                         let _ = send.finish();
                     });
                 }
                 STREAM_PEER_DOWN => {
                     let node = self.clone();
                     tokio::spawn(async move {
-                        let peer_id_arr: [u8; 32] = match protocol {
-                            ControlProtocol::ProtoV1 => {
-                                let proto_buf = match read_len_prefixed(&mut recv).await {
-                                    Ok(buf) => buf,
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            "PeerDown: failed to read proto body — rejecting: {e}"
-                                        );
-                                        return;
-                                    }
-                                };
-                                let frame = match crate::proto::node::PeerDown::decode(
-                                    proto_buf.as_slice(),
-                                ) {
-                                    Ok(f) => f,
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            "PeerDown: invalid protobuf — rejecting: {e}"
-                                        );
-                                        return;
-                                    }
-                                };
-                                if let Err(e) = frame.validate_frame() {
-                                    tracing::warn!(
-                                        "PeerDown: frame validation failed — rejecting: {e}"
-                                    );
-                                    return;
-                                }
-                                match frame.peer_id.as_slice().try_into() {
-                                    Ok(b) => b,
-                                    Err(_) => {
-                                        tracing::warn!(
-                                            "PeerDown: peer_id is not 32 bytes — rejecting"
-                                        );
-                                        return;
-                                    }
-                                }
+                        let proto_buf = match read_len_prefixed(&mut recv).await {
+                            Ok(buf) => buf,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "PeerDown: failed to read proto body — rejecting: {e}"
+                                );
+                                return;
                             }
-                            ControlProtocol::JsonV0 => {
-                                let mut id_bytes = [0u8; 32];
-                                if recv.read_exact(&mut id_bytes).await.is_err() {
-                                    tracing::warn!(
-                                        "PeerDown: missing legacy endpoint id bytes — rejecting"
-                                    );
-                                    return;
-                                }
-                                id_bytes
+                        };
+                        let frame = match crate::proto::node::PeerDown::decode(proto_buf.as_slice())
+                        {
+                            Ok(f) => f,
+                            Err(e) => {
+                                tracing::warn!("PeerDown: invalid protobuf — rejecting: {e}");
+                                return;
+                            }
+                        };
+                        if let Err(e) = frame.validate_frame() {
+                            tracing::warn!("PeerDown: frame validation failed — rejecting: {e}");
+                            return;
+                        }
+                        let peer_id_arr: [u8; 32] = match frame.peer_id.as_slice().try_into() {
+                            Ok(b) => b,
+                            Err(_) => {
+                                tracing::warn!("PeerDown: peer_id is not 32 bytes — rejecting");
+                                return;
                             }
                         };
                         let pk = match iroh::PublicKey::from_bytes(&peer_id_arr) {
@@ -3395,10 +3195,10 @@ impl Node {
                                         let mut state = node.state.lock().await;
                                         // Only insert if no other task raced and
                                         // established a connection while we were probing.
-                                        if let std::collections::hash_map::Entry::Vacant(entry) =
-                                            state.connections.entry(dead_id)
-                                        {
-                                            entry.insert(new_conn.clone());
+                                        #[allow(clippy::map_entry)]
+                                        // manual drop(state) before async spawn
+                                        if !state.connections.contains_key(&dead_id) {
+                                            state.connections.insert(dead_id, new_conn.clone());
                                             drop(state);
                                             let n2 = node.clone();
                                             tokio::spawn(async move {
@@ -3440,72 +3240,38 @@ impl Node {
                 STREAM_PEER_LEAVING => {
                     let node = self.clone();
                     tokio::spawn(async move {
-                        let leaving_id = match protocol {
-                            ControlProtocol::ProtoV1 => {
-                                let proto_buf = match read_len_prefixed(&mut recv).await {
-                                    Ok(buf) => buf,
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            "PeerLeaving: failed to read proto body — rejecting: {e}"
-                                        );
-                                        return;
-                                    }
-                                };
-                                let frame = match crate::proto::node::PeerLeaving::decode(
-                                    proto_buf.as_slice(),
-                                ) {
-                                    Ok(f) => f,
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            "PeerLeaving: invalid protobuf — rejecting: {e}"
-                                        );
-                                        return;
-                                    }
-                                };
-                                if let Err(e) = frame.validate_frame() {
-                                    tracing::warn!(
-                                        "PeerLeaving: frame validation failed — rejecting: {e}"
-                                    );
-                                    return;
-                                }
-                                match resolve_peer_leaving(remote, &frame) {
-                                    Ok(id) => id,
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            "PeerLeaving from {}: rejected ({})",
-                                            remote.fmt_short(),
-                                            e
-                                        );
-                                        return;
-                                    }
-                                }
+                        let proto_buf = match read_len_prefixed(&mut recv).await {
+                            Ok(buf) => buf,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "PeerLeaving: failed to read proto body — rejecting: {e}"
+                                );
+                                return;
                             }
-                            ControlProtocol::JsonV0 => {
-                                let mut id_bytes = [0u8; 32];
-                                if recv.read_exact(&mut id_bytes).await.is_err() {
+                        };
+                        let frame =
+                            match crate::proto::node::PeerLeaving::decode(proto_buf.as_slice()) {
+                                Ok(f) => f,
+                                Err(e) => {
                                     tracing::warn!(
-                                        "PeerLeaving: missing legacy endpoint id bytes — rejecting"
+                                        "PeerLeaving: invalid protobuf — rejecting: {e}"
                                     );
                                     return;
                                 }
-                                let pk = match iroh::PublicKey::from_bytes(&id_bytes) {
-                                    Ok(k) => k,
-                                    Err(_) => {
-                                        tracing::warn!(
-                                            "PeerLeaving: endpoint id is not a valid public key — rejecting"
-                                        );
-                                        return;
-                                    }
-                                };
-                                let leaving_id = EndpointId::from(pk);
-                                if leaving_id != remote {
-                                    tracing::warn!(
-                                        "PeerLeaving from {}: rejected (legacy sender mismatch)",
-                                        remote.fmt_short()
-                                    );
-                                    return;
-                                }
-                                leaving_id
+                            };
+                        if let Err(e) = frame.validate_frame() {
+                            tracing::warn!("PeerLeaving: frame validation failed — rejecting: {e}");
+                            return;
+                        }
+                        let leaving_id = match resolve_peer_leaving(remote, &frame) {
+                            Ok(id) => id,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "PeerLeaving from {}: rejected ({})",
+                                    remote.fmt_short(),
+                                    e
+                                );
+                                return;
                             }
                         };
                         eprintln!(
@@ -3592,6 +3358,7 @@ impl Node {
                 let error_snapshot = crate::proto::node::ConfigSnapshotResponse {
                     gen: NODE_PROTOCOL_GENERATION,
                     node_id: vec![],
+                    owner_id: String::new(),
                     revision: 0,
                     config_hash: vec![],
                     config: None,
@@ -3611,6 +3378,7 @@ impl Node {
             let error_snapshot = crate::proto::node::ConfigSnapshotResponse {
                 gen: NODE_PROTOCOL_GENERATION,
                 node_id: vec![],
+                owner_id: String::new(),
                 revision: 0,
                 config_hash: vec![],
                 config: None,
@@ -3627,6 +3395,7 @@ impl Node {
                 let error_snapshot = crate::proto::node::ConfigSnapshotResponse {
                     gen: NODE_PROTOCOL_GENERATION,
                     node_id: vec![],
+                    owner_id: String::new(),
                     revision: 0,
                     config_hash: vec![],
                     config: None,
@@ -3648,6 +3417,7 @@ impl Node {
             let error_snapshot = crate::proto::node::ConfigSnapshotResponse {
                 gen: NODE_PROTOCOL_GENERATION,
                 node_id: vec![],
+                owner_id: String::new(),
                 revision: 0,
                 config_hash: vec![],
                 config: None,
@@ -3674,6 +3444,7 @@ impl Node {
                 let error_snapshot = crate::proto::node::ConfigSnapshotResponse {
                     gen: NODE_PROTOCOL_GENERATION,
                     node_id: vec![],
+                    owner_id: String::new(),
                     revision: 0,
                     config_hash: vec![],
                     config: None,
@@ -3687,6 +3458,7 @@ impl Node {
             ConfigSnapshotResponse {
                 gen: NODE_PROTOCOL_GENERATION,
                 node_id: self.endpoint.id().as_bytes().to_vec(),
+                owner_id: local_owner_id.clone(),
                 revision: state.revision(),
                 config_hash: state.config_hash().to_vec(),
                 config: Some(proto_cfg),
@@ -3719,6 +3491,7 @@ impl Node {
                         ConfigUpdateNotification {
                             gen: NODE_PROTOCOL_GENERATION,
                             node_id: self.endpoint.id().as_bytes().to_vec(),
+                            owner_id: local_owner_id.clone(),
                             revision: state.revision(),
                             config_hash: state.config_hash().to_vec(),
                             config: Some(proto_cfg),
@@ -3999,6 +3772,10 @@ impl Node {
         let req = ConfigSubscribe {
             gen: NODE_PROTOCOL_GENERATION,
             subscriber_id: self.endpoint.id().as_bytes().to_vec(),
+            // Owner-id filtering is an embedded-client concept; mesh-llm does
+            // not currently filter snapshots, so we leave this empty for
+            // backward compatibility with older peers.
+            owner_id: String::new(),
         };
         write_len_prefixed(&mut send, &req.encode_to_vec()).await?;
 
@@ -4015,6 +3792,7 @@ impl Node {
         let empty_notif = ConfigUpdateNotification {
             gen: NODE_PROTOCOL_GENERATION,
             node_id: snapshot.node_id.clone(),
+            owner_id: snapshot.owner_id.clone(),
             revision: snapshot.revision,
             config_hash: snapshot.config_hash.clone(),
             config: snapshot.config.clone(),
@@ -4067,7 +3845,7 @@ impl Node {
 
         tracing::info!("Connecting to peer {}...", peer_id.fmt_short());
         let conn = match tokio::time::timeout(
-            std::time::Duration::from_secs(15),
+            PEER_CONNECT_AND_GOSSIP_TIMEOUT,
             connect_mesh(&self.endpoint, addr.clone()),
         )
         .await
@@ -4077,7 +3855,11 @@ impl Node {
                 anyhow::bail!("Failed to connect to {}: {e}", peer_id.fmt_short());
             }
             Err(_) => {
-                anyhow::bail!("Timeout connecting to {} (15s)", peer_id.fmt_short());
+                anyhow::bail!(
+                    "Timeout connecting to {} ({}s)",
+                    peer_id.fmt_short(),
+                    PEER_CONNECT_AND_GOSSIP_TIMEOUT.as_secs()
+                );
             }
         };
 
@@ -4147,15 +3929,9 @@ impl Node {
         use prost::Message as _;
 
         let buf = read_len_prefixed(&mut recv).await?;
-        let frame = match protocol {
-            ControlProtocol::ProtoV1 => crate::proto::node::TunnelMap::decode(buf.as_slice())
-                .map_err(|e| anyhow::anyhow!("TunnelMap decode error: {e}"))?,
-            ControlProtocol::JsonV0 => {
-                let mut frame = decode_legacy_tunnel_map_frame(&buf)?;
-                frame.owner_peer_id = remote.as_bytes().to_vec();
-                frame
-            }
-        };
+        let _ = protocol;
+        let frame = crate::proto::node::TunnelMap::decode(buf.as_slice())
+            .map_err(|e| anyhow::anyhow!("TunnelMap decode error: {e}"))?;
 
         frame
             .validate_frame()
@@ -4421,13 +4197,12 @@ fn ensure_private_node_key_file(path: &std::path::Path) -> Result<()> {
 
 mod gossip;
 mod heartbeat;
+pub use gossip::backfill_legacy_descriptors;
 #[allow(unused_imports)]
 use gossip::{apply_transitive_ann, peer_meaningfully_changed};
-pub use gossip::{backfill_legacy_descriptors, merge_demand};
 #[allow(unused_imports)]
 use heartbeat::{
-    heartbeat_failure_policy_for_peer, should_remove_connection, HeartbeatFailurePolicy,
-    MOE_RECOVERY_PROBATION_SECS,
+    heartbeat_failure_policy_for_peer, HeartbeatFailurePolicy, MOE_RECOVERY_PROBATION_SECS,
 };
 pub(crate) use heartbeat::{
     moe_recovery_ready_at, peer_is_eligible_for_active_moe, resolve_peer_down,
