@@ -489,34 +489,34 @@ fn render_cleanup_json(
 }
 
 pub async fn run_model_delete(model: &str, yes: bool, json_output: bool) -> Result<()> {
-    let is_path = model.contains('/') || model.contains('\\');
-    let resolved_path = if is_path {
-        std::path::PathBuf::from(model)
-    } else {
-        crate::models::find_model_path(model)
+    let paths = match delete::resolve_model_identifier(model) {
+        Ok(p) => p,
+        Err(e) => bail!("{}", e.to_string()),
     };
 
-    if !resolved_path.exists() {
+    if paths.is_empty() {
         bail!("Model not found: {}", model);
     }
 
-    let resolved = crate::models::ResolvedModel {
-        path: resolved_path.clone(),
-        display_name: resolved_path
+    if !yes {
+        let display_name = paths[0]
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("unknown")
-            .to_string(),
-        is_exact_path: is_path,
-        matched_records: vec![],
-    };
+            .to_string();
 
-    if !yes {
+        let resolved = crate::models::ResolvedModel {
+            path: paths[0].clone(),
+            display_name,
+            is_exact_path: model.contains('/'),
+            matched_records: vec![],
+        };
+
         let formatter = models_formatter(json_output);
         return formatter.render_delete_preview(&resolved);
     }
 
-    let result = delete::delete_model_at_path(model, false).await?;
+    let result = delete::delete_model_by_identifier(model).await?;
     let formatter = models_formatter(json_output);
     formatter.render_delete_result(&result)
 }
