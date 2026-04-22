@@ -43,6 +43,17 @@ COPY mesh-llm/plugin/build.rs mesh-llm/plugin/build.rs
 COPY mesh-llm/proto/ mesh-llm/proto/
 COPY mesh-llm/src/ mesh-llm/src/
 COPY mesh-llm/plugin/src/ mesh-llm/plugin/src/
+COPY mesh-client/Cargo.toml mesh-client/Cargo.toml
+COPY mesh-client/src/ mesh-client/src/
+COPY mesh-api/Cargo.toml mesh-api/Cargo.toml
+COPY mesh-api/src/ mesh-api/src/
+COPY mesh-host-core/Cargo.toml mesh-host-core/Cargo.toml
+COPY mesh-host-core/src/ mesh-host-core/src/
+COPY mesh-api-ffi/Cargo.toml mesh-api-ffi/Cargo.toml
+COPY mesh-api-ffi/src/ mesh-api-ffi/src/
+COPY mesh-api-ffi/build.rs mesh-api-ffi/build.rs
+COPY mesh-llm-test-harness/Cargo.toml mesh-llm-test-harness/Cargo.toml
+COPY mesh-llm-test-harness/src/ mesh-llm-test-harness/src/
 COPY tools/xtask/Cargo.toml tools/xtask/Cargo.toml
 COPY tools/xtask/src/ tools/xtask/src/
 RUN mkdir -p mesh-llm/ui/dist && echo '<html></html>' > mesh-llm/ui/dist/index.html
@@ -57,10 +68,27 @@ WORKDIR /src
 RUN rm -rf mesh-llm/ui/dist
 COPY --from=ui-builder /app/dist mesh-llm/ui/dist
 # Restore real build scripts (cargo-chef stubs them during cook)
+COPY Cargo.toml ./
+COPY Cargo.lock ./
+COPY mesh-llm/Cargo.toml mesh-llm/Cargo.toml
 COPY mesh-llm/build.rs mesh-llm/build.rs
+COPY mesh-llm/plugin/Cargo.toml mesh-llm/plugin/Cargo.toml
 COPY mesh-llm/plugin/build.rs mesh-llm/plugin/build.rs
+COPY mesh-client/Cargo.toml mesh-client/Cargo.toml
+COPY mesh-api/Cargo.toml mesh-api/Cargo.toml
+COPY mesh-host-core/Cargo.toml mesh-host-core/Cargo.toml
+COPY mesh-api-ffi/Cargo.toml mesh-api-ffi/Cargo.toml
+COPY mesh-llm-test-harness/Cargo.toml mesh-llm-test-harness/Cargo.toml
+COPY tools/xtask/Cargo.toml tools/xtask/Cargo.toml
 COPY mesh-llm/src/ mesh-llm/src/
 COPY mesh-llm/plugin/src/ mesh-llm/plugin/src/
+COPY mesh-client/src/ mesh-client/src/
+COPY mesh-api/src/ mesh-api/src/
+COPY mesh-host-core/src/ mesh-host-core/src/
+COPY mesh-api-ffi/src/ mesh-api-ffi/src/
+COPY mesh-api-ffi/build.rs mesh-api-ffi/build.rs
+COPY mesh-llm-test-harness/src/ mesh-llm-test-harness/src/
+COPY tools/xtask/src/ tools/xtask/src/
 COPY mesh-llm/skills/ mesh-llm/skills/
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
